@@ -658,22 +658,23 @@ fn field(fs: &mut FuncState, cc: &mut ConsControl) -> Result<(), String> {
         // Save freereg to restore after processing field
         let saved_freereg = fs.freereg;
 
-        fs.lexer.bump();
         let mut key = ExpDesc::new_void();
-        expr_internal(fs, &mut key)?;
-        expect(fs, LuaTokenKind::TkRightBracket)?;
+        yindex(fs, &mut key)?;
         expect(fs, LuaTokenKind::TkAssign)?;
 
-        let mut val = ExpDesc::new_void();
-        expr_internal(fs, &mut val)?;
-
         // Port of recfield logic from lparser.c:847-867
-        // Use indexed to determine VINDEXSTR vs VINDEXED based on key
+        // Use indexed to determine VINDEXSTR vs VINDEXED based on key.
+        // As in lparser.c, the key takes its register before the value is
+        // parsed, so the value's temporaries sit above it and are freed in
+        // order (a key such as [655360] needs a register).
         let mut tab = ExpDesc::new_void();
         tab.kind = ExpKind::VNONRELOC;
         tab.u = ExpUnion::Info(cc.table_reg as i32);
 
         code::indexed(fs, &mut tab, &mut key);
+
+        let mut val = ExpDesc::new_void();
+        expr_internal(fs, &mut val)?;
 
         // Generate appropriate store instruction based on tab.kind
         match tab.kind {
