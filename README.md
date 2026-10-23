@@ -83,12 +83,30 @@ index tools as often as needed. A second run with no changes takes a few
 milliseconds.
 
 **Choose the engine.** Documents that load `fontspec`, `xeCJK`, `ctex`,
-`unicode-math` or `polyglossia` run as XeLaTeX, everything else as pdfLaTeX.
+`unicode-math` or `polyglossia` run as XeLaTeX, LuaTeX-ja documents as
+LuaLaTeX, everything else as pdfLaTeX.
 To choose yourself, add `-pdf`, `-xelatex` or `-lualatex`:
 
 ```bash
 texres -lualatex paper.tex
 ```
+
+**Japanese documents.** pLaTeX and upLaTeX classes (`\NeedsTeXFormat{pLaTeX2e}`,
+`platex` plus `dvipdfmx` builds) need the pTeX engine, which TeXres does not
+provide; build them unchanged with TeX Live. TeXres bundles LuaTeX-ja, which
+typesets Japanese under LuaLaTeX with the Harano Aji fonts. To port a pLaTeX
+document, replace `jsarticle` with `ltjsarticle` (`jsbook` with `ltjsbook`,
+`jarticle` with `ltjarticle`) and the `zw` unit with `\zw`:
+
+```latex
+\documentclass{ltjsarticle}
+\begin{document}
+\noindent\hspace*{2\zw}日本語の文書です。
+\end{document}
+```
+
+The first LuaTeX-ja build takes a few seconds while LuaTeX-ja caches its
+font data. XeLaTeX with `xeCJK` also typesets Japanese.
 
 **Write the output elsewhere.** `texres -outdir=build paper.tex` puts the PDF
 in `build/`. Auxiliary files (`.aux`, `.bbl`, `.toc`) live in a private cache,
@@ -151,9 +169,12 @@ texres fmt paper.tex chapters/
 
 **Single tools.** A link to `texres` named `pdflatex`, `xelatex`, `lualatex`,
 `bibtex` or `biber` runs one pass of that tool. Named `latexmk`, it behaves
-like `texres`. The packages install only `texres`, so an existing TeX Live is
-left alone. On Windows, run this in a PowerShell opened with *Run as
-administrator*; the hard link takes no extra disk space. Without admin
+like `texres`. Without a link, `texres pdflatex ARGS` (or `xelatex`,
+`lualatex`) runs one engine pass, and so does `-progname=pdflatex` anywhere in
+the arguments, as with `pdftex`:
+`texres -progname=pdflatex -ini "&pdflatex" preamble.tex`. The packages
+install only `texres`, so an existing TeX Live is left alone. On Windows, run
+this in a PowerShell opened with *Run as administrator*; the hard link takes no extra disk space. Without admin
 rights, copy `texres.exe` to a folder of yours on `PATH` under the new name
 instead (about 800 MB).
 

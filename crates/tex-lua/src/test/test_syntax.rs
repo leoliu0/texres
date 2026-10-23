@@ -142,6 +142,51 @@ fn test_table_constructor_expression_key() {
     assert!(result.is_ok());
 }
 
+/// A key that needs a register (an integer too large for an operand) takes
+/// it before the value's temporaries, as in lparser.c's recfield; LuaTeX-ja's
+/// ltj-rmlgbm.lua writes `cache_chars[cid_name] = { [655360] = ... }`.
+#[test]
+fn test_table_constructor_register_key_before_indexed_value() {
+    let mut vm = GlobalState::new(SafeOption::default());
+    vm.open_stdlib(crate::stdlib::Stdlib::All).unwrap();
+    let result = vm.main_state().execute(
+        r#"
+        local data, name = { a = { characters = "chars" } }, "a"
+        local cache = {}
+        cache[name] = { [655360] = data[name].characters, [-1] = data[name].characters }
+        assert(cache.a[655360] == "chars" and cache.a[-1] == "chars")
+        local t = { [655360] = data[name].characters, x = data[name].characters }
+        assert(t[655360] == "chars" and t.x == "chars")
+    "#,
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// A local assigned in a multiple assignment keeps its old value as an
+/// earlier target's table or key, however many targets come between, as
+/// lparser.c's check_conflict does; LuaTeX-ja's ltj-rmlgbm.lua writes
+/// `tth[pricode], cidmo[i], pricode = { index = i }, pricode, pricode+1`.
+#[test]
+fn test_multiple_assignment_conflict_across_targets() {
+    let mut vm = GlobalState::new(SafeOption::default());
+    vm.open_stdlib(crate::stdlib::Stdlib::All).unwrap();
+    let result = vm.main_state().execute(
+        r#"
+        local t, c, p = {}, {}, 10
+        t[p], c[1], p = "x", p, p + 1
+        assert(t[10] == "x" and t[11] == nil and c[1] == 10 and p == 11)
+        local u, z, q = {}, 0, 5
+        u[q], z, q = "y", 1, q + 1
+        assert(u[5] == "y" and u[6] == nil and z == 1 and q == 6)
+        local s, d = {}, {}
+        local a = s
+        s.k, d.k, s = 1, 2, {}
+        assert(a.k == 1 and d.k == 2 and s.k == nil)
+    "#,
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
 // === Function Tests ===
 
 #[test]

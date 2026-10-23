@@ -2159,6 +2159,44 @@ SUPPLEMENT_PACKAGES = {
         "select": [("tex/xetex/xetexko", None)],
         "map_files": [],
     },
+    # LuaTeX-ja typesets Japanese under LuaLaTeX (the route for pLaTeX
+    # documents, #27). At load time it builds its CID fallback font from the
+    # Adobe-Japan1 CMaps and Adobe-Japan1-UCS2, which adobemapping provides;
+    # the other orderings' CMaps load only for Chinese and Korean CID fonts.
+    "luatexja": {
+        "version": "20261017.0",
+        "revision": 80679,
+        "license": "BSD-3-Clause",
+        "upstream_url": "https://mirror.aarnet.edu.au/pub/CTAN/systems/texlive/tlnet/archive/luatexja.tar.xz",
+        "upstream_sha256": "86875614b9d07049dfed6a6f0960a2af89238725f17364ce7c89c30900a8f37b",
+        "upstream_size_bytes": 200960,
+        "description": "LuaTeX-ja: Japanese typesetting for LuaLaTeX (classes, packages, Lua modules, JFMs)",
+        "source_obligations": "BSD-3-Clause; the TeX and Lua files are their own source. The copyright notice ships at the notices destination.",
+        "select": [("tex/luatex/luatexja", None)],
+        "map_files": [],
+        "notices": [
+            ("luatexja-COPYING.txt", "doc/luatex/luatexja/COPYING"),
+        ],
+    },
+    "adobemapping": {
+        "version": "TeX Live r66552",
+        "revision": 66552,
+        "license": "BSD-3-Clause",
+        "upstream_url": "https://mirror.aarnet.edu.au/pub/CTAN/systems/texlive/tlnet/archive/adobemapping.tar.xz",
+        "upstream_sha256": "a387389a11bd1220be3016ef74342bb9a4e1e888cee21379f3aadac786da1da1",
+        "upstream_size_bytes": 2178116,
+        "description": "Adobe-Japan1 CMaps and the pdf2unicode mappings LuaTeX-ja reads",
+        "source_obligations": "BSD-3-Clause; the CMap files are their own source. The copyright notices ship at the notices destinations.",
+        "select": [
+            ("fonts/cmap/adobemapping/cmap-resources/Adobe-Japan1-7/CMap", None),
+            ("fonts/cmap/adobemapping/mapping-resources-pdf/pdf2unicode", None),
+        ],
+        "map_files": [],
+        "notices": [
+            ("adobemapping-cmap-resources-LICENSE.md", "doc/fonts/adobemapping/cmap-resources/LICENSE.md"),
+            ("adobemapping-mapping-resources-pdf-LICENSE.txt", "doc/fonts/adobemapping/mapping-resources-pdf/LICENSE.txt"),
+        ],
+    },
 }
 # TeX Live's hyphenation support as its collection-lang* collections install
 # it: hyph-utf8 (encoding conversions, luatex-hyphen.lua), hyphen-base (the

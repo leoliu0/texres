@@ -1688,30 +1688,11 @@ fn restassign(fs: &mut FuncState, lh_id: LhsAssignId, nvars: usize) -> Result<()
             check_conflict(fs, lh_id, &nv_v);
         }
 
-        // Get updated lh_v after check_conflict for chain building
-        let updated_lh_v = {
-            let lh = fs
-                .compiler_state
-                .get_lhs_assign(lh_id)
-                .ok_or_else(|| "invalid LhsAssign id".to_string())?;
-            lh.v.clone()
-        };
-
-        // Get the prev id from current lh before creating new one
-        let prev_id = fs
-            .compiler_state
-            .get_lhs_assign(lh_id)
-            .and_then(|lh| lh.prev);
-
-        // Build chain: new node points to a copy of current lh (updated)
-        let new_prev_id = fs.compiler_state.alloc_lhs_assign(LhsAssign {
-            prev: prev_id,
-            v: updated_lh_v,
-        });
-
-        // Create new LhsAssign with the chain
+        // lparser.c: nv.prev = lh. The new node links to this node itself,
+        // so a later check_conflict updates the node this level stores
+        // through (`t[p], c[1], p = ...` keeps the old `p` as the key).
         let nv_id = fs.compiler_state.alloc_lhs_assign(LhsAssign {
-            prev: Some(new_prev_id),
+            prev: Some(lh_id),
             v: nv_v,
         });
 

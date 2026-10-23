@@ -199,3 +199,83 @@ p("lastannot", pdf.getlastannot(), pdf.getlastlink())
     let got = run_script("\\directlua{tex.enableprimitives('',{'outputmode'})}\\outputmode=1 ", script);
     assert!(got.contains(expected), "got: {got}");
 }
+
+/// `tex.get` on a glue parameter: a glue spec node without a boolean, all
+/// five values with `true` and only the width with `false` (LuaTeX-ja's
+/// ltj-lineskip.lua does arithmetic on `tex.get('baselineskip', false)`).
+// oracle: luatex --ini -interaction=nonstopmode (script in this test)
+#[test]
+fn tex_get_glue_returns_node_values_or_width() {
+    let out = run_script(
+        "\\baselineskip=12pt plus 1pt minus 2pt ",
+        r#"local a = {tex.get("baselineskip", false)}; local b = {tex.get("baselineskip", true)}; local c = tex.get("baselineskip")
+texio.write_nl("[false:" .. #a .. ":" .. tostring(a[1]) .. " true:" .. #b .. ":" .. tostring(b[1]) .. "," .. tostring(b[2]) .. " none:" .. type(c) .. "]")"#,
+    );
+    assert!(out.contains("[false:1:786432 true:5:786432,65536 none:userdata]"), "{out}");
+}
+
+/// Every `tex.nest` level has a `temp` head, also the levels this engine
+/// keeps no list for (math inside a box, alignment cells); LuaTeX-ja reads
+/// `tex.getnest(i).head.next` for every level down to 1.
+// oracle: luatex --ini -interaction=nonstopmode (script in this test)
+#[test]
+fn every_nest_level_has_a_head() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join(format!("lua_texlib-nest-{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"local r = {}
+for i = tex.nest.ptr, 0, -1 do
+  local n = tex.getnest(i)
+  r[#r+1] = i .. (n.head and (":" .. node.type(n.head.id) .. "/" .. tostring(n.head.next and node.type(n.head.next.id)) .. "/" .. (n.tail == n.head and "empty" or "list")) or ":nil")
+end
+texio.write_nl("[" .. table.concat(r, " ") .. "]")"#,
+    )
+    .unwrap();
+    let pre = format!(
+        "\\catcode`\\&=4 \\catcode`\\$=3 \\def\\p{{\\directlua{{dofile(\"{}\")}}}}\n\
+\\setbox0\\hbox{{$\\hbox{{\\vbox{{\\halign{{#\\cr\\p\\cr}}}}}}$}}\\setbox0\\hbox{{$\\p$}}",
+        path.display().to_string().replace('\\', "/")
+    );
+    let out = run_script(&pre, "");
+    assert!(out.contains("[5:temp/nil/empty 4:temp/nil/empty 3:temp/nil/empty 2:temp/nil/empty 1:temp/nil/empty 0:temp/nil/empty]"), "{out}");
+    assert!(out.contains("[2:temp/nil/empty 1:temp/nil/empty 0:temp/nil/empty]"), "{out}");
+}
+
+/// `user_defined` whatsits written into a list stay there with their
+/// values, also through `\unvbox` and `\copy`; LuaTeX-ja marks the direction
+/// of a list with one.
+// oracle: luatex --ini -interaction=nonstopmode (script in this test)
+#[test]
+fn user_defined_whatsits_stay_in_lists() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join(format!("lua_texlib-user-{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"local function w(t, v) local n = node.new("whatsit", "user_defined") n.user_id = 7 n.type = t n.value = v return n end
+UW = function()
+  node.write(w(100, 42)) node.write(w(115, "abc"))
+  local g = node.new("glue") g.width = 65536 node.write(w(110, g))
+end
+UR = function()
+  local t = {}
+  for n in node.traverse(tex.box[0].head) do
+    if n.id == node.id("whatsit") then
+      local v = n.value
+      t[#t+1] = n.user_id .. "/" .. n.type .. "/" .. (type(v) == "userdata" and (node.type(v.id) .. ":" .. v.width) or tostring(v))
+    else t[#t+1] = node.type(n.id) end
+  end
+  texio.write_nl("[" .. table.concat(t, ",") .. "]")
+end"#,
+    )
+    .unwrap();
+    let pre = format!(
+        "\\directlua{{dofile(\"{}\")}}\n\
+\\setbox0\\vbox{{\\directlua{{UW()}}\\hrule}}\\directlua{{UR()}}\n\
+\\setbox0\\vbox{{\\setbox2\\vbox{{\\directlua{{UW()}}}}\\unvbox2 \\hrule}}\\directlua{{UR()}}\n\
+\\setbox0\\copy0 \\directlua{{UR()}}",
+        path.display().to_string().replace('\\', "/")
+    );
+    let out = run_script(&pre, "");
+    assert_eq!(out.matches("[7/100/42,7/115/abc,7/110/glue:65536,rule]").count(), 3, "{out}");
+}

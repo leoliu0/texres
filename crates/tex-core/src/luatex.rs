@@ -370,9 +370,12 @@ impl Engine {
             return;
         }
         let (table, backend) = self.resolve_lua_primitives();
+        // the frozen `\pdfprimitive` runs `\primitive` on a non-expandable
+        // primitive (`\primitive\everymath`), so it keeps its meaning
+        let frozen = self.ids.frozen_primitive;
         for id in self.cs.all_ids() {
             let name = self.cs.name(id);
-            if name.starts_with(b"TeXres") || name.starts_with(b"texres") {
+            if id == frozen || name.starts_with(b"TeXres") || name.starts_with(b"texres") {
                 continue;
             }
             if matches!(self.eqtb.get(id), Some(Equiv::Prim(_))) {

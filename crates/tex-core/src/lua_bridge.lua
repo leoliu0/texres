@@ -578,6 +578,26 @@ local function memoize_getinfo()
   end
 end
 
+-- Fonts are hermetic: texres opens no font from the OS font stores, so the
+-- names database leaves out luaotfload's "system" location ($OSFONTDIR and
+-- the fontconfig directories). Scanning a desktop's thousands of fonts made
+-- the first LuaLaTeX run take tens of seconds, for entries no lookup could
+-- load. The configuration's precedence list goes through the same filter.
+local function hermetic_font_locations()
+  local fonts = _G.fonts
+  local names = type(fonts) == "table" and fonts.names
+  local set = type(names) == "table" and names.set_location_precedence
+  if type(set) ~= "function" then return end
+  names.set_location_precedence = function(precedence)
+    local kept = {}
+    for _, location in ipairs(type(precedence) == "table" and precedence or {}) do
+      if location ~= "system" then kept[#kept + 1] = location end
+    end
+    return set(kept)
+  end
+  names.set_location_precedence({ "local", "system", "texmf" })
+end
+
 -- luainit.c: package.searchers = { preload, kpse lua searcher }.
 local function preload_searcher(name)
   local f = package.preload[name]
@@ -609,7 +629,13 @@ local function kpse_lua_searcher(name)
     local load_database = f
     f = function(...)
       memoize_getinfo()
-      return load_database(...)
+      local init = load_database(...)
+      if type(init) ~= "function" then return init end
+      return function(...)
+        local result = init(...)
+        hermetic_font_locations()
+        return result
+      end
     end
   end
   return f

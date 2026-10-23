@@ -178,7 +178,7 @@ impl Engine {
         debug_assert_eq!(self.engine_kind, EngineKind::XeTeX);
         let normalization = self.eqtb.int_params[IntParam::XeTeXInputNormalization.idx() as usize];
         let default = self.xetex_default_encoding;
-        let Source::File { name, data, pos, line_no, line_start, state, xetex_enc, .. } =
+        let Source::File { name, data, pos, line_no, line_start, state, xetex_enc, pseudo_breaks, .. } =
             &mut self.input.stack[si]
         else {
             self.spare_line_buf = buf;
@@ -211,7 +211,10 @@ impl Engine {
                 utf16_line(data, start, *xetex_enc == Enc::Utf16Be, &mut text)
             }
             enc => {
-                let (end, next) = physical_line_bounds(data, start);
+                let (end, next) = match pseudo_breaks {
+                    Some(breaks) => crate::input::pseudo_line_bounds(data, breaks, start),
+                    None => physical_line_bounds(data, start),
+                };
                 let raw = &data[start..end];
                 match enc {
                     Enc::Raw => raw.iter().for_each(|&b| push_scalar(&mut text, u32::from(b))),

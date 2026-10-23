@@ -433,6 +433,17 @@ impl LocalParMode {
     }
 }
 
+/// The fields of a LuaTeX `user_defined` whatsit (`type` is the value's
+/// kind: `d` number, `s` string, `n` node list, ...).
+#[derive(Clone, Debug)]
+pub struct UserWhatsit {
+    pub user_id: i32,
+    pub kind: i32,
+    pub number: i32,
+    pub text: Vec<u8>,
+    pub list: NodeList,
+}
+
 #[derive(Clone, Debug)]
 pub enum WhatIt {
     /// LuaTeX boundary node (`\boundary`, `\wordboundary`,
@@ -555,10 +566,12 @@ pub enum WhatIt {
         rhm: u8,
     },
     Special(String),
+    /// LuaTeX `user_defined` whatsit: no output; Lua reads it back when the
+    /// list comes to Lua again (LuaTeX-ja marks list directions with them).
+    User(Box<UserWhatsit>),
     SavePos {
         obj: i32,
     },
-    User(i32),
     CjkText(Option<char>),
     /// `\pdfinterwordspaceon` (true) / `\pdfinterwordspaceoff` (false).
     PdfInterwordSpace(bool),

@@ -42,8 +42,17 @@ pub fn detect_program_directive(source: &str) -> Option<EngineKind> {
     None
 }
 
-/// Packages that only work under LuaTeX.
-const LUATEX_PACKAGES: &[&str] = &["luatexja", "luacode", "luatextra"];
+/// Packages and classes that only work under LuaTeX: LuaTeX-ja (its
+/// `luatexja-*` packages and `ltj*` classes) and Lua code packages (keep the
+/// lists in sync with `LUATEX_PACKAGES`/`LUATEX_CLASSES` in `texmk.rs`).
+const LUATEX_PACKAGES: &[&str] = &[
+    "luatexja", "luatexja-adjust", "luatexja-ajmacros", "luatexja-compat", "luatexja-fontspec",
+    "luatexja-otf", "luatexja-preset", "luatexja-ruby", "luatexja-zhfonts", "luacode", "luatextra",
+];
+const LUATEX_CLASSES: &[&str] = &[
+    "ltjarticle", "ltjbook", "ltjreport", "ltjsarticle", "ltjsbook", "ltjsreport", "ltjskiyou", "ltjspf",
+    "ltjtarticle", "ltjtbook", "ltjtreport",
+];
 
 /// Packages and classes which TeX Live compiles only with a Unicode engine
 /// (XeTeX or LuaTeX). A document that requires one and no LuaTeX-only package
@@ -115,12 +124,14 @@ pub fn detect_required_engine_from_source(source: &str) -> Option<EngineKind> {
             .flat_map(|cmd| command_arguments(&preamble, cmd))
             .any(|package| names.contains(&package))
     };
-    if packages(LUATEX_PACKAGES) || preamble.contains("\\directlua") {
+    let classes = command_arguments(&preamble, "\\documentclass");
+    if packages(LUATEX_PACKAGES)
+        || classes.iter().any(|class| LUATEX_CLASSES.contains(class))
+        || preamble.contains("\\directlua")
+    {
         return Some(EngineKind::LuaTeX);
     }
-    let unicode_class = command_arguments(&preamble, "\\documentclass")
-        .iter()
-        .any(|class| UNICODE_ENGINE_CLASSES.contains(class));
+    let unicode_class = classes.iter().any(|class| UNICODE_ENGINE_CLASSES.contains(class));
     (unicode_class || packages(UNICODE_ENGINE_PACKAGES)).then_some(EngineKind::XeTeX)
 }
 
@@ -165,6 +176,8 @@ mod tests {
     fn lua_only_packages_select_luatex_in_any_preamble_form() {
         let doc = |pre: &str| format!("{pre}\n\\begin{{document}}x\\end{{document}}");
         assert_eq!(detect(&doc(r"\documentclass{article}\usepackage[x]{amsmath,luacode}")), Some(EngineKind::LuaTeX));
+        assert_eq!(detect(&doc(r"\documentclass{ltjsarticle}")), Some(EngineKind::LuaTeX));
+        assert_eq!(detect(&doc(r"\documentclass{article}\usepackage{fontspec}\usepackage{luatexja-fontspec}")), Some(EngineKind::LuaTeX));
         assert_eq!(detect(&doc("\\documentclass{article}\n\\usepackage[opt]\n  { luatexja }")), Some(EngineKind::LuaTeX));
         assert_eq!(detect(&doc(r"\documentclass{article}\RequirePackage{luatextra}")), Some(EngineKind::LuaTeX));
         assert_eq!(detect(&doc(r"\documentclass{article}\directlua{tex.print(1)}")), Some(EngineKind::LuaTeX));

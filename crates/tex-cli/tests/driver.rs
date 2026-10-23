@@ -3442,3 +3442,66 @@ fn latexmk_options_from_editors_stay_out_of_the_engine() {
         assert!(!args.contains(&latexmk_only), "{latexmk_only} reached the engine: {args:?}");
     }
 }
+
+/// #26: one engine pass through `texres` itself, with no link named after
+/// the engine: `texres pdflatex …` and `texres -progname=pdflatex …`.
+#[test]
+fn engine_passes_run_without_a_link() {
+    let fixture = Fixture(std::env::temp_dir().join(format!(
+        "texres-engine-pass-{}", std::process::id()
+    )));
+    std::fs::create_dir_all(&fixture.0).unwrap();
+    fixture.write("hello.tex", "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n");
+    let texres = env!("CARGO_BIN_EXE_texres");
+    for args in [
+        &["pdflatex", "-interaction=nonstopmode", "hello.tex"][..],
+        &["-progname=pdflatex", "-interaction=nonstopmode", "hello.tex"],
+    ] {
+        let _ = std::fs::remove_file(fixture.0.join("hello.pdf"));
+        let _ = std::fs::remove_file(fixture.0.join("hello.log"));
+        let output = Command::new(texres)
+            .args(args).current_dir(&fixture.0).env_clear()
+            .env("HOME", fixture.0.join("home"))
+            .env("TEX_RS_CACHE_DIR", fixture.0.join("cache"))
+            .env("TEXMFDIST", fixture.0.join("absent-texmf"))
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(fixture.0.join("hello.pdf").is_file(), "{args:?}");
+        // A single engine pass writes its log next to the source; texmk
+        // keeps auxiliary files in its cache and reports its own steps.
+        assert!(fixture.0.join("hello.log").is_file(), "{args:?}");
+        assert!(!stderr.contains("texmk:"), "{args:?}: {stderr}");
+    }
+}
+
+/// #27: a class that needs pLaTeX gets a hint naming the missing engine and
+/// the supported route, and `-platex` is refused with the same route.
+#[test]
+fn platex_classes_explain_the_supported_route() {
+    let fixture = Fixture(std::env::temp_dir().join(format!(
+        "texres-platex-{}", std::process::id()
+    )));
+    std::fs::create_dir_all(&fixture.0).unwrap();
+    fixture.write("repro.cls", "\\NeedsTeXFormat{pLaTeX2e}\n\\ProvidesClass{repro}\n\\LoadClass{article}\n");
+    fixture.write("repro.tex", "\\documentclass{repro}\n\\begin{document}\nHello.\n\\end{document}\n");
+    let texres = env!("CARGO_BIN_EXE_texres");
+    let run = |args: &[&str]| {
+        Command::new(texres)
+            .args(args).current_dir(&fixture.0).env_clear()
+            .env("HOME", fixture.0.join("home"))
+            .env("TEX_RS_CACHE_DIR", fixture.0.join("cache"))
+            .env("TEXMFDIST", fixture.0.join("absent-texmf"))
+            .output().unwrap()
+    };
+    let output = run(&["-halt-on-error", "repro.tex"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("needs format `pLaTeX2e'"), "{stderr}");
+    assert!(stderr.contains("help:") && stderr.contains("LuaTeX-ja"), "{stderr}");
+
+    let output = run(&["-platex", "repro.tex"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("pTeX") && stderr.contains("LuaTeX-ja"), "{stderr}");
+}

@@ -13,6 +13,33 @@ use std::rc::Rc;
 const MAX_FONT_DIMENS: i32 = 65_536;
 const MAX_PAR_SHAPE_ENTRIES: i32 = 65_535;
 
+/// Assignments that main control runs itself (`main_dispatch`) rather than
+/// `try_assignment`. tex.web §1269 (and pdfTeX's and LuaTeX's
+/// `prefixed_command`) inserts the `\afterassignment` token after each of
+/// them; pdfTeX's `\pdffontexpand` and LuaTeX's `\initcatcodetable` and
+/// `\savecatcodetable` are not prefixed commands and do not.
+fn assigns_in_main_control(p: Prim) -> bool {
+    matches!(
+        p,
+        Prim::Font
+            | Prim::Letterspacefont
+            | Prim::PdfCopyFont
+            | Prim::PdfNoLigatures
+            | Prim::TextFont
+            | Prim::ScriptFont
+            | Prim::ScriptScriptFont
+            | Prim::CatCode
+            | Prim::MathCode
+            | Prim::DelCode
+            | Prim::LcCodeP
+            | Prim::UcCodeP
+            | Prim::SfCodeP
+            | Prim::Hyphenation
+            | Prim::Patterns
+            | Prim::CatCodeTable
+    )
+}
+
 impl Engine {
     /// Reject line-breaking parameter values whose signed meaning cannot be
     /// represented safely. This is centralized so direct assignments and
@@ -347,6 +374,9 @@ impl Engine {
             }
         }
         self.main_dispatch(p, id);
+        if assigns_in_main_control(p) {
+            self.trigger_after_assignment();
+        }
     }
 
     /// A control sequence whose meaning is not a primitive.
@@ -371,6 +401,7 @@ impl Engine {
                 self.eqtb.define_cur_font(f, g);
                 self.clear_prefixes();
                 self.space_factor = 1000;
+                self.trigger_after_assignment();
             }
             // register alias assignment target (\countdef'd cs etc.)
             Some(
@@ -1478,26 +1509,6 @@ impl Engine {
                     self.outer_scan_file_ended(definition_start.as_ref());
                     t2 = Token::char(2, b'}' as u32);
                 }
-                if self.is_macro_param(t2) {
-                    if !self.scanned_token_list_has_room(
-                        parameter_tokens,
-                        1,
-                        "macro parameter text size",
-                        definition_start.as_ref(),
-                    ) {
-                        if preserve_trace {
-                            self.diagnostic_trace_hold -= 1;
-                        }
-                        return;
-                    }
-                    parameter_tokens += 1;
-                    if let Some(last) = params.last_mut() {
-                        last.push(Token::char(6, b'#' as u32));
-                    } else {
-                        self.def_prefix.push(Token::char(6, b'#' as u32));
-                    }
-                    continue;
-                }
                 if t2.is_char() && t2.cc() == 1 {
                     // tex.web §476 (hash_brace): `#{` — the brace becomes the
                     // last parameter's delimiter; param text ends here WITHOUT
@@ -1997,6 +2008,9 @@ impl Engine {
                         }
                     } else {
                         self.main_dispatch(p, id);
+                        if assigns_in_main_control(p) {
+                            self.trigger_after_assignment();
+                        }
                     }
                     return;
                 }

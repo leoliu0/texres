@@ -300,6 +300,43 @@
     "min_ink_pixels": 1000
   },
   {
+    "name": "luatexja_ltjsarticle",
+    "description": "LuaTeX-ja port of a jsarticle document (#27): ltjsarticle, \\zw spacing, JFM glue and the Harano Aji fonts under LuaLaTeX",
+    "dir": "luatexja_ltjsarticle",
+    "main_tex": "main.tex",
+    "engine": "lualatex",
+    "reference_engine": "lualatex",
+    "required_fonts": [
+      "LMRoman",
+      "HaranoAjiMincho",
+      "HaranoAjiGothic"
+    ],
+    "expected_text": [
+      "LuaTeX-ja",
+      "日本語の段落が続きます",
+      "ゴシック体の日本語",
+      "明朝体の日本語"
+    ],
+    "check_type": "native_fontspec",
+    "min_ink_pixels": 1000
+  },
+  {
+    "name": "luatexja_ltjtarticle",
+    "description": "LuaTeX-ja vertical writing (#27): ltjtarticle page layout, rotated text body and vertical punctuation under LuaLaTeX",
+    "dir": "luatexja_ltjtarticle",
+    "main_tex": "main.tex",
+    "engine": "lualatex",
+    "reference_engine": "lualatex",
+    "required_fonts": [
+      "HaranoAjiMincho"
+    ],
+    "expected_text": [
+      "ABC 123"
+    ],
+    "check_type": "native_fontspec",
+    "min_ink_pixels": 500
+  },
+  {
     "name": "opentype_cff",
     "description": "Native OpenType font selection with CFF outline program (OTTO / CIDFontType0)",
     "dir": "opentype_cff",

@@ -167,6 +167,11 @@ pub enum Source {
         announced: bool,
         /// XeTeX: how the bytes of this file are decoded (`\XeTeXinputencoding`).
         xetex_enc: crate::xetex_input::Enc,
+        /// A `\scantokens` pseudo-file's line ends: the offsets of its
+        /// `\newlinechar` bytes. e-TeX's `pseudo_start` breaks lines there
+        /// only, so a carriage return or line feed inside the text stays in
+        /// the line (`\meaning` of LaTeX's `\@outputpage` holds `\^^M`).
+        pseudo_breaks: Option<Rc<[usize]>>,
     },
     TokList {
         /// `toks.as_ptr()`: the cursor's view of the list.
@@ -469,6 +474,16 @@ pub struct InputStack {
     /// `current_file_line` runs on hot paths (every skipped conditional)
     /// below stacks of macro frames.
     top_file: std::cell::Cell<usize>,
+}
+
+/// The content end and next-line offset of a pseudo-file line that starts
+/// at `start`: the line ends at the next recorded line break.
+pub(crate) fn pseudo_line_bounds(data: &[u8], breaks: &[usize], start: usize) -> (usize, usize) {
+    let index = breaks.partition_point(|&end| end < start);
+    match breaks.get(index) {
+        Some(&end) => (end, end + 1),
+        None => (data.len(), data.len()),
+    }
 }
 
 /// Return the content end and next-line offset for a physical line.
@@ -871,8 +886,17 @@ impl InputStack {
             tracked: false,
             announced: false,
             xetex_enc: crate::xetex_input::Enc::Default,
+            pseudo_breaks: None,
         });
         self.top_file.set(self.stack.len() - 1);
+    }
+
+    /// Push a `\scantokens` pseudo-file whose lines end at `breaks`.
+    pub(crate) fn push_pseudo_file(&mut self, name: String, data: Vec<u8>, breaks: Vec<usize>) {
+        self.push_file(name, data);
+        if let Some(Source::File { pseudo_breaks, .. }) = self.stack.last_mut() {
+            *pseudo_breaks = Some(breaks.into());
+        }
     }
 
     /// Push a file whose lines come from an `open_read_file` object.
@@ -916,6 +940,7 @@ impl InputStack {
             tracked: false,
             announced: false,
             xetex_enc: crate::xetex_input::Enc::Utf8,
+            pseudo_breaks: None,
         });
         self.top_file.set(self.stack.len() - 1);
     }
@@ -1095,6 +1120,7 @@ mod tests {
             tracked: false,
             announced: false,
             xetex_enc: crate::xetex_input::Enc::Default,
+            pseudo_breaks: None,
         });
 
         let context = input

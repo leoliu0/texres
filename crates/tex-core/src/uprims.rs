@@ -790,8 +790,9 @@ impl Engine {
             UPrim::ScanTextokens => {
                 let toks = self.scan_general_text();
                 let text = self.tokens_to_bytes(&toks);
+                let breaks = self.pseudo_line_breaks(&text);
                 if self.ensure_input_stack_room(1) {
-                    self.input.push_file("<scantextokens>".to_string(), text);
+                    self.input.push_pseudo_file("<scantextokens>".to_string(), text, breaks);
                 }
             }
             UPrim::ImmediateAssignment | UPrim::ImmediateAssigned => {
