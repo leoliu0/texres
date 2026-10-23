@@ -238,11 +238,9 @@ fn default_path_template(fmt: &FormatInfo) -> String {
         return ".".to_string();
     }
     let specs: Vec<String> = fmt.path.split(':').map(|spec| format!("$TEXMF/{spec}")).collect();
-    // Font searches also cover the operating system's fonts (`$OSFONTDIR//`).
-    let system = if matches!(fmt.var, "OPENTYPEFONTS" | "TTFONTS" | "T1FONTS" | "AFMFONTS") {
-        if cfg!(windows) { ";$OSFONTDIR//" } else { ":$OSFONTDIR//" }
-    } else { "" };
-    format!(".{PATH_SEPARATOR}{}{system}", specs.join(PATH_SEPARATOR))
+    // Fonts are hermetic: unlike TeX Live's, the font paths leave out the
+    // operating system's fonts (`$OSFONTDIR`), which texres never loads.
+    format!(".{PATH_SEPARATOR}{}", specs.join(PATH_SEPARATOR))
 }
 
 /// `$VAR` / `${VAR}` expansion as `kpathsea_var_expand`.

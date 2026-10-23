@@ -80,20 +80,23 @@ P(n)
     assert_eq!(lines[8], "72");
 }
 
-/// The font search paths cover the bundled fonts, and the cache variables
-/// luaotfload's `caches` setup reads name a directory it can create.
+/// The font search paths cover the bundled fonts and, fonts being hermetic,
+/// not the operating system's (luaotfload's names database scans them), and
+/// the cache variables luaotfload's `caches` setup reads name a directory it
+/// can create.
 #[test]
 fn search_paths_and_cache_variables() {
     let got = run(r#"
 local dirs = kpse.expand_path(kpse.show_path('opentype fonts'))
 P(dirs:find('/<embedded>/fonts/opentype/public/lm', 1, true) ~= nil)
+P(kpse.show_path('opentype fonts'):find('OSFONTDIR', 1, true) == nil, kpse.show_path('truetype fonts'):find('OSFONTDIR', 1, true) == nil)
 local cache = kpse.expand_var('$TEXMFCACHE')
 P(cache == kpse.expand_var('$TEXMFVAR'), cache:match('texmf%-var$') ~= nil)
 lfs.mkdirp(cache .. '/')
 P(lfs.isdir(cache), lfs.isdir(cache .. '/luatex-cache') == false)
 P(kpse.out_name_ok_silent_extended(cache .. '/luatex-cache/generic/x'))
 "#);
-    assert_eq!(got.lines().collect::<Vec<_>>(), ["true", "true | true", "true | true", "true"]);
+    assert_eq!(got.lines().collect::<Vec<_>>(), ["true", "true | true", "true | true", "true | true", "true"]);
 }
 
 /// Scanning Kpathsea's native path list must discover each face, including
