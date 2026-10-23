@@ -251,15 +251,35 @@ fn run_hooks(commands: &[String], opt: &Options) {
 /// (XeTeX or LuaTeX); pdfLaTeX rejects them or lacks their fonts.
 const UNICODE_ENGINE_PACKAGES: &[&str] = &["ctex", "xeCJK", "fontspec", "unicode-math", "polyglossia"];
 const UNICODE_ENGINE_CLASSES: &[&str] = &["ctexart", "ctexbook", "ctexrep", "ctexbeamer"];
+/// Packages and classes that only work under LuaTeX: LuaTeX-ja (its
+/// `luatexja-*` packages and `ltj*` classes) and Lua code packages.
+const LUATEX_PACKAGES: &[&str] = &[
+    "luatexja", "luatexja-adjust", "luatexja-ajmacros", "luatexja-compat", "luatexja-fontspec",
+    "luatexja-otf", "luatexja-preset", "luatexja-ruby", "luatexja-zhfonts", "luacode", "luatextra",
+];
+const LUATEX_CLASSES: &[&str] = &[
+    "ltjarticle", "ltjbook", "ltjreport", "ltjsarticle", "ltjsbook", "ltjsreport", "ltjskiyou", "ltjspf",
+    "ltjtarticle", "ltjtbook", "ltjtreport",
+];
 
-/// Without an explicit engine option, documents whose preamble requires a
-/// Unicode engine run as xelatex; everything else runs as pdflatex.
+/// Without an explicit engine option, documents whose preamble needs LuaTeX
+/// run as lualatex, those that require another Unicode engine as xelatex,
+/// and everything else as pdflatex.
 fn detect_engine(src_path: &Path) -> &'static str {
     match std::fs::read(src_path) {
-        Ok(source) if preamble_requires_unicode_engine(&String::from_utf8_lossy(&source)) => {
-            "xelatex"
-        }
-        _ => "pdflatex",
+        Ok(source) => engine_for_source(&String::from_utf8_lossy(&source)),
+        Err(_) => "pdflatex",
+    }
+}
+
+fn engine_for_source(source: &str) -> &'static str {
+    let preamble = tex_preamble(source);
+    if preamble_names(&preamble, LUATEX_CLASSES, LUATEX_PACKAGES) {
+        "lualatex"
+    } else if preamble_names(&preamble, UNICODE_ENGINE_CLASSES, UNICODE_ENGINE_PACKAGES) {
+        "xelatex"
+    } else {
+        "pdflatex"
     }
 }
 
@@ -277,7 +297,8 @@ fn strip_tex_comment(line: &str) -> &str {
     line
 }
 
-fn preamble_requires_unicode_engine(source: &str) -> bool {
+/// The source up to `\\begin{document}`, without comments.
+fn tex_preamble(source: &str) -> String {
     let mut preamble = String::new();
     for line in source.lines() {
         let line = strip_tex_comment(line);
@@ -288,12 +309,17 @@ fn preamble_requires_unicode_engine(source: &str) -> bool {
         preamble.push_str(line);
         preamble.push('\n');
     }
+    preamble
+}
+
+/// Whether the preamble loads one of `classes` or `packages`.
+fn preamble_names(preamble: &str, classes: &[&str], packages: &[&str]) -> bool {
     for (command, names) in [
-        ("\\documentclass", UNICODE_ENGINE_CLASSES),
-        ("\\usepackage", UNICODE_ENGINE_PACKAGES),
-        ("\\RequirePackage", UNICODE_ENGINE_PACKAGES),
+        ("\\documentclass", classes),
+        ("\\usepackage", packages),
+        ("\\RequirePackage", packages),
     ] {
-        let mut rest = preamble.as_str();
+        let mut rest = preamble;
         while let Some(start) = rest.find(command) {
             rest = &rest[start + command.len()..];
             if rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '@') {
@@ -374,7 +400,8 @@ fn usage() {
   -v, --version                 version
 Viewer options (-view=..., -pv, -new-viewer) are accepted and ignored.
 Other commands: texres fmt [--check] FILE...   format LaTeX sources and .bib files (see texres fmt --help)
-                texres latexdiff OLD.tex NEW.tex DIFF.tex"
+                texres latexdiff OLD.tex NEW.tex DIFF.tex
+                texres pdflatex|xelatex|lualatex ARGS...     one engine pass (also: -progname=NAME)"
     );
 }
 
@@ -502,9 +529,10 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
                     .ok_or_else(|| "-synctex needs a value".to_string())?;
                 passthrough.push(format!("-synctex={value}"));
             }
-            "-pdf" | "--pdf" => engine = Some("pdflatex".to_string()),
+            "-pdf" | "--pdf" | "-pdflatex" | "--pdflatex" => engine = Some("pdflatex".to_string()),
             "-pdfxe" | "-xelatex" | "--xelatex" => engine = Some("xelatex".to_string()),
             "-pdflua" | "-lualatex" | "--lualatex" => engine = Some("lualatex".to_string()),
+            "-platex" | "--platex" | "-uplatex" | "--uplatex" => return Err(PTEX_UNSUPPORTED.to_string()),
             "-h" | "-help" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -4674,6 +4702,42 @@ fn run_embedded_engine(program: &str) {
     embedded_engine::main();
 }
 
+/// pLaTeX and upLaTeX run on pTeX (Japanese primitives such as the `zw`
+/// unit, DVI output), which TeXres does not implement; LuaTeX-ja, which it
+/// bundles, is the LuaLaTeX counterpart.
+const PTEX_UNSUPPORTED: &str = "pLaTeX and upLaTeX need the pTeX engine, which TeXres does not provide. \
+Build these documents with TeX Live's platex/uplatex and dvipdfmx, or port them to LuaTeX-ja, which TeXres \
+bundles: use ltjsarticle for jsarticle (ltjsbook for jsbook, ltjarticle for jarticle) and \\zw for the zw unit.";
+
+const ENGINE_PROGRAMS: [&str; 3] = ["pdflatex", "xelatex", "lualatex"];
+
+/// One engine pass through `texres` itself (#26): `texres pdflatex ARGS`, or
+/// `-progname=NAME` anywhere in the arguments as with `pdftex`. Returns the
+/// engine and its argv (program name first); the `-progname` option stays in
+/// the engine's arguments.
+fn engine_invocation(args: &[String]) -> Option<(&'static str, Vec<String>)> {
+    let engine = |name: &str| ENGINE_PROGRAMS.into_iter().find(|program| *program == name);
+    let rest = args.get(1..).unwrap_or_default();
+    if let Some(program) = rest.first().and_then(|first| engine(first)) {
+        return Some((program, std::iter::once(program.to_string()).chain(rest[1..].iter().cloned()).collect()));
+    }
+    let program = rest.iter().enumerate().find_map(|(index, arg)| {
+        let name = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+        match name.strip_prefix("progname") {
+            Some(value) if value.starts_with('=') => engine(&value[1..]),
+            Some("") => rest.get(index + 1).and_then(|value| engine(value)),
+            _ => None,
+        }
+    })?;
+    Some((program, std::iter::once(program.to_string()).chain(rest.iter().cloned()).collect()))
+}
+
+fn run_engine_pass(program: &str, argv: Vec<String>) {
+    enable_embedded_resources_by_default();
+    std::env::set_var("TEX_SUITE_PROGRAM_NAME", program);
+    embedded_engine::main_with_args(argv.into_iter().map(OsString::from).collect());
+}
+
 pub(crate) fn main() {
     match std::env::var(TEXMK_INTERNAL_MODE_ENV).as_deref() {
         Ok("engine") => {
@@ -4709,6 +4773,10 @@ pub(crate) fn main() {
         }
         _ if args.get(1).is_some_and(|a| a == "fmt") => {
             std::process::exit(tex_format::cli::run(&args[2..]));
+        }
+        _ if engine_invocation(&args).is_some() => {
+            let (program, argv) = engine_invocation(&args).unwrap();
+            run_engine_pass(program, argv);
         }
         _ => std::process::exit(real_main()),
     }
@@ -4849,7 +4917,7 @@ mod io_safety_tests {
             "\\documentclass{article}\n\\usepackage { xeCJK }\n",
             "\\documentclass{article}\n\\usepackage{polyglossia} % \\usepackage{x}\n",
         ] {
-            assert!(preamble_requires_unicode_engine(source), "{source}");
+            assert_eq!(engine_for_source(source), "xelatex", "{source}");
         }
         for source in [
             "\\documentclass{article}\n% \\usepackage{fontspec}\n\\begin{document}\n",
@@ -4860,11 +4928,25 @@ mod io_safety_tests {
             "\\documentclass{article}\n\\newcommand\\x{100\\% fontspec}\n",
             "\\documentclass{ctexartx}\n\\usepackage[ctex]{foo}\n",
         ] {
-            assert!(!preamble_requires_unicode_engine(source), "{source}");
+            assert_eq!(engine_for_source(source), "pdflatex", "{source}");
         }
-        assert!(preamble_requires_unicode_engine(
-            "\\documentclass{article}\n\\def\\p{100\\%}\\usepackage{fontspec}\n"
-        ));
+        assert_eq!(engine_for_source("\\documentclass{article}\n\\def\\p{100\\%}\\usepackage{fontspec}\n"), "xelatex");
+    }
+
+    /// LuaTeX-ja's classes and packages need LuaTeX, also beside a package
+    /// that XeTeX would take (fontspec).
+    #[test]
+    fn preambles_needing_luatex_select_lualatex() {
+        for source in [
+            "\\documentclass{ltjsarticle}\n\\begin{document}x\\end{document}\n",
+            "\\documentclass[a4paper]{ltjtbook}\n",
+            "\\documentclass{article}\n\\usepackage{luatexja}\n",
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\usepackage[match]{luatexja-fontspec}\n",
+            "\\documentclass{article}\n\\usepackage{luacode}\n",
+        ] {
+            assert_eq!(engine_for_source(source), "lualatex", "{source}");
+        }
+        assert_eq!(engine_for_source("\\documentclass{article}\n% \\usepackage{luatexja}\n"), "pdflatex");
     }
 
     #[test]
@@ -4927,6 +5009,28 @@ mod latexmk_option_tests {
             .map(str::to_string)
             .collect();
         parse_args(&argv)
+    }
+
+    /// Bare `-pdflatex` selects pdfLaTeX, as `-xelatex` and `-lualatex` select
+    /// theirs; `-pdflatex=COMMAND` is still refused.
+    #[test]
+    fn bare_pdflatex_selects_the_engine() {
+        for flag in ["-pdflatex", "--pdflatex"] {
+            let options = parse(&["-xelatex", flag, "paper.tex"]).unwrap();
+            assert_eq!(options.engine.as_deref(), Some("pdflatex"), "{flag}");
+            assert!(!options.passthrough.contains(&flag.to_string()), "{flag}");
+        }
+        assert!(parse(&["-pdflatex=pdflatex -shell-escape %O %S", "paper.tex"]).is_err());
+    }
+
+    /// #27: pLaTeX and upLaTeX need the pTeX engine, which TeXres lacks.
+    #[test]
+    fn platex_and_uplatex_are_refused_with_the_migration_path() {
+        for flag in ["-platex", "--platex", "-uplatex", "--uplatex"] {
+            let error = parse(&[flag, "paper.tex"]).err().unwrap_or_else(|| panic!("{flag} was accepted"));
+            assert!(error.contains("pTeX"), "{flag}: {error}");
+            assert!(error.contains("LuaTeX-ja"), "{flag}: {error}");
+        }
     }
 
     /// vimtex's `-e` arguments, built by `s:wrap_option_appendcmd` in
@@ -5055,6 +5159,63 @@ mod latexmk_option_tests {
             let argv: Vec<&str> = args.iter().copied().chain(["main.tex"]).collect();
             let error = parse(&argv).err().unwrap_or_else(|| panic!("{args:?} was accepted"));
             assert!(error.contains(reason), "{args:?}: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod engine_invocation_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("texres").chain(list.iter().copied()).map(str::to_string).collect()
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// #26: `texres pdflatex …` runs one engine pass, as a link named
+    /// `pdflatex` would.
+    #[test]
+    fn an_engine_subcommand_runs_one_pass_of_that_engine() {
+        for engine in ["pdflatex", "xelatex", "lualatex"] {
+            let (program, argv) =
+                engine_invocation(&args(&[engine, "-ini", "&pdflatex", "pre.tex"])).unwrap();
+            assert_eq!(program, engine);
+            assert_eq!(argv, strings(&[engine, "-ini", "&pdflatex", "pre.tex"]));
+        }
+    }
+
+    /// #26: `-progname=NAME` selects the engine as it does for `pdftex`, and
+    /// stays in the engine's arguments.
+    #[test]
+    fn progname_selects_the_engine() {
+        for (given, engine) in [
+            (&["-progname=pdflatex", "-ini", "&pdflatex", "pre.tex"][..], "pdflatex"),
+            (&["--progname=xelatex", "doc.tex"][..], "xelatex"),
+            (&["-progname", "lualatex", "doc.tex"][..], "lualatex"),
+            (&["-ini", "-progname=pdflatex", "pre.tex"][..], "pdflatex"),
+        ] {
+            let (program, argv) = engine_invocation(&args(given)).unwrap();
+            assert_eq!(program, engine, "{given:?}");
+            let mut expected = vec![engine.to_string()];
+            expected.extend(strings(given));
+            assert_eq!(argv, expected, "{given:?}");
+        }
+    }
+
+    #[test]
+    fn other_invocations_stay_with_texmk() {
+        for given in [
+            &[][..],
+            &["paper.tex"],
+            &["-pdf", "paper.tex"],
+            &["pdflatex.tex"],
+            &["-progname=platex", "paper.tex"],
+            &["paper.tex", "pdflatex"],
+        ] {
+            assert!(engine_invocation(&args(given)).is_none(), "{given:?}");
         }
     }
 }

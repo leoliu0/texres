@@ -1023,11 +1023,11 @@ impl Engine {
         };
 
         if diagnostic.help.is_none() {
-            diagnostic.help = if custom_help.is_empty() {
+            diagnostic.help = format_mismatch_help(message).or(if custom_help.is_empty() {
                 default_help(message)
             } else {
                 Some(custom_help)
-            };
+            });
         }
 
         (diagnostic, cause_level)
@@ -1883,8 +1883,8 @@ fn unlocated_diagnostic(
         related: None,
         expansion: Vec::new(),
         included_from: Vec::new(),
-        help: help
-            .map(|text| bounded_text(text.trim(), MAX_HELP_BYTES))
+        help: format_mismatch_help(message)
+            .or_else(|| help.map(|text| bounded_text(text.trim(), MAX_HELP_BYTES)))
             .or_else(|| default_help(message)),
         note: None,
         hidden: 0,
@@ -2004,6 +2004,20 @@ fn clean_help_without_interactive_boilerplate(help: &str) -> String {
 fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let rest = text.split_once(start)?.1;
     Some(rest.split_once(end)?.0)
+}
+
+/// `\NeedsTeXFormat{pLaTeX2e}` (or upLaTeX2e) asks for pTeX, an engine
+/// TeXres does not implement. LaTeX's own help only restates the mismatch.
+fn format_mismatch_help(message: &str) -> Option<String> {
+    let needs_ptex = ["needs format `pLaTeX2e'", "needs format `upLaTeX2e'"]
+        .iter()
+        .any(|format| message.contains(format));
+    needs_ptex.then(|| {
+        "this class needs pLaTeX, which runs on the pTeX engine that TeXres does not provide; \
+build it with TeX Live's platex and dvipdfmx, or port it to LuaTeX-ja, which TeXres bundles \
+(ltjsarticle for jsarticle, \\zw for the zw unit)"
+            .to_string()
+    })
 }
 
 fn default_help(message: &str) -> Option<String> {
@@ -2440,6 +2454,20 @@ mod tests {
             clean_help_without_interactive_boilerplate(help),
             "Check that the names match. See the package manual."
         );
+    }
+
+    /// #27: a pLaTeX or upLaTeX class names the engine TeXres lacks and the
+    /// supported route, ahead of LaTeX's own help text.
+    #[test]
+    fn platex_formats_point_to_the_supported_route() {
+        for format in ["pLaTeX2e", "upLaTeX2e"] {
+            let message =
+                format!("LaTeX Error: This file needs format `{format}'\n               but this is `LaTeX2e'.");
+            let help = super::format_mismatch_help(&message).unwrap_or_else(|| panic!("{format}"));
+            assert!(help.contains("pTeX"), "{format}: {help}");
+            assert!(help.contains("LuaTeX-ja"), "{format}: {help}");
+        }
+        assert_eq!(super::format_mismatch_help("Undefined control sequence"), None);
     }
 
     #[test]
