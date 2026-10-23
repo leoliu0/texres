@@ -96,3 +96,34 @@ fn moveleft_raise_and_their_aliases_keep_their_direction() {
     );
     assert_eq!(out, ["[5.0pt,5.0pt,5.0pt]", "[\\moveright\\moveleft\\raise\\lower\\moveright\\raise]"]);
 }
+
+/// `\primitive` on a non-expandable primitive goes through the frozen
+/// `\pdfprimitive`, which LuaTeX mode keeps defined (LuaTeX-ja runs
+/// `\primitive\everymath{}` while loading).
+#[test]
+fn primitive_runs_non_expandable_primitives() {
+    let out = run(
+        "\\def\\count{X}\\primitive\\count0=7 \\u{\\directlua{tex.print(tex.count[0])}}\n\
+\\let\\everymath\\undefined \\setbox0\\hbox{\\primitive\\everymath{}$ $}\\u{ok}",
+    );
+    assert_eq!(out, ["[7]", "[ok]"]);
+}
+
+/// e-TeX `pseudo_start` breaks a `\scantokens` text into lines at
+/// `\newlinechar` only: a line feed or carriage return in the text stays a
+/// character (etoolbox re-reads `\meaning\@outputpage`, which holds
+/// `\^^M`, to patch it). LuaTeX reads pseudo-file lines without the
+/// `process_input_buffer` callback.
+#[test]
+fn scantokens_lines_end_at_newlinechar_only_and_skip_the_input_callback() {
+    let out = run(
+        "\\begingroup\\catcode`\\|=12 \\lccode`\\|=10 \\lowercase{\\endgroup\\def\\y{\\gdef\\b{a|b}}}\n\
+\\begingroup\\endlinechar=-1 \\newlinechar=-1 \\scantokens\\expandafter{\\y}\\endgroup\n\
+\\def\\stop{}\\def\\cnt#1{\\ifx#1\\stop\\else\\advance\\count1 1 \\expandafter\\cnt\\fi}\n\
+\\count1=0 \\expandafter\\cnt\\b\\stop\\u{\\the\\count1}\n\
+\\directlua{callback.register(\"process_input_buffer\", function(s) if s:find(\"MARK\") then return s .. \"Z\" end return s end)}\n\
+\\edef\\a{\\scantokens{MARK}}\\edef\\c{\\scantextokens{MARK}}\\u{\\meaning\\a|\\meaning\\c}\n\
+\\directlua{callback.register(\"process_input_buffer\", nil)}",
+    );
+    assert_eq!(out, ["[3]", "[macro:->MARK |macro:->MARK]"]);
+}

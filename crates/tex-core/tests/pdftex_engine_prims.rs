@@ -204,3 +204,57 @@ fn moveleft_raise_aliases_keep_their_direction() {
     ));
     assert!(e.term.contains("[5.0pt,5.0pt,5.0pt|\\moveright\\moveleft\\raise\\lower]"), "{}", e.term);
 }
+
+/// tex.web §1269: every assignment, including those main control runs
+/// itself (`\font`, `\catcode`, `\textfont`, `\hyphenation`, ...), inserts
+/// the `\afterassignment` token right after it. LuaTeX-ja's `\jfont` relies
+/// on this for `\font`. Expected output is `pdftex -ini` (TeX Live 2026).
+#[test]
+fn afterassignment_fires_after_main_control_assignments() {
+    let e = run(concat!(
+        "\\catcode`\\{=1 \\catcode`\\}=2 \\catcode`\\#=6\n",
+        "\\def\\m#1{\\immediate\\write16{[#1]}}\\def\\a{\\m{a}}\n",
+        "\\afterassignment\\a\\font\\x=cmr10 \\m{font}\n",
+        "\\afterassignment\\a\\catcode`\\@=11 \\m{catcode}\n",
+        "\\afterassignment\\a\\mathcode`\\x=\"0178 \\m{mathcode}\n",
+        "\\afterassignment\\a\\delcode`\\x=\"161300 \\m{delcode}\n",
+        "\\afterassignment\\a\\lccode`\\x=`\\x \\m{lccode}\n",
+        "\\afterassignment\\a\\uccode`\\x=`\\X \\m{uccode}\n",
+        "\\afterassignment\\a\\sfcode`\\x=999 \\m{sfcode}\n",
+        "\\afterassignment\\a\\textfont0=\\x \\m{textfont}\n",
+        "\\afterassignment\\a\\scriptfont0=\\x \\m{scriptfont}\n",
+        "\\afterassignment\\a\\hyphenation{ab-c} \\m{hyphenation}\n",
+        "\\afterassignment\\a\\x \\m{fontselect}\n",
+        "\\afterassignment\\a\\count0=1 \\m{count}\n",
+        "\\afterassignment\\a\\letterspacefont\\y\\x 100 \\m{letterspacefont}\n",
+        "\\afterassignment\\a\\pdfcopyfont\\z\\x \\m{pdfcopyfont}\n",
+        "\\afterassignment\\a\\pdfnoligatures\\x \\m{pdfnoligatures}\n",
+        "\\afterassignment\\a\\patterns{a1b} \\m{patterns}\n",
+        "\\afterassignment\\a\\global\\font\\w=cmr10 \\m{globalfont}\n",
+        "\\afterassignment\\a\\global\\catcode`\\!=12 \\m{globalcatcode}\n",
+        "\\afterassignment\\a\\global\\x \\m{globalselect}\n",
+        "\\end\n"
+    ));
+    let lines: Vec<&str> = e.term.lines().filter(|l| l.starts_with('[')).collect();
+    assert_eq!(
+        lines.join(" "),
+        "[a] [font] [a] [catcode] [a] [mathcode] [a] [delcode] [a] [lccode] [a] [uccode] \
+         [a] [sfcode] [a] [textfont] [a] [scriptfont] [a] [hyphenation] [a] [fontselect] [a] [count] \
+         [a] [letterspacefont] [a] [pdfcopyfont] [a] [pdfnoligatures] [a] [patterns] \
+         [a] [globalfont] [a] [globalcatcode] [a] [globalselect]"
+    );
+}
+
+/// tex.web §476: `##` in a parameter text is no literal `#`: the second `#`
+/// is not a parameter number, so it is an error and is read again. Expected
+/// output is `pdftex -ini` (TeX Live 2026).
+#[test]
+fn doubled_hash_in_a_parameter_text_is_an_error() {
+    let e = run(concat!(
+        "\\scrollmode\\catcode`\\{=1 \\catcode`\\}=2 \\catcode`\\#=6\n",
+        "\\def\\m#1{\\immediate\\write16{[#1]}}\n",
+        "\\def\\a##1x{A}\\m{\\meaning\\a}\\end\n"
+    ));
+    assert!(e.term.contains("[macro:#1#21x->A]"), "{}", e.term);
+    assert_eq!(e.error_count, 2, "{}", e.term);
+}

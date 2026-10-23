@@ -100,6 +100,9 @@ pub(crate) struct TexState {
     pub links: Vec<crate::lua_texnodes::Link>,
     /// `tex.setlist` lists the engine has no counterpart of.
     pub scratch: Vec<(String, u32)>,
+    /// The empty `temp` head `tex.nest[i].head` gives for levels this engine
+    /// keeps no list for (alignments): LuaTeX gives every level a head.
+    pub empty_nest_head: u32,
     /// `token.scan_list`: the box nesting depth whose box goes to Lua, and
     /// the box once it is complete.
     pub scan_depth: Option<usize>,

@@ -2183,17 +2183,10 @@ impl Engine {
                 // \scantokens{...}: stringify and rescan (e-TeX pseudo_start;
                 // the string is split into lines at \newlinechar)
                 let toks = self.scan_general_text();
-                let mut text = self.tokens_to_bytes(&toks);
-                let newline = self.eqtb.int_params[crate::prim::IntParam::NewLineChar.idx() as usize];
-                if let Ok(newline) = u8::try_from(newline) {
-                    if newline != b'\n' {
-                        for byte in text.iter_mut().filter(|byte| **byte == newline) {
-                            *byte = b'\n';
-                        }
-                    }
-                }
+                let text = self.tokens_to_bytes(&toks);
+                let breaks = self.pseudo_line_breaks(&text);
                 if self.ensure_input_stack_room(1) {
-                    self.input.push_file("<scantokens>".to_string(), text);
+                    self.input.push_pseudo_file("<scantokens>".to_string(), text, breaks);
                     self.mark_scan_tokens_file();
                 }
                 None
@@ -4747,6 +4740,20 @@ impl Engine {
     /// `tokens_to_string` that keeps every byte (see `tex_bytes`).
     pub(crate) fn tokens_to_text(&self, toks: &[Token]) -> String {
         crate::tex_bytes::bytes_to_text(&self.tokens_to_bytes(toks))
+    }
+
+    /// e-TeX `pseudo_start`: the lines of a `\scantokens` text end at its
+    /// `\newlinechar` characters, and nowhere else.
+    pub(crate) fn pseudo_line_breaks(&self, text: &[u8]) -> Vec<usize> {
+        let newline = self.eqtb.int_params[crate::prim::IntParam::NewLineChar.idx() as usize];
+        match u8::try_from(newline) {
+            Ok(byte) if byte.is_ascii() || self.engine_kind == crate::engine::EngineKind::PdfTeX => text
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &b)| (b == byte).then_some(index))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     pub(crate) fn tokens_to_bytes(&self, toks: &[Token]) -> Vec<u8> {

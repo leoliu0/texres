@@ -590,6 +590,22 @@ impl Engine {
                     ctx.right = *rhm;
                 }
                 match w {
+                    WhatIt::User(u) => {
+                        let n = self.lua_new_node(WHATSIT, ws::USER_DEFINED);
+                        let value = if u.kind == i32::from(b'n') {
+                            self.import_sub(&u.list, ctx) as i32
+                        } else {
+                            u.number
+                        };
+                        let nd = self.lua_nodes.node_mut(n);
+                        nd.f[0] = u.user_id;
+                        nd.f[1] = u.kind;
+                        nd.f[2] = value;
+                        if u.kind == i32::from(b's') {
+                            nd.ext = Some(Box::new(Ext { strs: vec![u.text.clone()], ..Ext::default() }));
+                        }
+                        n
+                    }
                     WhatIt::LocalPar(lp) => {
                         let n = self.lua_new_node(LOCAL_PAR, 0);
                         let left = self.import_sub(&lp.left, ctx);
@@ -1054,6 +1070,21 @@ impl Engine {
                     }
                     out.push(Node::Whatsit(w, crate::boxes::Attr::NONE));
                 }
+            }
+            ws::USER_DEFINED => {
+                let (user_id, kind, value) = (f[0], f[1], f[2]);
+                let mut list = Vec::new();
+                if kind == i32::from(b'n') {
+                    // the list moves into the engine node
+                    self.lua_nodes.node_mut(n).f[2] = 0;
+                    self.export_list(value as u32, &mut list);
+                }
+                let text = if kind == i32::from(b's') { s(self, 0).into_bytes() } else { Vec::new() };
+                let number = if matches!(u8::try_from(kind), Ok(b'n' | b'a')) { 0 } else { value };
+                out.push(Node::Whatsit(
+                    WhatIt::User(Box::new(boxes::UserWhatsit { user_id, kind, number, text, list })),
+                    crate::boxes::Attr::NONE,
+                ));
             }
             _ => {
                 // whatsits the engine cannot execute are dropped

@@ -285,6 +285,7 @@ impl Engine {
             line_start,
             state,
             name,
+            pseudo_breaks,
             ..
         } = &mut self.input.stack[si]
         else {
@@ -295,10 +296,14 @@ impl Engine {
             return false;
         }
         let start = *pos;
-        let (end, next) = physical_line_bounds(data, start);
+        let (end, next) = match pseudo_breaks {
+            Some(breaks) => crate::input::pseudo_line_bounds(data, breaks, start),
+            None => physical_line_bounds(data, start),
+        };
         // luatex `\scantextokens` ends without an end-of-line character
         // (which is why luacode compares its lines with such a token list).
         let last_text_line = next >= data.len() && name.as_str() == "<scantextokens>";
+        let pseudo = pseudo_breaks.is_some();
         let mut content_end = end;
         while content_end > start && data[content_end - 1] == b' ' {
             content_end -= 1;
@@ -309,8 +314,9 @@ impl Engine {
         *pos = next;
         *line_no += 1;
         *state = 0;
-        // luatex process_input_buffer: sees the line without \endlinechar
-        if self.engine_kind == EngineKind::LuaTeX {
+        // luatex process_input_buffer: sees the line without \endlinechar;
+        // `\scantokens` lines (luatex `pseudo_input`) bypass it
+        if self.engine_kind == EngineKind::LuaTeX && !pseudo {
             self.lua_process_input_line(&mut buf);
         }
         let before = buf.len();

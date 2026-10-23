@@ -168,6 +168,18 @@ impl Engine {
         }
     }
 
+    /// The empty list head of a nest level without an engine list: one
+    /// `temp` node, made again if Lua freed it or linked nodes to it.
+    fn lua_empty_nest_head(&mut self) -> u32 {
+        let h = self.lua_tex.empty_nest_head;
+        if h != 0 && self.lua_nodes.valid(h) && self.lua_nodes.node_mut(h).next == 0 {
+            return h;
+        }
+        let h = self.lua_new_node(TEMP, 0);
+        self.lua_tex.empty_nest_head = h;
+        h
+    }
+
     fn lua_link_index(&self, t: Target) -> Option<usize> {
         self.lua_tex.links.iter().position(|l| l.target == t && self.lua_nodes.valid(l.head))
     }
@@ -862,7 +874,7 @@ impl UserDataTrait for NestUd {
             let j = frame.unwrap_or(usize::MAX);
             Some(match key {
                 "mode" => UdValue::Integer(luatex_mode(mode)),
-                "head" | "tail" if frame.is_none() => UdValue::Nil,
+                "head" | "tail" if frame.is_none() => opt_node(e.lua_empty_nest_head()),
                 "head" => {
                     let t = e.lua_level_target(j);
                     opt_node(e.lua_list_link(t))

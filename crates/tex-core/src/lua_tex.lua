@@ -115,7 +115,9 @@ local function param_get(name, raw)
   if kind == "int" or kind == "dim" then return a end
   if kind == "toks" then return text end
   if kind == "glue" or kind == "muglue" then
+    -- ltexlib.c gettex: `true` gives the five values, `false` the width
     if raw then return a, b, c, d, e end
+    if raw == false then return a end
     return new_spec(a, b, c, d, e)
   end
   local f = specials[name]
