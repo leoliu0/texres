@@ -49,6 +49,7 @@ mod lua_deps;
 mod lua_sys;
 pub use lua_sys::{set_cache_dir, set_font_cache_dir, set_shell_escape, ShellEscape};
 pub use lua_sys_kpse::{set_internal_command, InternalCommand};
+pub use tex_print::set_line_widths;
 #[cfg(any(windows, test))]
 mod lua_sys_crt;
 mod lua_sys_embedded;

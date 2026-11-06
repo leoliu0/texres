@@ -1282,7 +1282,7 @@ impl Engine {
             }
         }
         head.push(']');
-        let near_edge = self.term_offset > crate::tex_print::MAX_PRINT_LINE - 9;
+        let near_edge = self.term_offset > crate::tex_print::max_print_line() - 9;
         if near_edge {
             self.tex_print_ln(true, true);
         } else if self.term_offset > 0 || self.file_offset > 0 {

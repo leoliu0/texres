@@ -2680,6 +2680,21 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             );
         }
     }
+    // web2c reads `max_print_line`, `error_line` and `half_error_line` from
+    // texmf.cnf, the environment and `-cnf-line` (applied above as
+    // environment variables): programs that parse the log set them so that
+    // TeX does not cut an error's context line short.
+    let width = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    tex_core::set_line_widths(
+        width("max_print_line", 79),
+        width("error_line", 79),
+        width("half_error_line", 50),
+    );
     if kpathsea_debug != 0 {
         let mut flags = std::env::var("TEXDEBUG").unwrap_or_default();
         if !flags.split(',').any(|flag| flag.trim() == "lookups") {

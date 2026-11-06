@@ -17,9 +17,7 @@ use crate::eqtb::Equiv;
 use crate::input::Source;
 use crate::prim::IntParam;
 use crate::token::{CsId, Token};
-
-const ERROR_LINE: usize = 79;
-const HALF_ERROR_LINE: usize = 50;
+use crate::tex_print::{error_line, half_error_line};
 
 /// `token_type` of a token list level (`print_token_list_type`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -484,23 +482,29 @@ impl Engine {
 impl Rendered {
     /// The two lines `show_context` prints from the pseudoprinted text.
     fn emit(&self, out: &mut Vec<u8>) {
+        let error_line = error_line();
+        let half_error_line = half_error_line();
         let first = self.first.min(self.text.len());
         let tally = self.text.len();
-        let trick_count = ERROR_LINE.max(first + 1 + ERROR_LINE - HALF_ERROR_LINE);
+        let trick_count = error_line.max(first + 1 + error_line.saturating_sub(half_error_line));
         let second = tally.min(trick_count) - first;
         out.extend_from_slice(&self.header);
-        let (from, n) = if self.l + first <= HALF_ERROR_LINE {
+        let (from, n) = if self.l + first <= half_error_line {
             (0, self.l + first)
         } else {
             out.extend_from_slice(b"...");
-            (self.l + first - HALF_ERROR_LINE + 3, HALF_ERROR_LINE)
+            (self.l + first + 3 - half_error_line, half_error_line)
         };
         push_valid_utf8(out, &self.text, from, first);
         out.push(b'\n');
         out.extend(std::iter::repeat(b' ').take(n));
-        let to = if second + n <= ERROR_LINE { first + second } else { first + (ERROR_LINE - n - 3) };
+        let to = if second + n <= error_line {
+            first + second
+        } else {
+            first + error_line.saturating_sub(n + 3)
+        };
         push_valid_utf8(out, &self.text, first, to);
-        if second + n > ERROR_LINE {
+        if second + n > error_line {
             out.extend_from_slice(b"...");
         }
     }

@@ -2884,6 +2884,78 @@ fn reserved_pdf_objects_survive_a_format_dump() {
         .any(|w| w == b"/K true"));
 }
 
+/// #28: `error_line`, `half_error_line` and `max_print_line` come from the
+/// environment and `-cnf-line`, as in pdftex. Raised, they keep the whole
+/// error line instead of replacing its start with `...`, so a program that
+/// reads the log still knows the column. The structured `-->` report is not
+/// cut short either way.
+#[test]
+fn error_context_widths_come_from_environment_and_cnf_line() {
+    let job = Job::new("error-line-widths");
+    job.write(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\n\
+         $a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t+u+v+w+x+y+z+a+b+c+d+e+f+g+h \\undefinedcommand + x$\n\
+         \\end{document}\n",
+    );
+    let whole = "l.3 $a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t+u+v+w+x+y+z+a+b+c+d+e+f+g+h \\undefinedcommand\n";
+    let output = run_pdflatex(
+        &job,
+        &["-interaction=nonstopmode", "-halt-on-error", "main.tex"],
+        &[
+            ("error_line", "254"),
+            ("half_error_line", "238"),
+            ("max_print_line", "1000"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", failure_output(&output));
+    assert!(job.log().contains(whole), "{}", job.log());
+
+    let output = run_pdflatex(
+        &job,
+        &[
+            "-cnf-line=error_line=254",
+            "-cnf-line=half_error_line=238",
+            "-cnf-line=max_print_line=1000",
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "main.tex",
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", failure_output(&output));
+    assert!(job.log().contains(whole), "{}", job.log());
+
+    // Defaults are unchanged: TeX cuts the context to error_line columns.
+    let output = run_pdflatex(
+        &job,
+        &["-interaction=nonstopmode", "-halt-on-error", "main.tex"],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", failure_output(&output));
+    let log = job.log();
+    assert!(
+        log.contains("l.3 ...v+w+x+y+z+a+b+c+d+e+f+g+h \\undefinedcommand\n"),
+        "{log}"
+    );
+    assert!(log.contains("  --> main.tex:3:70\n"), "{log}");
+
+    // Degenerate values must not crash the context arithmetic.
+    let output = run_pdflatex(
+        &job,
+        &[
+            "-cnf-line=error_line=1",
+            "-cnf-line=half_error_line=1",
+            "-cnf-line=max_print_line=1",
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "main.tex",
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", failure_output(&output));
+}
+
 /// kpathsea `-cnf-line=VAR=VALUE` sets VAR, overriding the environment
 /// (pdftex: `TEXINPUTS=.: pdftex -cnf-line=TEXINPUTS=./lib: ...` finds
 /// ./lib/libfile.tex).

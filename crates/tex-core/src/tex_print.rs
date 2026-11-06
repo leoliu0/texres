@@ -12,8 +12,42 @@ use crate::engine::{Engine, InteractionMode};
 use crate::prim::IntParam;
 use crate::tex_bytes::{bytes_to_text, push_printable, Xprn};
 
-/// tex.web `max_print_line` (texmf.cnf default).
+/// tex.web `max_print_line`, `error_line` and `half_error_line`
+/// (texmf.cnf defaults): the width the transcript wraps at and the two
+/// widths `show_context` cuts an error's context lines to.
 pub(crate) const MAX_PRINT_LINE: usize = 79;
+const ERROR_LINE: usize = 79;
+const HALF_ERROR_LINE: usize = 50;
+
+thread_local! {
+    static LINE_WIDTHS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((MAX_PRINT_LINE, ERROR_LINE, HALF_ERROR_LINE)) };
+}
+
+pub(crate) fn max_print_line() -> usize {
+    LINE_WIDTHS.with(|widths| widths.get().0)
+}
+
+pub(crate) fn error_line() -> usize {
+    LINE_WIDTHS.with(|widths| widths.get().1)
+}
+
+pub(crate) fn half_error_line() -> usize {
+    LINE_WIDTHS.with(|widths| widths.get().2)
+}
+
+/// Sets the three widths, as pdftex reads them from `texmf.cnf`, the
+/// environment and `-cnf-line=VAR=VALUE` before the job starts.
+pub fn set_line_widths(max_print_line: usize, error_line: usize, half_error_line: usize) {
+    // The context arithmetic needs a few columns for `l.N`, `...` and the
+    // split; degenerate values must not underflow it.
+    let widths = (
+        max_print_line.max(10),
+        error_line.max(4),
+        half_error_line.max(4),
+    );
+    LINE_WIDTHS.with(|cell| cell.set(widths));
+}
 
 /// One output stream's pending text and column.
 pub(crate) struct Lane {
@@ -58,7 +92,7 @@ impl Lane {
         };
         self.out.push(byte);
         self.offset += units;
-        if self.offset >= MAX_PRINT_LINE {
+        if self.offset >= max_print_line() {
             if cont == 0 {
                 self.out.push(b'\n');
                 self.offset = 0;
@@ -219,7 +253,7 @@ impl Engine {
         let term_active = self.interaction_mode != InteractionMode::Batch;
         let term_offset = if term_active { self.term_offset } else { 0 };
         let measured = if unicode { self.code_units(raw) } else { s.len() };
-        if term_offset + measured > MAX_PRINT_LINE - 2 {
+        if term_offset + measured > max_print_line() - 2 {
             self.tex_print_ln(true, true);
         } else if term_offset > 0 || self.file_offset > 0 {
             self.tex_print_str(true, true, " ");
@@ -254,7 +288,7 @@ impl Engine {
         } else {
             self.term_offset
         };
-        if term_offset + self.code_units(name) > MAX_PRINT_LINE - 2 {
+        if term_offset + self.code_units(name) > max_print_line() - 2 {
             self.tex_print_ln(true, true);
         } else if term_offset > 0 || self.file_offset > 0 {
             self.tex_print_str(true, true, " ");

@@ -46,6 +46,24 @@ error: Undefined control sequence \printtotl
 Colors are used on a terminal unless `NO_COLOR` is set or
 `CLICOLOR=0`; `CLICOLOR_FORCE=1` forces them.
 
+As in TeX Live, `max_print_line` (79), `error_line` (79) and
+`half_error_line` (50) come from the environment or from
+`-cnf-line=VAR=VALUE`. They set where transcript lines wrap and how much of
+an error's `l.N` context lines is printed before `...` replaces the rest. A
+program that reads those lines can raise them to get the whole line:
+
+```sh
+error_line=254 half_error_line=238 max_print_line=1000 \
+  texres pdflatex -interaction=nonstopmode -halt-on-error main.tex
+```
+
+The `l.N` line and the `-->` location answer different questions and need not
+agree: `l.N` shows the input TeX had read when it reported the error, cut at
+the error, whereas `-->` points at the token that caused it (for example the
+`$` that starts a math formula, or the start of an undefined control
+sequence). The `-->` excerpt is never cut short, so it is the better source
+for a program that wants the offending token rather than the read position.
+
 Locations refer to the bytes TeX actually read. The scanner records the start
 and physical width of each file token, so `^^` spellings, active characters,
 tabs, non-UTF-8 input, generated `\csname` tokens, and very long control
