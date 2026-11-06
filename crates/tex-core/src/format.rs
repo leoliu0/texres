@@ -9,7 +9,9 @@
 //! a few milliseconds instead of re-executing the bootstrap.
 //!
 //! Runtime state (input stack, page lists, PDF document, write streams)
-//! is never serialized: at `\dump` time it is empty. Non-void box
+//! is never serialized: at `\dump` time it is empty. PDF object numbers
+//! reserved by `\pdfobj reserveobjnum` are, as in pdfTeX, so a preamble can
+//! reserve objects that a document later defines with `useobjnum`. Non-void box
 //! registers and a non-empty save stack make the dump refuse, matching
 //! tex.web's requirement that `\dump` happen at top level.
 //!
@@ -32,7 +34,7 @@ use crate::tfm::{CharInfo, ExtRecipe, Font, LigStep};
 use crate::token::{CsTable, Token};
 
 const MAGIC: &[u8; 8] = b"RUSTEXFM";
-const VERSION: u16 = 26;
+const VERSION: u16 = 27;
 /// A production format is currently about 8 MiB decoded. Keep corrupt or
 /// unrelated external files from turning format probing into an unbounded
 /// allocation while leaving ample room for future format growth.
@@ -65,6 +67,10 @@ const TAG_ATTRIBUTE_REG: u8 = 15;
 const TAG_UMATHCHAR_DEF: u8 = 16;
 /// Marks the trailing translation tables (xprn, xord, xchr).
 const TCX_TRAILER: u8 = 0xC7;
+/// Marks the PDF object reservations made before `\dump`
+/// (`\pdfobj reserveobjnum`, e.g. pgf's `pgfsys-pdftex.def`), which pdfTeX
+/// keeps in the format so `useobjnum` still works after loading it.
+const PDF_OBJECT_TRAILER: u8 = 0xC8;
 
 // ---------------------------------------------------------------------------
 // writer / reader primitives
@@ -758,6 +764,20 @@ pub fn save_format_with_encoding(
         }
     }
 
+    // pdfTeX dumps its object table: objects reserved by
+    // `\pdfobj reserveobjnum` survive, and the next number follows the last
+    // one allocated before the dump. Written object bodies do not survive:
+    // at top level none have been shipped out.
+    w.u8(PDF_OBJECT_TRAILER);
+    w.i32(eng.pdf_next_obj);
+    w.i32(eng.pdf_last_obj);
+    let mut reserved: Vec<i32> = eng.pdf_reserved_objnums.iter().copied().collect();
+    reserved.sort_unstable();
+    w.u32(reserved.len() as u32);
+    for obj in reserved {
+        w.i32(obj);
+    }
+
     let payload = match encoding {
         FormatEncoding::Raw => w.buf,
         FormatEncoding::Zstd(_level) => compress_format_frames(&w.buf, |chunk| {
@@ -1362,6 +1382,9 @@ pub fn load_format_bytes_into(data: &[u8], eng: &mut Engine) -> Result<(), Strin
     eng.hyphen_tries = scratch.hyphen_tries;
     eng.hyphen_codes = scratch.hyphen_codes;
     eng.pdf_backend.glyph_unicode = scratch.pdf_backend.glyph_unicode;
+    eng.pdf_next_obj = scratch.pdf_next_obj;
+    eng.pdf_last_obj = scratch.pdf_last_obj;
+    eng.pdf_reserved_objnums = scratch.pdf_reserved_objnums;
     eng.xprn = scratch.xprn;
     eng.tcx = scratch.tcx;
     eng.format_ident = scratch.format_ident;
@@ -1716,6 +1739,22 @@ fn load_state(r: &mut R, eng: &mut Engine) -> io::Result<()> {
             }
             _ => return Err(bad("invalid translation table flag")),
         };
+    }
+    if r.p < r.b.len() {
+        if r.u8()? != PDF_OBJECT_TRAILER {
+            return Err(bad("has trailing data"));
+        }
+        eng.pdf_next_obj = r.i32()?;
+        eng.pdf_last_obj = r.i32()?;
+        if eng.pdf_next_obj < 1 {
+            return Err(bad("invalid PDF object counter"));
+        }
+        for _ in 0..r.count()? {
+            let obj = r.i32()?;
+            if obj <= 0 || obj >= eng.pdf_next_obj || !eng.pdf_reserved_objnums.insert(obj) {
+                return Err(bad("invalid reserved PDF object number"));
+            }
+        }
     }
     if r.p != r.b.len() {
         return Err(bad("has trailing data"));
@@ -2417,9 +2456,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let loaded = load_format_from(&data).unwrap();
         assert_eq!(loaded.xprn, crate::tex_bytes::Tcx::builtin("cp8bit.tcx").unwrap().xprn);
-        // without the trailer, as written before the tables were dumped
-        let legacy = load_format_from(&data[..data.len() - 34]).unwrap();
+        // without either trailer, as written before the tables were dumped:
+        // the TCX trailer (tag, 32 xprn bytes, table flag) and the PDF object
+        // reservations (tag, next and last object, count, numbers)
+        let trailers = 34 + 13 + 4 * eng.pdf_reserved_objnums.len();
+        let legacy = load_format_from(&data[..data.len() - trailers]).unwrap();
         assert_eq!(legacy.xprn, crate::tex_bytes::cp227_xprn());
+        assert_eq!(legacy.pdf_next_obj, 1);
+        assert!(legacy.pdf_reserved_objnums.is_empty());
     }
 
     #[test]

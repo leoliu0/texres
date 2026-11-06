@@ -2851,6 +2851,39 @@ fn dumped_formats_are_selected_by_fmt_and_first_line() {
     assert!(text(&output.stderr).contains("I can't find the format file `nosuch.fmt'!"));
 }
 
+/// #29: pdfTeX keeps objects reserved by `\pdfobj reserveobjnum` in the
+/// format, so a preamble that reserves them (pgf's `pgfsys-pdftex.def`) still
+/// lets the document define them with `useobjnum`, and the numbers allocated
+/// afterwards follow the preamble's.
+#[test]
+fn reserved_pdf_objects_survive_a_format_dump() {
+    let job = Job::new("pdfobj-dump");
+    job.write(
+        "pre.tex",
+        "\\catcode`\\{=1 \\catcode`\\}=2 \\pdfobj reserveobjnum \\pdfobj reserveobjnum \\dump\n",
+    );
+    let output = run_pdflatex(&job, &["-ini", "-interaction=nonstopmode", "pre.tex"], &[]);
+    assert!(output.status.success(), "{}", failure_output(&output));
+    job.write(
+        "main.tex",
+        "%&pre\n\\pdfobj useobjnum 2 {<< /K true >>}\\pdfobj reserveobjnum\
+         \\message{[NEXT=\\the\\pdflastobj]}\\shipout\\hbox{\\vrule width1pt height1pt}\\end\n",
+    );
+    let output = run_pdflatex(&job, &["-interaction=nonstopmode", "main.tex"], &[]);
+    assert!(output.status.success(), "{}", failure_output(&output));
+    assert!(
+        text(&output.stdout).contains("[NEXT=3]"),
+        "{}",
+        failure_output(&output)
+    );
+    let log = job.log();
+    assert!(!log.contains("was not reserved"), "{log}");
+    assert!(std::fs::read(job.dir.join("main.pdf"))
+        .unwrap()
+        .windows(7)
+        .any(|w| w == b"/K true"));
+}
+
 /// kpathsea `-cnf-line=VAR=VALUE` sets VAR, overriding the environment
 /// (pdftex: `TEXINPUTS=.: pdftex -cnf-line=TEXINPUTS=./lib: ...` finds
 /// ./lib/libfile.tex).

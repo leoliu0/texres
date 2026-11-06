@@ -574,14 +574,21 @@ errors and warnings in the logs. The CLI formats files on all cores
 
 The single-pass personalities (`pdflatex`, `lualatex`, `xelatex` links) take
 pdfTeX's web2c options (`pdflatex --help`). `-ini` dumps `JOBNAME.fmt` into
-the output directory. As in TeX Live, an `-ini` run first loads the format
+the output directory. The dump carries the PDF object numbers reserved by
+`\pdfobj reserveobjnum` and the next free number (the `PDF_OBJECT_TRAILER`
+section of `format.rs`), as pdfTeX's object table does: a preamble that loads
+tikz can therefore be dumped, and the document's `\pdfobj useobjnum` still
+finds the objects pgf reserved. As in TeX Live, an `-ini` run first loads the format
 that a leading `&NAME` names (if `NAME.fmt` is missing, `pdflatex` and
 `xelatex` load their default format and `lualatex` stops) or, except under
 `lualatex`, that a `%&NAME` first line names when that format exists; `-fmt`
 loads nothing under `-ini`. Otherwise `-fmt=NAME`, `&NAME`, a `%&NAME` first
 line, or `-progname=NAME` load such a TeXres dump (`NAME` equal to the
 program selects the built-in format). `-cnf-line=VAR=VALUE` sets a search
-or policy variable such as `TEXINPUTS` or `openout_any`; `-kpathsea-debug=N`
+or policy variable such as `TEXINPUTS` or `openout_any`; as in web2c,
+`max_print_line`, `error_line` and `half_error_line` (transcript wrapping and
+the two error-context widths, `tex_print::set_line_widths`) are read from
+there and from the environment. `-kpathsea-debug=N`
 (nonzero) traces file lookups in the transcript. `-translate-file=TCXNAME`,
 `-8bit` and a `%&-translate-file=` first line select which bytes 128-255 print as
 themselves rather than as `^^xx`: `pdflatex` and the built-in format use
