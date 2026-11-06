@@ -256,6 +256,7 @@ const UNICODE_ENGINE_CLASSES: &[&str] = &["ctexart", "ctexbook", "ctexrep", "cte
 const LUATEX_PACKAGES: &[&str] = &[
     "luatexja", "luatexja-adjust", "luatexja-ajmacros", "luatexja-compat", "luatexja-fontspec",
     "luatexja-otf", "luatexja-preset", "luatexja-ruby", "luatexja-zhfonts", "luacode", "luatextra",
+    "luacas",
 ];
 const LUATEX_CLASSES: &[&str] = &[
     "ltjarticle", "ltjbook", "ltjreport", "ltjsarticle", "ltjsbook", "ltjsreport", "ltjskiyou", "ltjspf",
@@ -4943,6 +4944,8 @@ mod io_safety_tests {
             "\\documentclass{article}\n\\usepackage{luatexja}\n",
             "\\documentclass{article}\n\\usepackage{fontspec}\n\\usepackage[match]{luatexja-fontspec}\n",
             "\\documentclass{article}\n\\usepackage{luacode}\n",
+            "\\documentclass{article}\n\\usepackage{luacas}\n",
+            "\\documentclass{article}\n\\usepackage{amsmath,luacas}\n",
         ] {
             assert_eq!(engine_for_source(source), "lualatex", "{source}");
         }

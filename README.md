@@ -83,8 +83,9 @@ index tools as often as needed. A second run with no changes takes a few
 milliseconds.
 
 **Choose the engine.** Documents that load `fontspec`, `xeCJK`, `ctex`,
-`unicode-math` or `polyglossia` run as XeLaTeX, LuaTeX-ja documents as
-LuaLaTeX, everything else as pdfLaTeX.
+`unicode-math` or `polyglossia` run as XeLaTeX, LuaTeX-ja and Lua-only
+packages such as `luacas` or `luacode` as LuaLaTeX, everything else as
+pdfLaTeX.
 To choose yourself, add `-pdf`, `-xelatex` or `-lualatex`:
 
 ```bash

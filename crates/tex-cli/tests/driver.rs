@@ -703,6 +703,46 @@ fn copied_texmk_symlink_personalities_need_no_sibling_executables() {
         .contains("The style file: <embedded:plain.bst>"));
 }
 
+/// #30: luacas is bundled, and a document that uses it runs as LuaLaTeX
+/// without an engine option.
+#[test]
+fn luacas_documents_compile_as_lualatex() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fixture =
+        Fixture(std::env::temp_dir().join(format!("texres-luacas-{}-{nonce}", std::process::id())));
+    std::fs::create_dir_all(&fixture.0).unwrap();
+    std::fs::write(
+        fixture.0.join("main.tex"),
+        "\\documentclass{article}\n\\usepackage{luacas}\n\\begin{document}\n\
+         \\begin{CAS}\nvars('x','y')\nf = 3*x*y - x^2*y\nfxy = diff(f,x,y)\n\\end{CAS}\n\
+         \\[ \\print{fxy} = \\print*{fxy} \\]\n\\end{document}\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_texres"));
+    command
+        .args(["--keep-logs", "main.tex"])
+        .current_dir(&fixture.0)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", fixture.0.join("home"))
+        .env("TEX_RS_CACHE_DIR", fixture.0.join("cache"))
+        .stdin(std::process::Stdio::null());
+    let output = support::bundled_fonts_only(&mut command, &fixture.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && fixture.0.join("main.pdf").is_file(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = std::fs::read_to_string(fixture.0.join("main.log")).unwrap();
+    assert!(log.starts_with("This is LuaHBTeX"), "{log}");
+}
+
 /// `fmt` and `latexdiff` are subcommands of `texres` only: through the
 /// engine and BibTeX links they are job names (`pdflatex fmt` builds
 /// `fmt.tex`, as TeX Live's does).

@@ -2178,6 +2178,19 @@ SUPPLEMENT_PACKAGES = {
             ("luatexja-COPYING.txt", "doc/luatex/luatexja/COPYING"),
         ],
     },
+    # luacas (#30): symbolic computation in LuaLaTeX. The whole runtime tree
+    # ships, including `test/luacas-parser.lua`, which `luacas.sty` requires.
+    "luacas": {
+        "version": "1.0.2",
+        "revision": 67247,
+        "license": "LPPL-1.3c",
+        "upstream_url": "https://mirror.aarnet.edu.au/pub/CTAN/systems/texlive/tlnet/archive/luacas.tar.xz",
+        "upstream_sha256": "ff514cbe687115aab3a82981682f6232a3a20f39fd18fd245e5b157d38172a41",
+        "upstream_size_bytes": 63948,
+        "description": "luacas: a computer algebra system for LuaLaTeX",
+        "select": [("tex/lualatex/luacas", None)],
+        "map_files": [],
+    },
     "adobemapping": {
         "version": "TeX Live r66552",
         "revision": 66552,
