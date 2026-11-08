@@ -100,23 +100,29 @@ def ensure_public(docs, selected, cache):
 # --------------------------------------------------------------------- CPUs
 
 
-def cpu_slots(jobs, per_job):
+def cpu_slots(jobs, per_job, allow_unpinned=False):
     """Disjoint CPU lists, whole physical cores (SMT siblings together)."""
     seen, cores = set(), []
     base = Path("/sys/devices/system/cpu")
     for c in sorted(int(p.name[3:]) for p in base.glob("cpu[0-9]*")):
         if c in seen:
             continue
-        sib = sorted(int(x) for x in (base / f"cpu{c}/topology/thread_siblings_list").read_text().replace("-", ",").split(",") if x.strip())
+        sib_file = base / f"cpu{c}/topology/thread_siblings_list"
+        if not sib_file.exists():
+            continue
         lst = []
-        for part in (base / f"cpu{c}/topology/thread_siblings_list").read_text().strip().split(","):
+        for part in sib_file.read_text().strip().split(","):
             a, _, b = part.partition("-")
             lst += list(range(int(a), int(b or a) + 1))
         seen.update(lst)
         cores.append(sorted(lst))
+    if not cores:
+        return [None] * jobs
     threads = len(cores[0])
     ncores = max(1, per_job // threads)
     if jobs * ncores > len(cores):
+        if allow_unpinned:
+            return [None] * jobs
         sys.exit(f"--jobs {jobs} x {per_job} CPUs does not fit on {len(cores)} physical cores")
     return [",".join(str(c) for core in cores[k * ncores : (k + 1) * ncores] for c in core) for k in range(jobs)]
 
@@ -124,8 +130,57 @@ def cpu_slots(jobs, per_job):
 # ---------------------------------------------------------------- one tool
 
 
+def ensure_tl_hyphenation(root: Path) -> dict:
+    """If host TeX Live's language.dat lacks non-English hyphenation patterns,
+    extract tex/generic/ from the bundled archive and dump xelatex.fmt so TL
+    polyglossia/babel runs use the same hyphenation patterns as TeX Live 2026."""
+    kpse = B.TL_BIN / "kpsewhich"
+    if kpse.exists():
+        r = B.sh([str(kpse), "language.dat"])
+        ldat = Path(r.stdout.strip()) if r.stdout.strip() else None
+        if ldat and ldat.is_file() and any(l.strip().startswith("french") for l in ldat.read_text(errors="ignore").splitlines()):
+            return {}
+    import glob
+    import io
+    import tarfile
+    assets = HERE.parent / "crates" / "tex-kpse" / "assets"
+    parts = sorted(glob.glob(str(assets / "packages.tar.zst.*")))
+    supp_path = assets / "packages-supplement.tar.zst"
+    if not parts or not supp_path.is_file():
+        return {}
+    tl_texmf = root / "tl_texmf"
+    web2c = tl_texmf / "web2c"
+    if not (web2c / "xelatex.fmt").is_file():
+        cat = subprocess.Popen(["cat", *parts], stdout=subprocess.PIPE)
+        zst = subprocess.Popen(["zstd", "-dc"], stdin=cat.stdout, stdout=subprocess.PIPE)
+        with tarfile.open(fileobj=zst.stdout, mode="r|*") as tar:
+            for m in tar:
+                if m.isfile() and m.name.startswith("tex/generic/"):
+                    dst = tl_texmf / m.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(tar.extractfile(m).read())
+        supp = subprocess.run(["zstd", "-dc", str(supp_path)], stdout=subprocess.PIPE, check=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(supp), mode="r:") as tar:
+            for m in tar.getmembers():
+                if m.isfile() and m.name.startswith("tex/generic/"):
+                    dst = tl_texmf / m.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(tar.extractfile(m).read())
+        web2c.mkdir(parents=True, exist_ok=True)
+        env = {**B.make_env(), "TEXINPUTS": f".:{tl_texmf / 'tex'}//:", "TEXFORMATS": f"{web2c}:"}
+        xetex = B.TL_BIN / "xetex"
+        if xetex.is_file():
+            subprocess.run([str(xetex), "-ini", "-interaction=nonstopmode", "-etex", "xelatex.ini"],
+                           cwd=web2c, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return {
+        "TEXINPUTS": f".:{tl_texmf / 'tex'}//:",
+        "LUAINPUTS": f".:{tl_texmf / 'tex'}//:",
+        "TEXFORMATS": f"{web2c}:",
+    }
+
+
 class Tool:
-    def __init__(self, kind, d, root, texres, bindir, cpus):
+    def __init__(self, kind, d, root, texres, bindir, cpus, tl_extra_env=None):
         self.kind, self.d = kind, d
         self.flag = FLAGS[d["engine"]]
         self.engine = ENGINE_EXE[d["engine"]]
@@ -138,8 +193,12 @@ class Tool:
         self.snap_cache = self.base / "snap_cache"
         self.texres, self.bindir, self.cpus = texres, bindir, cpus
         self.env = B.make_env()
+        if shutil.which("biber", path=self.env["PATH"]) is None:
+            self.env["PATH"] = f"{self.env['PATH']}:{self.bindir}"
         if kind == "texres":
             self.env["TEX_RS_CACHE_DIR"] = str(self.cache)
+        elif tl_extra_env:
+            self.env.update(tl_extra_env)
         self.env["TMPDIR"] = os.environ.get("TMPDIR", "/tmp")
 
     def pin(self, cmd):
@@ -298,12 +357,12 @@ def measure(d, tools, sc, runs, prep_d, edit, timeout, tag):
     return out
 
 
-def do_doc(d, root, texres, bindir, args, cpus):
+def do_doc(d, root, texres, bindir, args, cpus, tl_extra_env=None):
     name = d["name"]
     tag = f"{name:30s}"
     entry = {"engine": d["engine"], "source": d["source"], "tags": d["tags"], "note": d["note"], "main": d["main"],
              "ref": d.get("ref", "")}
-    tools = {k: Tool(k, d, root, texres, bindir, cpus) for k in ("texres", "tl")}
+    tools = {k: Tool(k, d, root, texres, bindir, cpus, tl_extra_env=tl_extra_env) for k in ("texres", "tl")}
     try:
         verify = {}
         # --- TeX Live first: a document TL cannot build is not a TeXres problem
@@ -323,14 +382,23 @@ def do_doc(d, root, texres, bindir, args, cpus):
             B.restore(t.work, t.snap_work)
             if kind == "texres":
                 B.restore(t.cache, t.snap_cache)
-        vf = B.compare_pdfs(tools["tl"].pdf(), tools["texres"].pdf())
+        vf = B.compare_pdfs(tools["tl"].pdf(), tools["texres"].pdf(), visual_dpi=args.visual_dpi)
         vf.update(verify)
-        vf["equivalent"] = vf["pages_equal"] and vf["text_equal"]
+        text_ok = vf["text_equal"] if args.min_text_similarity >= 1.0 else vf["text_similarity"] >= args.min_text_similarity
+        vis_ok = True if args.visual_dpi <= 0 else (
+            vf.get("visual_iou", 1.0) >= args.min_visual_iou
+            and vf.get("similarity", 1.0) >= args.min_similarity
+        )
+        vf["equivalent"] = vf["pages_equal"] and text_ok and vis_ok
         entry["verify"] = vf
         entry["pages"] = vf["pages_tl"]
         if not vf["equivalent"]:
             entry["status"] = "differs"
-            log(f"  {tag} DIFFERS: pages TL {vf['pages_tl']} TeXres {vf['pages_texres']}; {json.dumps(vf.get('first_difference'))[:200]}")
+            log(
+                f"  {tag} DIFFERS: pages TL {vf['pages_tl']} TeXres {vf['pages_texres']} "
+                f"text_sim={vf.get('text_similarity', 0):.4f} vis_iou={vf.get('visual_iou', 1.0):.4f}; "
+                f"{json.dumps(vf.get('first_difference'))[:200]}"
+            )
             return entry
         # --- choose the edit (generated docs: the marker; public docs: a plain-text line TL shows)
         edit = None
@@ -425,6 +493,26 @@ def render_md(res):
     for k, v in sorted(stc.items()):
         L.append(f"| {k} | {v} |")
     L.append("")
+    # parity & similarity summary
+    verified = [e["verify"] for e in docs.values() if "verify" in e and "pages_equal" in e["verify"]]
+    if verified:
+        pages_eq = sum(1 for v in verified if v.get("pages_equal"))
+        text_eq = sum(1 for v in verified if v.get("text_equal"))
+        text_sims = [v.get("text_similarity", 1.0 if v.get("text_equal") else 0.0) for v in verified]
+        sims = [v.get("similarity", v.get("text_similarity", 1.0 if v.get("text_equal") else 0.0)) for v in verified]
+        vis_ious = [v["visual_iou"] for v in verified if "visual_iou" in v]
+        L.append("## TeX Live Parity & Similarity\n")
+        L.append("| Metric | Value |\n| --- | ---: |")
+        L.append(f"| Page-count parity | {pages_eq} / {len(docs)} |")
+        L.append(f"| Exact text parity (`pdftotext -layout`) | {text_eq} / {len(docs)} |")
+        L.append(f"| Text similarity (min / median / mean) | {min(text_sims):.4f} / {statistics.median(text_sims):.4f} / {statistics.mean(text_sims):.4f} |")
+        if vis_ious:
+            L.append(f"| Visual ink IoU (min / median / mean) | {min(vis_ious):.4f} / {statistics.median(vis_ious):.4f} / {statistics.mean(vis_ious):.4f} |")
+        L.append(f"| Composite similarity (min / median / mean) | {min(sims):.4f} / {statistics.median(sims):.4f} / {statistics.mean(sims):.4f} |")
+        if "gate" in res:
+            g = res["gate"]
+            L.append(f"| Release gate | **{'PASS' if g['passed'] else 'FAIL'}** (min_similarity >= {g['min_similarity']:.3f}, min_text_similarity >= {g['min_text_similarity']:.3f}, max_median_wall_ratio <= {g['max_median_wall_ratio']:.2f}) |")
+        L.append("")
     # summary
     L.append("## Summary: documents where TeXres is faster / slower\n")
     L.append("| Scenario | TeXres faster | TeXres slower | Median ratio | Worst ratio |\n| --- | ---: | ---: | ---: | ---: |")
@@ -486,32 +574,95 @@ def render_md(res):
 # ---------------------------------------------------------------------- main
 
 
+def evaluate_gate(res, args) -> dict:
+    docs = res["documents"]
+    total = len(docs)
+    timed = {n: e for n, e in docs.items() if e["status"] == "timed"}
+    pass_rate = (len(timed) / total) if total else 0.0
+    verified = [e["verify"] for e in docs.values() if "verify" in e and "pages_equal" in e["verify"]]
+    min_text_sim = min((v.get("text_similarity", 0.0) for v in verified), default=0.0) if len(verified) == total else 0.0
+    min_sim = min((v.get("similarity", 0.0) for v in verified), default=0.0) if len(verified) == total else 0.0
+    vis_ious = [v["visual_iou"] for v in verified if "visual_iou" in v]
+    min_vis_iou = min(vis_ious) if vis_ious else 1.0
+    reasons = []
+    if pass_rate < args.min_pass_rate:
+        failed_names = sorted(n for n, e in docs.items() if e["status"] != "timed")
+        reasons.append(f"pass rate {len(timed)}/{total} ({pass_rate:.3f}) < {args.min_pass_rate:.3f} (failed: {', '.join(failed_names[:10])})")
+    if min_text_sim < args.min_text_similarity:
+        reasons.append(f"min text_similarity {min_text_sim:.4f} < {args.min_text_similarity:.4f}")
+    if min_sim < args.min_similarity:
+        reasons.append(f"min similarity {min_sim:.4f} < {args.min_similarity:.4f}")
+    if args.visual_dpi > 0 and min_vis_iou < args.min_visual_iou:
+        reasons.append(f"min visual_iou {min_vis_iou:.4f} < {args.min_visual_iou:.4f}")
+    scenario_medians = {}
+    for s in res["scenarios_run"]:
+        rs = [ratio(e, s) for e in timed.values() if ratio(e, s) is not None]
+        if rs:
+            med = statistics.median(rs)
+            scenario_medians[s] = round(med, 4)
+            if med > args.max_median_wall_ratio:
+                reasons.append(f"scenario ({s}) median wall ratio {med:.3f} > {args.max_median_wall_ratio:.3f}")
+    return {
+        "passed": len(reasons) == 0,
+        "total_docs": total,
+        "passed_docs": len(timed),
+        "pass_rate": round(pass_rate, 4),
+        "min_text_similarity": args.min_text_similarity,
+        "observed_min_text_similarity": round(min_text_sim, 6),
+        "min_similarity": args.min_similarity,
+        "observed_min_similarity": round(min_sim, 6),
+        "min_visual_iou": args.min_visual_iou,
+        "observed_min_visual_iou": round(min_vis_iou, 4),
+        "max_median_wall_ratio": args.max_median_wall_ratio,
+        "scenario_median_ratios": scenario_medians,
+        "reasons": reasons,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--texres", help="texres executable to measure (copy it somewhere stable first)")
     ap.add_argument("--texres-note", default="", help="free text recorded in the results (e.g. commit)")
     ap.add_argument("--from-json")
-    ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--runs", type=int, default=None)
     ap.add_argument("--docs", default="all", help="comma-separated names, or tag=<tag>, engine=pdf|xe|lua, source=generated|arxiv|github")
-    ap.add_argument("--scenarios", default="abc")
+    ap.add_argument("--scenarios", default=None)
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--cpus-per-job", type=int, default=4)
+    ap.add_argument("--no-pin", action="store_true", help="do not pin workers with taskset")
     ap.add_argument("--timeout", type=int, default=900, help="per command, seconds")
     ap.add_argument("--out-dir", default=str(BENCH / "results"))
-    ap.add_argument("--name", default="bench100", help="result file stem")
+    ap.add_argument("--name", default=None, help="result file stem")
     ap.add_argument("--workdir")
     ap.add_argument("--cache", default=os.environ.get("BENCH_CACHE", str(Path.home() / ".cache" / "texres-bench")))
     ap.add_argument("--resume", action="store_true", help="reuse per-document results for the same binary in <out-dir>/<name>_docs/")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--gate", action="store_true", help="gate build/release on TeX Live parity, similarity threshold, and wall-time ratio")
+    ap.add_argument("--visual-dpi", type=int, default=None, help="render DPI for visual page similarity (default: 100 in --gate, 0 otherwise)")
+    ap.add_argument("--min-similarity", type=float, default=0.980, help="minimum composite similarity per document (default: 0.980)")
+    ap.add_argument("--min-text-similarity", type=float, default=None, help="minimum text similarity per document (default: 0.995 in --gate, 1.0 otherwise)")
+    ap.add_argument("--min-visual-iou", type=float, default=0.70, help="minimum rendered ink IoU per document when --visual-dpi > 0 (default: 0.70)")
+    ap.add_argument("--min-pass-rate", type=float, default=1.0, help="minimum fraction of documents passing parity + timing (default: 1.0)")
+    ap.add_argument("--max-median-wall-ratio", type=float, default=1.0, help="maximum median TeXres/TeX Live wall-time ratio per scenario (default: 1.0)")
     args = ap.parse_args()
     if args.from_json:
         jp = Path(args.from_json)
         jp.with_suffix(".md").write_text(render_md(json.loads(jp.read_text())))
         return 0
+    if args.runs is None:
+        args.runs = 1 if args.gate else 5
+    if args.scenarios is None:
+        args.scenarios = "ab" if args.gate else "abc"
+    if args.visual_dpi is None:
+        args.visual_dpi = 100 if args.gate else 0
+    if args.min_text_similarity is None:
+        args.min_text_similarity = 0.995 if args.gate else 1.0
+    if args.name is None:
+        args.name = "parity100" if args.gate else "bench100"
     if not args.texres:
         ap.error("--texres is required")
-    if args.runs < 5:
-        ap.error("--runs must be at least 5")
+    if args.runs < 1 or (not args.gate and args.runs < 5):
+        ap.error("--runs must be at least 5 (or >= 1 with --gate)")
     texres = Path(args.texres).resolve()
     if not texres.is_file():
         ap.error(f"{texres} not found")
@@ -532,15 +683,12 @@ def main():
     ensure_public(docs, sel, args.cache)
     for tool in ("pdflatex", "xelatex", "lualatex", "latexmk", "bibtex"):
         if not (B.TL_BIN / tool).exists():
-            ap.error(f"/usr/bin/{tool} missing")
-    if shutil.which("biber", path=B.CLEAN_PATH) is None:
-        ap.error("biber not found on " + B.CLEAN_PATH)
-
+            ap.error(f"{B.TL_BIN / tool} missing")
     root = Path(args.workdir or tempfile.mkdtemp(prefix="texres-bench100-", dir=os.environ.get("TMPDIR"))).resolve()
     root.mkdir(parents=True, exist_ok=True)
     bindir = root / "bin"
     bindir.mkdir(exist_ok=True)
-    for name in ("pdflatex", "xelatex", "lualatex"):
+    for name in ("pdflatex", "xelatex", "lualatex", "biber"):
         link = bindir / name
         if link.is_symlink() or link.exists():
             link.unlink()
@@ -550,23 +698,29 @@ def main():
     per_doc = out / f"{args.name}_docs"
     per_doc.mkdir(exist_ok=True)
     sha = hashlib.sha256(texres.read_bytes()).hexdigest()
-    slots = cpu_slots(args.jobs, args.cpus_per_job) if args.jobs > 1 else [None]
+    slots = ([None] * args.jobs) if (args.jobs <= 1 or args.no_pin) else cpu_slots(args.jobs, args.cpus_per_job, allow_unpinned=args.gate)
 
+    tl_extra_env = ensure_tl_hyphenation(root)
     # warm TL's $HOME-side caches (luaotfload database, fontconfig) once, serially
     warm = root / "warm"
     warm.mkdir(exist_ok=True)
     for eng in ("pdf", "xe", "lua"):
         (warm / "w.tex").write_text("\\documentclass{article}\\usepackage{fontspec}\\begin{document}warm\\end{document}\n" if eng != "pdf" else "\\documentclass{article}\\begin{document}warm\\end{document}\n")
-        B.timed([str(B.TL_BIN / ENGINE_EXE[eng]), "-interaction=nonstopmode", "w.tex"], warm, B.make_env(), 600)
+        B.timed([str(B.TL_BIN / ENGINE_EXE[eng]), "-interaction=nonstopmode", "w.tex"], warm, {**B.make_env(), **tl_extra_env}, 600)
 
     res = {"environment": B.environment(texres), "runs": args.runs, "scenarios_run": list(args.scenarios), "documents": {},
-           "jobs": args.jobs, "cpus_per_job": args.cpus_per_job if args.jobs > 1 else None, "texres_note": args.texres_note}
+           "jobs": args.jobs, "cpus_per_job": args.cpus_per_job if (args.jobs > 1 and any(slots)) else None, "texres_note": args.texres_note}
     todo = []
     for n in sel:
         pj = per_doc / f"{n}.json"
         if args.resume and pj.exists():
             old = json.loads(pj.read_text())
-            if old.get("texres_sha256") == sha and old.get("scenarios") == args.scenarios and old.get("runs", 0) >= args.runs:
+            if (
+                old.get("texres_sha256") == sha
+                and old.get("scenarios") == args.scenarios
+                and old.get("runs", 0) >= args.runs
+                and old.get("visual_dpi", 0) == args.visual_dpi
+            ):
                 res["documents"][n] = old["entry"]
                 log(f"resume {n}: {old['entry']['status']}")
                 continue
@@ -579,9 +733,15 @@ def main():
             slot = free.pop()
         try:
             t0 = time.time()
-            e = do_doc(docs[n], root, texres, bindir, args, slots[slot])
+            e = do_doc(docs[n], root, texres, bindir, args, slots[slot], tl_extra_env=tl_extra_env)
             log(f"== {n}: {e['status']} ({time.time() - t0:.0f}s)")
-            (per_doc / f"{n}.json").write_text(json.dumps({"texres_sha256": sha, "scenarios": args.scenarios, "runs": args.runs, "entry": e}, indent=1))
+            (per_doc / f"{n}.json").write_text(json.dumps({
+                "texres_sha256": sha,
+                "scenarios": args.scenarios,
+                "runs": args.runs,
+                "visual_dpi": args.visual_dpi,
+                "entry": e,
+            }, indent=1))
             return n, e
         finally:
             with lock:
@@ -592,13 +752,25 @@ def main():
             res["documents"][n] = e
     res["documents"] = {n: res["documents"][n] for n in sel}
     res["environment"]["loadavg_at_end"] = os.getloadavg()
+    gate = evaluate_gate(res, args)
+    res["gate"] = gate
     (out / f"{args.name}.json").write_text(json.dumps(res, indent=1) + "\n")
     (out / f"{args.name}.md").write_text(render_md(res))
     log(f"wrote {out / (args.name + '.json')} and .md")
+    if args.gate:
+        status_str = "PASS" if gate["passed"] else "FAIL"
+        log(
+            f"[GATE {status_str}] {gate['passed_docs']}/{gate['total_docs']} docs passed; "
+            f"min_text_similarity={gate['observed_min_text_similarity']:.4f} (>= {gate['min_text_similarity']:.4f}); "
+            f"min_visual_iou={gate['observed_min_visual_iou']:.4f} (>= {gate['min_visual_iou']:.4f}); "
+            f"min_similarity={gate['observed_min_similarity']:.4f} (>= {gate['min_similarity']:.4f}); "
+            f"median_wall_ratios={gate['scenario_median_ratios']} (<= {gate['max_median_wall_ratio']:.2f})"
+        )
+        for reason in gate["reasons"]:
+            log(f"  ! {reason}")
     if not args.keep and not args.workdir:
         shutil.rmtree(root, ignore_errors=True)
-    return 0
-
+    return 0 if (not args.gate or gate["passed"]) else 1
 
 if __name__ == "__main__":
     sys.exit(main())

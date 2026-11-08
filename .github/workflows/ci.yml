@@ -202,6 +202,14 @@ jobs:
             collection-luatex
             collection-xetex
             collection-mathscience
+            collection-binextra
+            collection-bibtexextra
+            collection-humanities
+            collection-metapost
+            collection-pictures
+            collection-plaingeneric
+            collection-pstricks
+            collection-publishers
             collection-langarabic
             collection-langcjk
             collection-langchinese
@@ -234,6 +242,19 @@ jobs:
             --reference-lualatex "$(command -v lualatex)" \
             --reference-texlive 2026
 
+
+      - name: 100-document TeX Live parity, similarity, and performance gate
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/bench100.py \
+            --texres target/release/texres \
+            --gate \
+            --jobs "$(nproc)" \
+            --min-similarity 0.980 \
+            --min-text-similarity 0.995 \
+            --min-visual-iou 0.70 \
+            --max-median-wall-ratio 1.0 \
+            --out-dir target/parity100
       - name: Preserve engine compatibility evidence
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -242,6 +263,8 @@ jobs:
           path: |
             target/font-evidence-full/report.json
             target/font-evidence-full/cases/
+            target/parity100/parity100.json
+            target/parity100/parity100.md
           retention-days: 14
           if-no-files-found: ignore
 

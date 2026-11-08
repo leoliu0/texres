@@ -31,6 +31,7 @@ user+system of the process tree (wait4 rusage).
 
 import argparse
 import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -48,9 +49,26 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "bench" / "corpus"
-TL_BIN = Path("/usr/bin")
-CLEAN_PATH = "/usr/bin:/usr/bin/vendor_perl:/bin"
 
+
+def _detect_tl_bin() -> Path:
+    env_dir = os.environ.get("TEXLIVE_BIN_DIR")
+    if env_dir and (Path(env_dir) / "pdflatex").exists():
+        return Path(env_dir).resolve()
+    which_ltx = shutil.which("latexmk") or shutil.which("pdflatex")
+    if which_ltx:
+        cand = Path(which_ltx).resolve().parent
+        if (cand / "pdflatex").exists():
+            return cand
+    return Path("/usr/bin")
+
+
+TL_BIN = _detect_tl_bin()
+CLEAN_PATH = (
+    f"{TL_BIN}:/usr/bin:/usr/bin/vendor_perl:/bin"
+    if str(TL_BIN) not in ("/usr/bin", "/bin")
+    else "/usr/bin:/usr/bin/vendor_perl:/bin"
+)
 # name -> (engine flag for texres/latexmk, engine executable name)
 DOCS = {
     "article_math": ("-pdf", "pdflatex"),
@@ -195,14 +213,79 @@ def pdf_summary(pdf: Path):
     return pages, text
 
 
-def compare_pdfs(tl_pdf, rs_pdf):
+def _page_text_similarity(tl_pdf: Path, rs_pdf: Path, pages: int) -> float:
+    ratios = []
+    for p in range(1, pages + 1):
+        a = re.sub(r"\s+", "", sh(["pdftotext", "-layout", "-f", str(p), "-l", str(p), str(tl_pdf), "-"]).stdout)
+        b = re.sub(r"\s+", "", sh(["pdftotext", "-layout", "-f", str(p), "-l", str(p), str(rs_pdf), "-"]).stdout)
+        ratios.append(1.0 if a == b else difflib.SequenceMatcher(None, a, b).ratio())
+    return statistics.mean(ratios) if ratios else 1.0
+
+
+def _visual_similarity(tl_pdf: Path, rs_pdf: Path, pages: int, dpi: int = 100, max_pages: int = 6) -> dict:
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return {}
+    if pages <= 0:
+        return {}
+    if pages <= max_pages:
+        sampled = list(range(1, pages + 1))
+    else:
+        sampled = sorted({1, pages} | {1 + round(i * (pages - 1) / (max_pages - 1)) for i in range(max_pages)})
+    ious, pix_sims = [], []
+    with tempfile.TemporaryDirectory(prefix="texres-vis-") as td:
+        tdir = Path(td)
+        for p in sampled:
+            tl_prefix = tdir / f"tl_{p}"
+            rs_prefix = tdir / f"rs_{p}"
+            r1 = sh(["pdftoppm", "-png", "-r", str(dpi), "-f", str(p), "-l", str(p), "-singlefile", str(tl_pdf), str(tl_prefix)])
+            r2 = sh(["pdftoppm", "-png", "-r", str(dpi), "-f", str(p), "-l", str(p), "-singlefile", str(rs_pdf), str(rs_prefix)])
+            p1, p2 = tl_prefix.with_suffix(".png"), rs_prefix.with_suffix(".png")
+            if r1.returncode != 0 or r2.returncode != 0 or not p1.exists() or not p2.exists():
+                continue
+            with Image.open(p1) as im1, Image.open(p2) as im2:
+                rgb1 = im1.convert("RGB")
+                rgb2 = im2.convert("RGB")
+                if rgb1.size != rgb2.size:
+                    rgb2 = rgb2.resize(rgb1.size)
+                a1 = np.asarray(rgb1, dtype=np.float32)
+                a2 = np.asarray(rgb2, dtype=np.float32)
+                m1 = (a1[:, :, 0] < 250) | (a1[:, :, 1] < 250) | (a1[:, :, 2] < 250)
+                m2 = (a2[:, :, 0] < 250) | (a2[:, :, 1] < 250) | (a2[:, :, 2] < 250)
+                union = int(np.sum(m1 | m2))
+                inter = int(np.sum(m1 & m2))
+                iou = (inter / union) if union > 200 else 1.0
+                pix_sim = 1.0 - float(np.mean(np.abs(a1 - a2)) / 255.0)
+                ious.append(iou)
+                pix_sims.append(pix_sim)
+    if not ious:
+        return {}
+    return {
+        "visual_dpi": dpi,
+        "visual_pages_sampled": len(ious),
+        "visual_iou": round(min(ious), 4),
+        "visual_mean_iou": round(statistics.mean(ious), 4),
+        "visual_similarity": round(min(pix_sims), 4),
+        "visual_mean_similarity": round(statistics.mean(pix_sims), 4),
+    }
+
+
+def compare_pdfs(tl_pdf, rs_pdf, visual_dpi=0, max_visual_pages=6):
     p1, t1 = pdf_summary(tl_pdf)
     p2, t2 = pdf_summary(rs_pdf)
     res = {"pages_tl": p1, "pages_texres": p2}
     n1, n2 = re.sub(r"\s+", "", t1), re.sub(r"\s+", "", t2)
     res["text_equal"] = n1 == n2
     res["pages_equal"] = p1 == p2
-    if n1 != n2:
+    if n1 == n2:
+        res["text_similarity"] = 1.0
+    else:
+        if max(len(n1), len(n2)) <= 50000:
+            res["text_similarity"] = round(difflib.SequenceMatcher(None, n1, n2).ratio(), 6)
+        else:
+            res["text_similarity"] = round(_page_text_similarity(tl_pdf, rs_pdf, min(p1, p2)), 6)
         # first differing page, and a short excerpt of each side
         diff_pages = []
         for p in range(1, min(p1, p2) + 1):
@@ -213,6 +296,14 @@ def compare_pdfs(tl_pdf, rs_pdf):
         res["differing_pages"] = diff_pages
         i = next((k for k in range(min(len(n1), len(n2))) if n1[k] != n2[k]), min(len(n1), len(n2)))
         res["first_difference"] = {"tl": n1[max(0, i - 30) : i + 40], "texres": n2[max(0, i - 30) : i + 40]}
+    if visual_dpi and visual_dpi > 0 and min(p1, p2) > 0:
+        res.update(_visual_similarity(tl_pdf, rs_pdf, min(p1, p2), dpi=visual_dpi, max_pages=max_visual_pages))
+    if not res["pages_equal"]:
+        res["similarity"] = round((min(p1, p2) / max(p1, p2, 1)) * res["text_similarity"] * 0.5, 6)
+    elif "visual_similarity" in res:
+        res["similarity"] = round(min(res["text_similarity"], res["visual_similarity"]), 6)
+    else:
+        res["similarity"] = res["text_similarity"]
     return res
 
 
@@ -266,7 +357,10 @@ def measure(doc, tools, scenario, runs, prep_d):
 
 
 def first_line(cmd):
-    r = sh(cmd, env=make_env())
+    try:
+        r = sh(cmd, env=make_env())
+    except FileNotFoundError:
+        return "?"
     return ((r.stdout or r.stderr).strip().splitlines() or ["?"])[0]
 
 
@@ -300,7 +394,7 @@ def environment(texres: Path):
         "lualatex": first_line([str(TL_BIN / "lualatex"), "--version"]),
         "latexmk": first_line([str(TL_BIN / "latexmk"), "--version"]),
         "bibtex": first_line([str(TL_BIN / "bibtex"), "--version"]),
-        "biber": first_line(["biber", "--version"]),
+        "biber": first_line(["biber", "--version"] if shutil.which("biber", path=CLEAN_PATH) else [str(texres), "biber", "--version"]),
         "pdftotext": first_line(["pdftotext", "-v"]),
         "python": platform.python_version(),
         "loadavg_at_start": os.getloadavg(),
