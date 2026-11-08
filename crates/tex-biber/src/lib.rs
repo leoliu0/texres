@@ -197,7 +197,7 @@ pub fn run_configured(opts:&Options<'_>, overrides:&BTreeMap<String,String>, con
         stdout.write_all(&bytes).map_err(|error|format!("Cannot write bibliography output to stdout: {error}"))?;
         if !quiet{stdout.write_all(log[before_output..].as_bytes()).map_err(|error|format!("Cannot write bibliography log to stdout: {error}"))?;}
     }else{fs::write(&path,&bytes).map_err(|error|format!("Cannot write {}: {error}",path.display()))?;}
-    if !control.options.get("nolog").is_some_and(|value|matches!(value.as_str(),"1"|"true"|"yes")){fs::write(&logfile,log.as_bytes()).map_err(|error|format!("Cannot write bibliography log: {error}"))?;}
+    if !control.options.get("nolog").is_some_and(|value|matches!(value.as_str(),"1"|"true"|"yes")){fs::write(&logfile,tool::format_blg(&log).as_bytes()).map_err(|error|format!("Cannot write bibliography log: {error}"))?;}
     Ok(Outcome {bbl:path,warnings:warnings.len() as u32,errors:errors.len() as u32,log})
 }
 

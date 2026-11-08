@@ -182,7 +182,7 @@ pub(crate) fn run(opts: &Options<'_>, overrides: &BTreeMap<String,String>, confi
     if !warnings.is_empty(){log.push_str(&format!("INFO - WARNINGS: {}\n",warnings.len()));}
     if !errors.is_empty(){log.push_str(&format!("INFO - ERRORS: {}\n",errors.len()));}
     if noisy_stdout{use std::io::Write;std::io::stdout().lock().write_all(log[prefix_end..].as_bytes()).map_err(|e|e.to_string())?;}
-    fs::write(logfile,log.as_bytes()).map_err(|e|format!("Cannot write bibliography log: {e}"))?;
+    fs::write(logfile,format_blg(&log).as_bytes()).map_err(|e|format!("Cannot write bibliography log: {e}"))?;
     Ok(Outcome {bbl:output,warnings:warnings.len() as u32,errors:errors.len() as u32,log})
 }
 fn default_output(path:&Path,format:&str)->PathBuf {
@@ -230,6 +230,7 @@ fn parse_model(model:roxmltree::Node<'_, '_>,control:&mut Control)->Result<(),St
     }
     Ok(())
 }
+pub(crate) fn format_blg(log:&str)->String{let mut out=String::with_capacity(log.len()+192);for (idx,line) in log.lines().enumerate(){out.push_str(&format!("[{idx}] Biber.pm> {line}\n"));}out}
 pub(crate) fn logfile_path(control:&Control,opts:&Options<'_>,tool:bool)->PathBuf{
     let path=if let Some(logfile)=control.options.get("logfile"){PathBuf::from(if logfile.ends_with(".blg"){logfile.clone()}else{format!("{logfile}.blg")})}
         else if tool{let mut path=opts.bcf.as_os_str().to_os_string();path.push(".blg");PathBuf::from(path)}
