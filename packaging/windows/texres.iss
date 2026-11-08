@@ -1,7 +1,7 @@
 ; Inno Setup script for texres (TeX engine & toolchain) on Windows
 #define MyAppName "texres"
 #ifndef MyAppVersion
-#define MyAppVersion "0.7.9"
+#define MyAppVersion "0.7.10"
 #endif
 #define MyAppPublisher "Leo Liu"
 #define MyAppURL "https://github.com/leoliu0/texres"
