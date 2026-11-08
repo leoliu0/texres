@@ -796,3 +796,32 @@ pub fn install(lua: &mut Lua) -> Result<(), String> {
     loaded.set("lpeg", &lib).map_err(err)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LuaApi, SafeOption, Stdlib};
+
+    #[test]
+    fn grammar_allows_same_rule_across_choice_and_sequence_branches() {
+        let mut lua = Lua::new(SafeOption::default());
+        lua.open_stdlib(Stdlib::All).unwrap();
+        install(&mut lua).unwrap();
+        let pos: i64 = lua
+            .load(
+                "local P, R, S, V = lpeg.P, lpeg.R, lpeg.S, lpeg.V\n\
+                 local g = P({\n\
+                     'num',\n\
+                     sign = S('-+'),\n\
+                     digit = R('09'),\n\
+                     int = (V('sign') ^ -1) * (V('digit') ^ 1),\n\
+                     frac = P('.') * (V('digit') ^ 1),\n\
+                     num = (V('int') * (V('frac') ^ -1)) + ((V('sign') ^ -1) * V('frac')),\n\
+                 })\n\
+                 return g:match('-.5')",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(pos, 4);
+    }
+}

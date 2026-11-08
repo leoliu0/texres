@@ -550,13 +550,18 @@ fn verifyrule(
             TCAPTURE | TRUNTIME => i += 1,
             TCALL => i = sib2(t, i),
             TSEQ => {
-                if !verifyrule(t, i + 1, passed, false, rules, name_error)? {
+                let nb = passed.len();
+                let first_nullable = verifyrule(t, i + 1, passed, false, rules, name_error)?;
+                passed.truncate(nb);
+                if !first_nullable {
                     return Ok(nullable);
                 }
                 i = sib2(t, i);
             }
             TCHOICE => {
+                let nb = passed.len();
                 nullable = verifyrule(t, i + 1, passed, nullable, rules, name_error)?;
+                passed.truncate(nb);
                 i = sib2(t, i);
             }
             TRULE => {
