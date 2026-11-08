@@ -12,8 +12,10 @@ impl Fixture {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("texres-babel-{name}-{}-{nonce}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "texres-babel-{name}-{}-{nonce}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("main.tex"), source).unwrap();
         Self(path)
@@ -30,7 +32,10 @@ impl Fixture {
     fn run_as(&self, engine: &str) -> Output {
         self.exec(
             env!("CARGO_BIN_EXE_texmk"),
-            &[("TEXMK_INTERNAL_MODE", "engine"), ("TEX_SUITE_PROGRAM_NAME", engine)],
+            &[
+                ("TEXMK_INTERNAL_MODE", "engine"),
+                ("TEX_SUITE_PROGRAM_NAME", engine),
+            ],
         )
     }
 
@@ -172,4 +177,25 @@ fn pdflatex_format_dumps_the_polish_patterns() {
     let log = fixture.read("main.log");
     assert!(log.contains("PL=86"), "{log}");
     assert!(log.contains("sta-bi-li-zu-je"), "{log}");
+}
+
+#[test]
+fn babel_european_ldf_definitions_load_offline() {
+    let fixture = Fixture::new(
+        "ldf-european",
+        r"\documentclass{article}
+\usepackage[T1]{fontenc}
+\usepackage[dutch,polish,italian]{babel}
+\begin{document}
+\typeout{MAIN=\languagename}
+\selectlanguage{polish}\typeout{PL=\languagename/\the\language}
+\selectlanguage{dutch}\typeout{NL=\languagename}
+\end{document}
+",
+    );
+    fixture.run(env!("CARGO_BIN_EXE_pdflatex"));
+    let log = fixture.read("main.log");
+    assert!(log.contains("MAIN=italian"), "{log}");
+    assert!(log.contains("PL=polish/86"), "{log}");
+    assert!(log.contains("NL=dutch"), "{log}");
 }
