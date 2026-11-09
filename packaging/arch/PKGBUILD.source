@@ -1,6 +1,6 @@
 # Maintainer: Leo Liu <leoliu0@users.noreply.github.com>
 pkgname=texres
-pkgver=0.7.9
+pkgver=0.7.10
 pkgrel=1
 pkgdesc="Ultra-fast, pure-Rust TeX engine and typesetting toolchain (built from source)"
 arch=('x86_64' 'aarch64')
@@ -26,7 +26,7 @@ conflicts=('texres-bin' 'ratex' 'ratex-bin')
 replaces=('ratex')
 options=('!lto')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/leoliu0/texres/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('8505a07e31ae4ab9277e39c83fb1a0be862dc8f1c787a77cc22d86b93dfd32f9')
+sha256sums=('2740ada8d9cd7084a59880d35206206de0d8264b6e94d68ce2828e32261d76f5')
 
 build() {
     cd "${pkgname}-${pkgver}"
