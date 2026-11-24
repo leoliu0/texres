@@ -1839,3 +1839,266 @@ fn alignment_entries_end_only_at_visible_row_delimiters() {
         assert!(flat.contains(expected), "{expected}: {}", e.term);
     }
 }
+
+fn engine_allowing_errors(source: &str) -> Engine {
+    let mut engine = Engine::new(true);
+    engine.init_primitives();
+    engine.add_nullfont();
+    let source = format!(
+        r"\catcode`\{{=1 \catcode`\}}=2 \catcode`\#=6 \catcode`\&=4
+\catcode`\$=3 \catcode`\^=7 \catcode`\_=8 \catcode`\~=13
+{source}"
+    );
+    engine
+        .input
+        .push_file("review.tex".into(), source.into_bytes());
+    engine.run();
+    engine
+}
+
+/// Regression for #1: `pass_text_run` must still count braces from `PEEK_SRC`
+/// after `U_PART_SRC` is exhausted so `align_brace_depth` is not corrupted.
+#[test]
+fn pass_text_run_counts_braces_in_alignment_peek_source() {
+    let e = engine(
+        r"\catcode`\&=4
+\count1=0
+\setbox0=\vbox{\halign{\global\advance\count1 by 1 \noexpand\iffalse #&\global\advance\count1 by 1 #\cr
+{a}\fi x&y\cr}}
+\message{[CELLS=\the\count1]}
+\end",
+    );
+    assert!(e.term.contains("[CELLS=2]"), "{}", e.term);
+}
+
+/// Regression for #2: closed-group fast paths in `take_undelimited_arg` and
+/// `take_delimited_run` must not swallow `&` when `align_brace_depth < 0`.
+#[test]
+fn closed_group_fast_paths_respect_negative_align_brace_depth() {
+    // Undelimited argument `{a&b}` when `}` closed `\bgroup` from u-part.
+    let e = engine_allowing_errors(
+        r"\let\bgroup={ \let\egroup=}
+\def\foo#1{\message{FOO=[#1]}}
+\def\run{\foo{a&b}}
+\setbox0=\vbox{\halign{\bgroup#\egroup&#\cr \relax}\run\cr}}
+\end",
+    );
+    assert!(
+        e.error_count > 0 && !e.term.contains("FOO=[a&b]"),
+        "expected alignment error instead of swallowing &: errors={} term={}",
+        e.error_count,
+        e.term
+    );
+
+    // Delimited argument `{a&b};` under the same negative align_brace_depth.
+    let e2 = engine_allowing_errors(
+        r"\let\bgroup={ \let\egroup=}
+\def\bar#1;{\message{BAR=[#1]}}
+\def\run{\bar{a&b};}
+\setbox0=\vbox{\halign{\bgroup#\egroup&#\cr \relax}\run\cr}}
+\end",
+    );
+    assert!(
+        e2.error_count > 0 && !e2.term.contains("BAR=[a&b]"),
+        "expected alignment error in delimited fast path: errors={} term={}",
+        e2.error_count,
+        e2.term
+    );
+}
+
+/// Regression for #3: `take_def_body_run` must reject `\outer` active
+/// characters inside a macro-expanded `\def` body.
+#[test]
+fn take_def_body_run_rejects_outer_active_char() {
+    let e = engine_allowing_errors(
+        r"\def\run{\def\foo{a~b}}
+\outer\def~{x}
+\run
+\end",
+    );
+    assert!(e.error_count > 0, "expected outer error: {}", e.log);
+    assert!(
+        e.diagnostic_output
+            .contains("Forbidden control sequence found while scanning definition of \\foo")
+            || e.log
+                .contains("Forbidden control sequence found while scanning definition of \\foo"),
+        "diag={}\nlog={}",
+        e.diagnostic_output,
+        e.log
+    );
+}
+
+/// Regression for #4: `balanced_prefix` group copies (`take_undelimited_arg`,
+/// `take_balanced_run`, `take_delimited_run`) must unfreeze active-CS tokens
+/// back to category-13 character tokens.
+#[test]
+fn balanced_group_copies_unfreeze_active_cs_tokens() {
+    use tex_core::token::{Token, CAT_ACTIVE};
+    let mut e = Engine::new(true);
+    e.init_primitives();
+    let tilde_id = e.cs.intern(&Engine::active_cs_name(b'~' as u32));
+    let expected_active = Token::char(CAT_ACTIVE, b'~' as u32);
+    let close = Token::char(2, b'}' as u32);
+
+    // 1. `take_balanced_run` via `scan_balanced_raw`
+    e.input.push_toks(
+        vec![Token::letter(b'a'), Token::from_cs(tilde_id), close],
+        "<test>",
+    );
+    assert_eq!(
+        e.scan_balanced_raw(true),
+        vec![Token::letter(b'a'), expected_active]
+    );
+
+    // 2. `take_undelimited_arg` and `take_delimited_run`: `\edef\call`
+    //    stores `\noexpand~` as an active-CS token inside `\call`'s body;
+    //    calling `\call` must restore it to a cat-13 active character token.
+    let e = engine(
+        r"\catcode`\~=13
+\def~{BAD}
+\def\testu#1{\ifcat\noexpand#1\noexpand~\message{U=OK}\else\message{U=BAD}\fi}
+\def\testd#1;{\ifcat\noexpand#1\noexpand~\message{D=OK}\else\message{D=BAD}\fi}
+\edef\call{\noexpand\testu{\noexpand~}\noexpand\testd{\noexpand~};}
+\call
+\end",
+    );
+    assert!(e.term.contains("U=OK"), "{}", e.term);
+    assert!(e.term.contains("D=OK"), "{}", e.term);
+}
+
+/// Regression for #5: `take_delimited_run` must hold `diagnostic_macro_trace`
+/// across the argument scan so the active macro remains in the error trace.
+#[test]
+fn take_delimited_run_preserves_macro_trace() {
+    let e = engine_allowing_errors(
+        r"\def\outer{\inner foo\par\stop}
+\def\inner#1\stop{#1}
+\outer
+\end",
+    );
+    assert!(e.error_count > 0, "{}", e.term);
+    assert!(
+        e.diagnostic_output.contains("\\inner") || e.term.contains("\\inner"),
+        "expected \\inner in trace; diag={}\nterm={}",
+        e.diagnostic_output,
+        e.term
+    );
+}
+
+/// Regression for #6: tail recursion through a trailing parameter (and
+/// through trailing empty parameters) runs in O(1) input stack space.
+#[test]
+fn tail_recursion_through_trailing_parameter_uses_constant_stack() {
+    let e = engine(
+        r"\count0=0
+\def\step#1{\advance\count0 by 1 #1}
+\def\go{\ifnum\count0<6000 \expandafter\step\expandafter{\expandafter\go\expandafter}\fi}
+\go
+\message{[A=\the\count0]}
+\count0=0
+\def\stepb#1#2{\advance\count0 by 1 #1#2}
+\def\gob{\ifnum\count0<6000 \expandafter\stepb\expandafter{\expandafter\gob\expandafter}\expandafter{\expandafter}\fi}
+\gob
+\message{[B=\the\count0]}
+\end",
+    );
+    assert!(e.term.contains("[A=6000]"), "{}", e.term);
+    assert!(e.term.contains("[B=6000]"), "{}", e.term);
+}
+
+/// Verification of #7 against TeX Live 2026 (`tex.web §392-§397`): a `\par`
+/// that partially matches a delimiter prefix (`#1\par X`) is copied into the
+/// argument without error on a later mismatch, whereas a non-matching `\par`
+/// still triggers `Paragraph ended before ... was complete`.
+#[test]
+fn delimited_argument_par_prefix_matches_tex_live() {
+    let ok = engine(
+        r"\def\foo#1\par X{\message{ARG=[#1]}}
+\foo a\par b\par X
+\end",
+    );
+    assert!(ok.term.contains(r"ARG=[a\par b]"), "{}", ok.term);
+
+    let err = engine_allowing_errors(
+        r"\def\bar#1ab{\message{BAR=[#1]}}
+\bar xa\par ab
+\end",
+    );
+    assert!(
+        err.error_count > 0
+            && (err
+                .diagnostic_output
+                .contains("Paragraph ended before \\bar was complete")
+                || err.log.contains("Paragraph ended before \\bar was complete")),
+        "errors={} diag={}\nlog={}",
+        err.error_count,
+        err.diagnostic_output,
+        err.log
+    );
+}
+
+/// Regression for #8: `Debug` formatting of `Macro`/`CachedReplacement`
+/// clones safely without holding a reference into `UnsafeCell`.
+#[test]
+fn cached_replacement_debug_formatting_is_safe() {
+    let e = engine(
+        r"\def\foo#1{[#1]}
+\edef\bar{\foo{ok}}
+\end",
+    );
+    let id = e.cs.lookup(b"foo").unwrap();
+    let eq = e.eqtb.get(id).unwrap();
+    let formatted = format!("{eq:?}");
+    assert!(formatted.contains("CachedReplacement"), "{formatted}");
+}
+
+/// Regression for #10: cross-segment decimal runs hit `take_decimal_run_from_list`.
+#[test]
+fn cross_segment_decimal_run_scans_exact_value() {
+    let e = engine(
+        r"\def\wrap#1#2{1#1#2}
+\count0=\wrap{234}{56} \relax
+\message{[N=\the\count0]}
+\end",
+    );
+    assert!(e.term.contains("[N=123456]"), "{}", e.term);
+}
+
+/// Regression for #11: `skip_raw_spaces` must not stop early at an ignored,
+/// comment, or invalid token followed by spaces.
+#[test]
+fn skip_raw_spaces_skips_across_ignored_tokens() {
+    use tex_core::token::Token;
+    let mut e = Engine::new(true);
+    e.init_primitives();
+    e.input.push_toks(
+        vec![
+            Token::space(),
+            Token::char(9, 0),
+            Token::space(),
+            Token::char(14, b'%' as u32),
+            Token::space(),
+            Token::letter(b'Z'),
+        ],
+        "<test>",
+    );
+    e.skip_raw_spaces();
+    assert_eq!(e.raw_token(), Token::letter(b'Z'));
+}
+
+/// Regression for #12: `\ifcsname` fast path via `take_csname_run` preserves
+/// non-interning, `\lastnamedcs`, and error handling.
+#[test]
+fn ifcsname_fast_path_preserves_lookup_and_non_interning() {
+    let e = engine(
+        r"\def\hello{world}
+\ifcsname hello\endcsname\message{HIT=OK}\else\message{HIT=BAD}\fi
+\ifcsname neverdefinedxyz\endcsname\message{MISS=BAD}\else\message{MISS=OK}\fi
+\ifcsname neverdefinedxyz\endcsname\message{MISS2=BAD}\else\message{MISS2=OK}\fi
+\end",
+    );
+    assert!(e.term.contains("HIT=OK"), "{}", e.term);
+    assert!(e.term.contains("MISS=OK"), "{}", e.term);
+    assert!(e.term.contains("MISS2=OK"), "{}", e.term);
+    assert!(e.cs.lookup(b"neverdefinedxyz").is_none());
+}

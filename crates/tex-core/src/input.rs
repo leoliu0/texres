@@ -250,12 +250,16 @@ pub(crate) struct ListCursor {
     pub(crate) pos: u32,
     pub(crate) end: u32,
     pub(crate) trace_depth: u8,
+    /// True if the source may contain an active-character CS token that
+    /// balanced-group fast paths must unfreeze via `unfreeze_input_token`.
+    pub(crate) maybe_active_cs: bool,
 }
 
 /// An input source. `repr(C, u8)` keeps `Source` to 64 bytes (one cache line)
-/// and places the token cursor (`seg`, `pos`, `end`, `trace_depth`) at byte
-/// offset 8 in `TokRc`, `TokVec`, and `MacroFrame`, so `Source::cursor` /
-/// `Source::cursor_mut` checks only `discriminant != 0` without a jump table.
+/// and places the token cursor (`seg`, `pos`, `end`, `trace_depth`,
+/// `maybe_active_cs`) at byte offset 8 in `TokRc`, `TokVec`, and `MacroFrame`,
+/// so `Source::cursor` / `Source::cursor_mut` checks only `discriminant != 0`
+/// without a jump table.
 #[derive(Debug)]
 #[repr(C, u8)]
 pub enum Source {
@@ -280,6 +284,7 @@ pub enum Source {
         end: u32,
         /// Number of macro ancestry entries that belong to this list.
         trace_depth: u8,
+        maybe_active_cs: bool,
         owner: CsId,
         toks: Rc<[Token]>,
         name: &'static str,
@@ -292,6 +297,7 @@ pub enum Source {
         end: u32,
         /// Number of macro ancestry entries that belong to this list.
         trace_depth: u8,
+        maybe_active_cs: bool,
         owner: CsId,
         toks: CompactTokenVec,
         name: &'static str,
@@ -440,6 +446,7 @@ pub struct MacroFrame {
     pub(crate) pos: u32,
     pub(crate) end: u32,
     pub trace_depth: u8,
+    pub(crate) maybe_active_cs: bool,
     in_arg: bool,
     arg_count: u8,
     /// Body position after the reference whose argument is being read.
@@ -458,6 +465,7 @@ impl MacroFrame {
         args: MacroArgs,
         owner: Option<CsId>,
         trace_depth: u8,
+        maybe_active_cs: bool,
     ) -> Self {
         let end = plan
             .references
@@ -468,6 +476,7 @@ impl MacroFrame {
             pos: 0,
             end,
             trace_depth,
+            maybe_active_cs,
             in_arg: false,
             arg_count: args.count,
             resume: 0,
@@ -1286,6 +1295,7 @@ impl InputStack {
         name: &'static str,
         owner: Option<CsId>,
         trace_depth: u8,
+        maybe_active_cs: bool,
     ) {
         self.ensure_stack_room();
         assert!(
@@ -1297,6 +1307,7 @@ impl InputStack {
             pos: 0,
             end: toks.len() as u32,
             trace_depth,
+            maybe_active_cs,
             owner: owner.unwrap_or(NO_OWNER),
             toks,
             name,
@@ -1309,6 +1320,7 @@ impl InputStack {
         name: &'static str,
         owner: Option<CsId>,
         trace_depth: u8,
+        maybe_active_cs: bool,
     ) {
         self.ensure_stack_room();
         assert!(
@@ -1322,6 +1334,7 @@ impl InputStack {
             pos: 0,
             end,
             trace_depth,
+            maybe_active_cs,
             owner: owner.unwrap_or(NO_OWNER),
             toks: CompactTokenVec::from_vec(toks),
             name,
@@ -1336,8 +1349,8 @@ impl InputStack {
         trace_depth: u8,
     ) {
         match toks.into() {
-            TokTokens::Rc(r) => self.push_toks_rc(r, name, owner, trace_depth),
-            TokTokens::Vec(v) => self.push_toks_vec(v, name, owner, trace_depth),
+            TokTokens::Rc(r) => self.push_toks_rc(r, name, owner, trace_depth, true),
+            TokTokens::Vec(v) => self.push_toks_vec(v, name, owner, trace_depth, true),
         }
     }
 
@@ -1513,12 +1526,13 @@ mod tests {
             pos: 1,
             end: 2,
             trace_depth: 3,
+            maybe_active_cs: true,
             owner: NO_OWNER,
             toks: rc,
             name: "<rc>",
         };
         let c = s_rc.cursor().expect("TokRc cursor");
-        assert_eq!((c.pos, c.end, c.trace_depth), (1, 2, 3));
+        assert_eq!((c.pos, c.end, c.trace_depth, c.maybe_active_cs), (1, 2, 3, true));
 
         let v = vec![Token::letter(b'b')];
         let s_vec = Source::TokVec {
@@ -1526,12 +1540,13 @@ mod tests {
             pos: 4,
             end: 5,
             trace_depth: 6,
+            maybe_active_cs: false,
             owner: NO_OWNER,
             toks: CompactTokenVec::from_vec(v),
             name: "<vec>",
         };
         let c = s_vec.cursor().expect("TokVec cursor");
-        assert_eq!((c.pos, c.end, c.trace_depth), (4, 5, 6));
+        assert_eq!((c.pos, c.end, c.trace_depth, c.maybe_active_cs), (4, 5, 6, false));
 
         let m = crate::eqtb::Macro {
             num_params: 1,
@@ -1548,12 +1563,12 @@ mod tests {
         let mut args = MacroArgs::with_buffer(Vec::with_capacity(16));
         args.buffer().push(Token::letter(b'd'));
         args.finish_arg();
-        let mut frame = MacroFrame::new(plan, args, None, 7);
+        let mut frame = MacroFrame::new(plan, args, None, 7, true);
         frame.pos = 8;
         frame.end = 9;
         let s_frame = Source::MacroFrame(frame);
         let c = s_frame.cursor().expect("MacroFrame cursor");
-        assert_eq!((c.pos, c.end, c.trace_depth), (8, 9, 7));
+        assert_eq!((c.pos, c.end, c.trace_depth, c.maybe_active_cs), (8, 9, 7, true));
     }
 
     #[test]

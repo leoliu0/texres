@@ -924,7 +924,9 @@ impl Engine {
     /// sequence carries the one-shot \\noexpand flag so a later x/f-scan
     /// stores it without expanding; char tokens are unaffected.
     pub fn push_tokens_exp_not(&mut self, toks: Vec<Token>) {
-        self.begin_token_list(toks, true, "<replay>", None);
+        // `freeze_unexpanded_toks` marks every CS with `UNEXPANDED_CS_FLAG`,
+        // which `balanced_prefix` already rejects, so no plain active CS exists.
+        self.begin_token_list_with_active(toks, true, "<replay>", None, false);
     }
     /// named replay source: trace readability only.
     pub fn push_tokens_named(&mut self, toks: Vec<Token>, name: &'static str) {
@@ -934,7 +936,7 @@ impl Engine {
         self.begin_token_list(toks, false, name, None)
     }
     fn push_macro_tokens(&mut self, toks: Vec<Token>, owner: CsId) {
-        self.begin_token_list(toks, false, "<macro>", Some(owner));
+        self.begin_token_list_with_active(toks, false, "<macro>", Some(owner), false);
     }
     #[inline]
     pub(crate) fn ensure_input_stack_room(&mut self, needed: usize) -> bool {
@@ -1001,16 +1003,23 @@ impl Engine {
             let mut rest = self.token_vec_pool.pop().unwrap_or_default();
             rest.extend(self.pushed[cut..].iter().rev());
             self.pushed.truncate(cut);
-            self.input.push_toks_vec(rest, "<pushback>", None, 0);
+            let maybe_active_cs = rest.iter().any(|t| t.is_cs() && self.cs.is_active(t.cs_id()));
+            self.input
+                .push_toks_vec(rest, "<pushback>", None, 0, maybe_active_cs);
         }
         true
     }
 
     pub fn push_tokens_rc(&mut self, toks: std::rc::Rc<[Token]>, owner: CsId) {
-        self.try_push_tokens_rc(toks, owner);
+        self.try_push_tokens_rc(toks, owner, true);
     }
 
-    fn try_push_tokens_rc(&mut self, toks: std::rc::Rc<[Token]>, owner: CsId) -> bool {
+    fn try_push_tokens_rc(
+        &mut self,
+        toks: std::rc::Rc<[Token]>,
+        owner: CsId,
+        maybe_active_cs: bool,
+    ) -> bool {
         if toks.is_empty() {
             return true;
         }
@@ -1019,7 +1028,7 @@ impl Engine {
         }
         let depth = self.trace_depth();
         self.input
-            .push_toks_rc(toks, "<macro>", Some(owner), depth);
+            .push_toks_rc(toks, "<macro>", Some(owner), depth, maybe_active_cs);
         true
     }
 
@@ -1029,6 +1038,7 @@ impl Engine {
         plan: std::rc::Rc<crate::eqtb::MacroReplacement>,
         args: crate::input::MacroArgs,
         owner: CsId,
+        maybe_active_cs: bool,
     ) -> bool {
         if !self.prepare_token_list_push(0) {
             self.recycle_token_vec(args.into_buffer());
@@ -1036,7 +1046,7 @@ impl Engine {
         }
         let depth = self.trace_depth();
         self.input.stack.push(crate::input::Source::MacroFrame(
-            crate::input::MacroFrame::new(plan, args, Some(owner), depth),
+            crate::input::MacroFrame::new(plan, args, Some(owner), depth, maybe_active_cs),
         ));
         true
     }
@@ -1052,6 +1062,17 @@ impl Engine {
         exp_not: bool,
         name: &'static str,
         owner: Option<CsId>,
+    ) -> bool {
+        self.begin_token_list_with_active(toks, exp_not, name, owner, true)
+    }
+
+    fn begin_token_list_with_active(
+        &mut self,
+        toks: Vec<Token>,
+        exp_not: bool,
+        name: &'static str,
+        owner: Option<CsId>,
+        maybe_active_cs: bool,
     ) -> bool {
         if toks.is_empty() {
             self.recycle_token_vec(toks);
@@ -1071,7 +1092,8 @@ impl Engine {
             toks
         };
         let depth = self.trace_depth();
-        self.input.push_toks_vec(toks, name, owner, depth);
+        self.input
+            .push_toks_vec(toks, name, owner, depth, maybe_active_cs);
         true
     }
     /// The runaway-expansion guard fired while expanding `t` (meaning of
@@ -1276,7 +1298,7 @@ impl Engine {
                                     SelfReference,
                                     ControlSequence(Token),
                                     Character(Token),
-                                    List(std::rc::Rc<[Token]>),
+                                    List(std::rc::Rc<[Token]>, bool),
                                 }
                                 let body = match *m.body {
                                     [] => Body::Empty,
@@ -1294,7 +1316,10 @@ impl Engine {
                                     {
                                         Body::Character(only)
                                     }
-                                    _ => Body::List(std::rc::Rc::clone(&m.body)),
+                                    _ => Body::List(
+                                        std::rc::Rc::clone(&m.body),
+                                        m.has_active_cs(&self.cs),
+                                    ),
                                 };
                                 self.enter_macro_diagnostic(id, t.cs_id());
                                 if matches!(body, Body::ControlSequence(_) | Body::Character(_)) {
@@ -1321,8 +1346,8 @@ impl Engine {
                                         self.cur_prim = None;
                                         return only;
                                     }
-                                    Body::List(body) => {
-                                        if !self.try_push_tokens_rc(body, id) {
+                                    Body::List(body, maybe_active_cs) => {
+                                        if !self.try_push_tokens_rc(body, id, maybe_active_cs) {
                                             return EOF_MARKER;
                                         }
                                         break 'expand;
@@ -1666,8 +1691,9 @@ impl Engine {
                             && !self.xetex_macro_trace()
                         {
                             let body = std::rc::Rc::clone(&m.body);
+                            let maybe_active_cs = m.has_active_cs(&self.cs);
                             self.enter_macro_diagnostic(id2, invocation);
-                            self.push_tokens_rc(body, id2);
+                            self.try_push_tokens_rc(body, id2, maybe_active_cs);
                         } else {
                             let m = m.clone();
                             self.expand_macro(id2, &m, invocation);
@@ -2059,9 +2085,18 @@ impl Engine {
         // \\ifx; restore before do_if so \\unless\\ifcsname inverts.
         let unless = std::mem::take(&mut self.unless_next);
         self.csname_depth += 1;
-        let mut name: Vec<u8> = Vec::new();
+        let mut name = self
+            .csname_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        name.clear();
         let mut aborted = false;
         loop {
+            match self.take_csname_run(&mut name) {
+                CsNameRun::Finished => break,
+                CsNameRun::More => continue,
+                CsNameRun::Empty => {}
+            }
             let t = self.get_x_raw();
             if t == EOF_MARKER {
                 self.error("Missing \\endcsname inserted");
@@ -2131,6 +2166,7 @@ impl Engine {
         } else {
             false
         };
+        self.recycle_csname_buf(name);
         self.unless_next = unless;
         self.do_if(def, id, p);
         None
@@ -3159,51 +3195,72 @@ impl Engine {
     /// is complete).
     #[inline(always)]
     pub(crate) fn take_decimal_run(&mut self, value: &mut i64, space_ends: bool) -> bool {
-        // Look at the next token before calling out: after a one-digit
-        // operand (`\numexpr 3*...`) the run is empty.
-        match self.token_list_peek() {
-            Some(t)
-                if t.0.wrapping_sub(Token::other(b'0').0) < 10
-                    || (space_ends && t.0 >> 24 == u32::from(crate::token::CAT_SPACE)) =>
-            {
-                self.take_decimal_run_from_list(value, space_ends)
-            }
-            _ => false,
+        // Peek before calling out: after a one-digit operand (`\numexpr 3*...`)
+        // the run is empty. Only invoke the out-of-line scanner when the next
+        // token is a digit/terminating space or we are at a segment boundary.
+        if !self.pushed.is_empty() {
+            return false;
+        }
+        let Some(cursor) = self.input.stack.last().and_then(crate::input::Source::cursor) else {
+            return false;
+        };
+        if cursor.pos >= cursor.end {
+            return self.take_decimal_run_from_list(value, space_ends);
+        }
+        // SAFETY: `cursor.pos < cursor.end` within the live token buffer.
+        let t = unsafe { *cursor.seg.add(cursor.pos as usize) };
+        if t.0.wrapping_sub(Token::other(b'0').0) < 10
+            || (space_ends && t.0 >> 24 == u32::from(crate::token::CAT_SPACE))
+        {
+            self.take_decimal_run_from_list(value, space_ends)
+        } else {
+            false
         }
     }
 
     #[inline(never)]
     fn take_decimal_run_from_list(&mut self, value: &mut i64, space_ends: bool) -> bool {
-        let Some((segment, trace_depth)) = self.nonempty_token_list_front(false) else {
-            return false;
-        };
+        self.ensure_nonempty_list_front(false);
         let mut v = *value;
-        let mut length = 0;
         let mut last = None;
         let mut space = false;
-        for &t in segment {
-            let digit = t.0.wrapping_sub(Token::other(b'0').0);
-            if digit < 10 {
-                let next = v * 10 + i64::from(digit);
-                if next > 0x7FFF_FFFF {
+        loop {
+            let Some((segment, trace_depth)) = self.token_list_front() else {
+                break;
+            };
+            let mut length = 0;
+            for &t in segment {
+                let digit = t.0.wrapping_sub(Token::other(b'0').0);
+                if digit < 10 {
+                    let next = v * 10 + i64::from(digit);
+                    if next > 0x7FFF_FFFF {
+                        break;
+                    }
+                    v = next;
+                } else if space_ends && t.0 >> 24 == u32::from(crate::token::CAT_SPACE) {
+                    space = true;
+                } else {
                     break;
                 }
-                v = next;
-            } else if space_ends && t.0 >> 24 == u32::from(crate::token::CAT_SPACE) {
-                space = true;
-            } else {
+                length += 1;
+                last = Some(t);
+                if space {
+                    break;
+                }
+            }
+            if length == 0 {
                 break;
             }
-            length += 1;
-            last = Some(t);
-            if space {
+            let exhausted = length == segment.len();
+            self.consume_token_list_front(length, trace_depth);
+            if space || !exhausted {
                 break;
             }
+            self.ensure_nonempty_list_front(false);
         }
         let Some(last) = last else {
             return false;
         };
-        self.consume_token_list_front(length, trace_depth);
         self.unexpanded_parameter = false;
         self.set_cur_char(last);
         *value = v;
@@ -3445,7 +3502,11 @@ impl Engine {
             let show_args = self.trace_macro_call(invocation, m);
             if m.num_params == 0 && m.prefix.is_empty() {
                 self.enter_macro_diagnostic(id, invocation);
-                self.push_tokens_rc(std::rc::Rc::clone(&m.body), id);
+                self.try_push_tokens_rc(
+                    std::rc::Rc::clone(&m.body),
+                    id,
+                    m.has_active_cs(&self.cs),
+                );
                 return;
             }
             self.enter_macro_diagnostic(id, invocation);
@@ -3457,7 +3518,11 @@ impl Engine {
         // macros need no argument buffers or substituted replacement list.
         if m.num_params == 0 && m.prefix.is_empty() {
             self.current_macro = id;
-            self.push_tokens_rc(std::rc::Rc::clone(&m.body), id);
+            self.try_push_tokens_rc(
+                std::rc::Rc::clone(&m.body),
+                id,
+                m.has_active_cs(&self.cs),
+            );
             return;
         }
 
@@ -3560,7 +3625,11 @@ impl Engine {
                 }
             }
             if !m.body.is_empty() {
-                self.push_tokens_rc(std::rc::Rc::clone(&m.body), id);
+                self.try_push_tokens_rc(
+                    std::rc::Rc::clone(&m.body),
+                    id,
+                    m.has_active_cs(&self.cs),
+                );
             }
             return;
         }
@@ -3666,7 +3735,11 @@ impl Engine {
         }
         let Some(plan) = plan else {
             self.recycle_token_vec(args.into_buffer());
-            self.push_tokens_rc(std::rc::Rc::clone(&m.body), id);
+            self.try_push_tokens_rc(
+                std::rc::Rc::clone(&m.body),
+                id,
+                m.has_active_cs(&self.cs),
+            );
             return;
         };
         let Some(length) =
@@ -3680,7 +3753,7 @@ impl Engine {
             self.recycle_token_vec(args.into_buffer());
             return;
         }
-        self.try_push_macro_frame_parts(plan, args, id);
+        self.try_push_macro_frame_parts(plan, args, id, m.has_active_cs(&self.cs));
     }
 
     /// tex.web §393 for an undelimited argument that begins in the current
@@ -3706,7 +3779,7 @@ impl Engine {
         self.ensure_nonempty_list_front(true);
         let align_live = self.align_state != crate::align::PH_IDLE && self.align_delimiter_live();
         let partoken = self.partoken_id();
-        let Some((segment, _)) = self.token_list_front() else {
+        let Some((segment, _, maybe_active_cs)) = self.token_list_front_with_active() else {
             return UndelimitedArg::Slow;
         };
         let mut length = 0;
@@ -3720,25 +3793,34 @@ impl Engine {
             return UndelimitedArg::Slow;
         };
         length += 1;
-        let outer = self.eqtb.has_outer_macros();
+        let outer = self.check_outer_enabled();
         let taken = if t.0 >> 24 == 1 {
-            // A group that closes inside the segment leaves
-            // align_brace_depth as it was.
-            let group = &segment[length..];
-            let (size, after) = balanced_prefix(group, long, partoken, 1);
-            let content = &group[..size.saturating_sub(1)];
-            if after != 0
-                || content.len() > crate::input::MAX_TOKEN_LIST_TOKENS
-                || (outer && content.iter().any(|&t| self.is_outer_token(t)))
-            {
+            // Inside an alignment with negative align_brace_depth (e.g. a `}`
+            // closed an implicit `\bgroup`), this `{` can raise depth back to
+            // zero and expose a live `&`/`\cr` inside the group.
+            if self.align_state != crate::align::PH_IDLE && self.align_brace_depth < 0 {
                 self.align_brace_depth = self.align_brace_depth.saturating_add(1);
                 UndelimitedArg::Group
             } else {
-                if collect {
-                    out.extend_from_slice(content);
+                // A group that closes inside the segment leaves
+                // align_brace_depth as it was.
+                let group = &segment[length..];
+                let (size, after) = balanced_prefix(group, long, partoken, 1);
+                let content = &group[..size.saturating_sub(1)];
+                if after != 0
+                    || content.len() > crate::input::MAX_TOKEN_LIST_TOKENS
+                    || ((maybe_active_cs || outer)
+                        && self.find_slow_balanced_token(content, outer).is_some())
+                {
+                    self.align_brace_depth = self.align_brace_depth.saturating_add(1);
+                    UndelimitedArg::Group
+                } else {
+                    if collect {
+                        out.extend_from_slice(content);
+                    }
+                    length += size;
+                    UndelimitedArg::Taken
                 }
-                length += size;
-                UndelimitedArg::Taken
             }
         } else {
             // A token that raw_token returns, unfreeze_input_token keeps and
@@ -4089,11 +4171,12 @@ impl Engine {
         loop {
             if let Some((segment, trace_depth)) = self.nonempty_token_list_front(false) {
                 let spaces = segment.iter().take_while(|t| t.0 >> 24 == 10).count();
-                let rest = segment.len() - spaces;
+                let next_stops =
+                    spaces < segment.len() && !matches!(segment[spaces].0 >> 24, 9 | 14 | 15);
                 if spaces > 0 {
                     self.consume_token_list_front(spaces, trace_depth);
                 }
-                if rest > 0 {
+                if next_stops {
                     return;
                 }
             }
@@ -4236,6 +4319,33 @@ impl Engine {
         }
     }
 
+    #[inline(always)]
+    fn check_outer_enabled(&self) -> bool {
+        self.eqtb.has_outer_macros()
+            && self.eqtb.int_params[crate::prim::IntParam::SuppressOuterError.idx() as usize] == 0
+    }
+
+    /// First token in a `balanced_prefix` slice that requires the
+    /// token-by-token loop: an active-character CS (needs `unfreeze_input_token`)
+    /// or, when `check_outer` is true, an `\outer` macro or active character.
+    #[inline(always)]
+    fn find_slow_balanced_token(&self, tokens: &[Token], check_outer: bool) -> Option<usize> {
+        for (i, &t) in tokens.iter().enumerate() {
+            if t.is_cs() {
+                let id = t.cs_id();
+                if self.cs.is_active(id) || (check_outer && self.eqtb.is_outer_cs(id)) {
+                    return Some(i);
+                }
+            } else if check_outer
+                && t.0 >> 24 == u32::from(CAT_ACTIVE)
+                && self.is_outer_active(t.chr())
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Move the run of plain tokens at the front of the current token list
     /// into balanced text at brace depth `depth` in one step, as the
     /// token-by-token loop of `scan_balanced_raw_collect` would. Returns
@@ -4256,15 +4366,13 @@ impl Engine {
             return None;
         }
         let partoken = self.partoken_id();
-        let (segment, trace_depth) = self.token_list_front()?;
+        let check_outer = self.check_outer_enabled();
+        let (segment, trace_depth, maybe_active_cs) = self.token_list_front_with_active()?;
         let (mut length, mut after) = balanced_prefix(segment, long, partoken, *depth);
-        // An \outer token needs the token-by-token path.
-        if self.eqtb.has_outer_macros() {
-            if let Some(outer) = segment[..length]
-                .iter()
-                .position(|&t| self.is_outer_token(t))
-            {
-                (length, after) = balanced_prefix(&segment[..outer], long, partoken, *depth);
+        // Active-CS tokens and \outer macros need the token-by-token path.
+        if maybe_active_cs || check_outer {
+            if let Some(slow_pos) = self.find_slow_balanced_token(&segment[..length], check_outer) {
+                (length, after) = balanced_prefix(&segment[..slow_pos], long, partoken, *depth);
             }
         }
         let mut content = length - usize::from(after == 0);
@@ -4320,10 +4428,8 @@ impl Engine {
             if !plain_balanced_token(t, true, t)
                 || t.0 >> 24 == 6
                 || (expanded && (t.is_cs() || t.0 >> 24 == 13))
-                || (t.is_cs()
-                    && (self.cs.is_active(t.cs_id())
-                        || self.is_macro_param(t)
-                        || (outer && self.is_outer_macro_token(t))))
+                || (t.is_cs() && (self.cs.is_active(t.cs_id()) || self.is_macro_param(t)))
+                || (outer && self.is_outer_macro_token(t))
             {
                 break;
             }
@@ -4444,6 +4550,12 @@ impl Engine {
     /// token is pushed back and the input comes from a list.
     #[inline(always)]
     fn token_list_front(&self) -> Option<(&[Token], u8)> {
+        let (rest, trace_depth, _) = self.token_list_front_with_active()?;
+        Some((rest, trace_depth))
+    }
+
+    #[inline(always)]
+    fn token_list_front_with_active(&self) -> Option<(&[Token], u8, bool)> {
         if !self.pushed.is_empty() {
             return None;
         }
@@ -4459,7 +4571,7 @@ impl Engine {
         } else {
             &[]
         };
-        Some((rest, cursor.trace_depth))
+        Some((rest, cursor.trace_depth, cursor.maybe_active_cs))
     }
 
     /// Step past any exhausted segment or token list on top of `input.stack`.
@@ -4660,10 +4772,12 @@ impl Engine {
         }
         self.ensure_nonempty_list_front(true);
         let align_live = self.align_state != crate::align::PH_IDLE && self.align_delimiter_live();
+        let align_negative =
+            self.align_state != crate::align::PH_IDLE && self.align_brace_depth < 0;
         let partoken_id = self.partoken_id();
         let partoken = Token::from_cs(partoken_id);
-        let outer = self.eqtb.has_outer_macros();
-        let Some((segment, trace_depth)) = self.token_list_front() else {
+        let outer = self.check_outer_enabled();
+        let Some((segment, _, maybe_active_cs)) = self.token_list_front_with_active() else {
             return DelimitedRun::None;
         };
         let first = delim[0];
@@ -4677,10 +4791,6 @@ impl Engine {
         let mut length = 0;
         let mut copied = 0;
         let mut stored = 0;
-        // Whether a token outside a group was taken: the token loop takes
-        // those runs with consume_token_list_front, which returns the macro
-        // trace to this list; group and delimiter tokens keep it.
-        let mut unwinds = false;
         loop {
             let run = length;
             let limit = segment.len().min(length + (room - stored));
@@ -4716,20 +4826,19 @@ impl Engine {
                 } else {
                     break;
                 }
-                if align_live && crate::align::row_delimiter(t, &self.eqtb).is_some() {
+                if align_live && crate::align::is_row_delimiter(t, &self.eqtb) {
                     break;
                 }
                 length += 1;
             }
             stored += length - run;
-            unwinds |= length > run;
             // A group: the token loop stores its brace, its tokens
             // (`take_balanced_run`) and a `}` of its own; the braces leave
             // align_brace_depth as it was.
             let Some(&brace) = segment.get(length) else {
                 break;
             };
-            if brace.0 >> 24 != 1 || self.delim_eq(brace, first) {
+            if brace.0 >> 24 != 1 || align_negative || self.delim_eq(brace, first) {
                 break;
             }
             let group = &segment[length + 1..];
@@ -4737,7 +4846,8 @@ impl Engine {
             let content = &group[..size.saturating_sub(1)];
             if after != 0
                 || stored + size + 1 > room
-                || (outer && content.iter().any(|&t| self.is_outer_token(t)))
+                || ((maybe_active_cs || outer)
+                    && self.find_slow_balanced_token(content, outer).is_some())
             {
                 break;
             }
@@ -4770,11 +4880,8 @@ impl Engine {
         } else {
             length
         };
-        if unwinds {
-            self.consume_token_list_front(taken, trace_depth);
-        } else {
-            self.consume_token_list_front_held(taken);
-        }
+        // Fetched with align_macro_arg set, which keeps the macro trace.
+        self.consume_token_list_front_held(taken);
         if delimited {
             DelimitedRun::Delimited
         } else {
@@ -4844,7 +4951,7 @@ impl Engine {
             toks.push(string_token(e));
         }
         toks.extend(self.cs.name(id).iter().map(|&b| string_token(b)));
-        self.push_tokens_named(toks, "<inserted>");
+        self.begin_token_list_with_active(toks, false, "<inserted>", None, false);
         true
     }
 
@@ -4888,7 +4995,7 @@ impl Engine {
                 Token::other(b)
             }
         }));
-        self.push_tokens_named(toks, "<inserted>");
+        self.begin_token_list_with_active(toks, false, "<inserted>", None, false);
     }
 
     /// xetex.web / luatex `str_toks`: UTF-8 text becomes one token per scalar

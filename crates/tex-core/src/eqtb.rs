@@ -207,23 +207,32 @@ pub struct Macro {
 /// Single-threaded cached [`MacroReplacement`] without `RefCell` borrow
 /// bookkeeping: callers only ever clone out or replace the `Rc`.
 #[derive(Default)]
-pub struct CachedReplacement(std::cell::UnsafeCell<Option<Rc<MacroReplacement>>>);
+pub struct CachedReplacement {
+    plan: std::cell::UnsafeCell<Option<Rc<MacroReplacement>>>,
+    /// Cached scan of `Macro::body` for active-character CS tokens
+    /// (`0` = unchecked, `1` = none, `2` = contains at least one).
+    active_cs: std::cell::Cell<u8>,
+}
 
 impl Clone for CachedReplacement {
     #[inline]
     fn clone(&self) -> Self {
         // SAFETY: `Macro` lives on one single-threaded `Engine`; no reference
-        // into `self.0` ever escapes `CachedReplacement`'s methods.
-        let inner = unsafe { (*self.0.get()).clone() };
-        CachedReplacement(std::cell::UnsafeCell::new(inner))
+        // into `self.plan` ever escapes `CachedReplacement`'s methods.
+        let inner = unsafe { (*self.plan.get()).clone() };
+        CachedReplacement {
+            plan: std::cell::UnsafeCell::new(inner),
+            active_cs: std::cell::Cell::new(self.active_cs.get()),
+        }
     }
 }
 
 impl std::fmt::Debug for CachedReplacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: single-threaded, non-reentrant debug formatting.
-        let inner = unsafe { &*self.0.get() };
-        f.debug_tuple("CachedReplacement").field(inner).finish()
+        // SAFETY: single-threaded; clone out before calling into `Formatter`
+        // so no shared reference into the `UnsafeCell` crosses user `fmt::Write`.
+        let inner = unsafe { (*self.plan.get()).clone() };
+        f.debug_tuple("CachedReplacement").field(&inner).finish()
     }
 }
 
@@ -240,6 +249,29 @@ pub struct MacroReplacement {
     pub(crate) used_mask: u16,
 }
 impl Macro {
+    /// True when `self.body` contains a control-sequence token naming an active
+    /// character (which balanced-group fast paths must unfreeze). Cached on
+    /// first check so repeat expansions pay one byte load.
+    #[inline(always)]
+    pub(crate) fn has_active_cs(&self, cs: &crate::token::CsTable) -> bool {
+        let cached = self.replacement.active_cs.get();
+        if cached != 0 {
+            return cached == 2;
+        }
+        self.compute_has_active_cs(cs)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn compute_has_active_cs(&self, cs: &crate::token::CsTable) -> bool {
+        let found = self
+            .body
+            .iter()
+            .any(|t| t.is_cs() && cs.is_active(t.cs_id()));
+        self.replacement.active_cs.set(if found { 2 } else { 1 });
+        found
+    }
+
     /// Return the cached [`MacroReplacement`] for `self.body`, building it on
     /// first use or after an in-place `body` replacement.
     #[inline]
@@ -247,7 +279,7 @@ impl Macro {
         // SAFETY: single-threaded `Engine`; the slot reference does not live
         // across `build_replacement_plan`.
         unsafe {
-            if let Some(plan) = (*self.replacement.0.get()).as_ref() {
+            if let Some(plan) = (*self.replacement.plan.get()).as_ref() {
                 if Rc::ptr_eq(&plan.body, &self.body) {
                     return Rc::clone(plan);
                 }
@@ -255,7 +287,7 @@ impl Macro {
         }
         let built = Rc::new(self.build_replacement_plan());
         unsafe {
-            *self.replacement.0.get() = Some(Rc::clone(&built));
+            *self.replacement.plan.get() = Some(Rc::clone(&built));
         }
         built
     }
@@ -3098,6 +3130,7 @@ mod tests {
                 args.clone(),
                 None,
                 0,
+                false,
             );
             std::iter::from_fn(|| frame.next_token()).collect()
         }

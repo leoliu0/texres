@@ -556,10 +556,10 @@ impl Trie {
     /// the `j`-th of the characters `hc`, which are scalars or UTF-16 code
     /// units and never 0.
     pub(crate) fn xe_gap_values(&self, hc: &[u32], hyf: &mut [u8]) {
-        let mut text_stack = [0u8; 260];
-        let mut gap_stack = [0usize; 66];
-        let mut vals_stack = [0u8; 264];
         if hc.len() <= 64 {
+            let mut text_stack = [0u8; 260];
+            let mut gap_stack = [0usize; 66];
+            let mut vals_stack = [0u8; 264];
             let mut tlen = 1usize;
             for (idx, &c) in hc.iter().enumerate() {
                 gap_stack[idx] = tlen;
