@@ -244,6 +244,17 @@ impl GcHeader {
         self.set_marked_bits(m);
     }
 
+    /// Reset color to `current_white` and age to `G_NEW` in a single read-modify-write.
+    #[inline(always)]
+    pub fn reset_to_new_white(&self, current_white: u8) {
+        debug_assert!(
+            current_white == 0 || current_white == 1,
+            "current_white must be 0 or 1"
+        );
+        let m = (self.marked() & !(MASKCOLORS | AGEBITS)) | (1 << (WHITE0BIT + current_white));
+        self.set_marked_bits(m);
+    }
+
     #[inline(always)]
     pub fn make_gray(&self) {
         self.set_marked_bits(self.marked() & !MASKCOLORS);
@@ -447,6 +458,11 @@ impl<T: HasGcHeader> GcPtr<T> {
     #[inline(always)]
     pub fn as_ref(&self) -> &T {
         unsafe { &*self.ptr }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_raw_ptr(self) -> *const T {
+        self.ptr
     }
 
     pub fn is_null(&self) -> bool {
@@ -926,24 +942,23 @@ impl GcList {
         self.gc_list.push(value);
     }
 
+    /// Free an object using its known list index.
+    /// O(1) via swap_remove: moves last object to removed position, updates its index.
+    #[inline]
+    pub fn remove_at(&mut self, index: usize) -> GcObjectOwner {
+        let last_index = self.gc_list.len() - 1;
+        if index != last_index {
+            self.gc_list[last_index].header_mut().set_index(index);
+        }
+        self.gc_list.swap_remove(index)
+    }
+
     /// Free an object using its pointer
     /// O(1) via swap_remove: moves last object to removed position, updates its index
     #[inline]
     pub fn remove(&mut self, gc_ptr: GcObjectPtr) -> GcObjectOwner {
         let index = gc_ptr.index();
-        let last_index = self.gc_list.len() - 1;
-        if index != last_index {
-            // Update moved object's index
-            let moved_obj = &self.gc_list[last_index];
-            moved_obj
-                .as_gc_ptr()
-                .header_mut()
-                .expect("moved object must have a valid GC header")
-                .set_index(index);
-        }
-
-        // swap_remove: O(1) removal by moving last element to this position
-        self.gc_list.swap_remove(index)
+        self.remove_at(index)
     }
 
     /// Current number of live objects (always equals Vec length, no holes!)

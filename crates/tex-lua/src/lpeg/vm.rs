@@ -31,10 +31,162 @@ pub struct MatchArgs<'a> {
     pub max_stack: usize,
 }
 
+use std::mem::MaybeUninit;
+
+const INLINE_FRAMES: usize = 32;
+const INLINE_CAPS: usize = 16;
+
+struct FrameStack {
+    inline: [MaybeUninit<Frame>; INLINE_FRAMES],
+    len: usize,
+    heap: Vec<Frame>,
+}
+
+impl FrameStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: [const { MaybeUninit::uninit() }; INLINE_FRAMES],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        if self.heap.is_empty() { self.len } else { self.heap.len() }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, frame: Frame) {
+        if self.heap.is_empty() {
+            if self.len < INLINE_FRAMES {
+                self.inline[self.len].write(frame);
+                self.len += 1;
+                return;
+            }
+            let mut heap = Vec::with_capacity(INLINE_FRAMES * 2);
+            // SAFETY: `self.inline[..self.len]` are initialized `Copy` `Frame`s.
+            let slice = unsafe {
+                std::slice::from_raw_parts(self.inline.as_ptr().cast::<Frame>(), self.len)
+            };
+            heap.extend_from_slice(slice);
+            heap.push(frame);
+            self.heap = heap;
+        } else {
+            self.heap.push(frame);
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<Frame> {
+        if self.heap.is_empty() {
+            if self.len == 0 {
+                None
+            } else {
+                self.len -= 1;
+                // SAFETY: `self.inline[self.len]` was initialized when pushed.
+                Some(unsafe { self.inline[self.len].assume_init() })
+            }
+        } else {
+            self.heap.pop()
+        }
+    }
+
+    #[inline(always)]
+    fn last_mut(&mut self) -> Option<&mut Frame> {
+        if self.heap.is_empty() {
+            if self.len == 0 {
+                None
+            } else {
+                // SAFETY: `self.inline[self.len - 1]` was initialized when pushed.
+                Some(unsafe { self.inline[self.len - 1].assume_init_mut() })
+            }
+        } else {
+            self.heap.last_mut()
+        }
+    }
+}
+
+pub struct SmallCaps {
+    inline: [MaybeUninit<Cap>; INLINE_CAPS],
+    len: usize,
+    heap: Vec<Cap>,
+}
+
+impl SmallCaps {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: [const { MaybeUninit::uninit() }; INLINE_CAPS],
+            len: 0,
+            heap: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Cap] {
+        if self.heap.is_empty() {
+            // SAFETY: `self.inline[..self.len]` are initialized `Copy` `Cap`s.
+            unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast::<Cap>(), self.len) }
+        } else {
+            &self.heap
+        }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [Cap] {
+        if self.heap.is_empty() {
+            // SAFETY: `self.inline[..self.len]` are initialized `Copy` `Cap`s.
+            unsafe {
+                std::slice::from_raw_parts_mut(self.inline.as_mut_ptr().cast::<Cap>(), self.len)
+            }
+        } else {
+            &mut self.heap
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        if self.heap.is_empty() { self.len } else { self.heap.len() }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, cap: Cap) {
+        if self.heap.is_empty() {
+            if self.len < INLINE_CAPS {
+                self.inline[self.len].write(cap);
+                self.len += 1;
+                return;
+            }
+            let mut heap = Vec::with_capacity(INLINE_CAPS * 2);
+            let slice = unsafe {
+                std::slice::from_raw_parts(self.inline.as_ptr().cast::<Cap>(), self.len)
+            };
+            heap.extend_from_slice(slice);
+            heap.push(cap);
+            self.heap = heap;
+        } else {
+            self.heap.push(cap);
+        }
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, new_len: usize) {
+        if self.heap.is_empty() {
+            if new_len < self.len {
+                self.len = new_len;
+            }
+        } else {
+            self.heap.truncate(new_len);
+        }
+    }
+}
+
 pub struct Matched {
     /// End of the match (0-based, exclusive).
     pub end: usize,
-    pub caps: Vec<Cap>,
+    pub caps: SmallCaps,
     pub dynvals: Vec<V>,
 }
 
@@ -43,8 +195,8 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
     let subject = m.subject;
     let e = subject.len();
     let mut limit = MAXBACK;
-    let mut stack: Vec<Frame> = Vec::with_capacity(MAXBACK);
-    let mut caps: Vec<Cap> = Vec::with_capacity(32);
+    let mut stack = FrameStack::new();
+    let mut caps = SmallCaps::new();
     let mut dynvals: Vec<V> = Vec::new();
     let mut s = init;
     let mut p = 0usize;
@@ -177,11 +329,11 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
                 ICLOSERUNTIME => {
                     let close = caps.len();
                     caps.push(Cap { s, idx: 0, kind: CCLOSE, siz: 1 });
-                    let open = findopen(&caps, close);
-                    let id = finddyncap(&caps, open, close);
+                    let open = findopen(caps.as_slice(), close);
+                    let id = finddyncap(caps.as_slice(), open, close);
                     let (func, nested) = {
                         let mut cs = CapState {
-                            caps: &caps,
+                            caps: caps.as_slice(),
                             cap: open,
                             subject,
                             ktable: m.ktable,
@@ -190,7 +342,7 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
                             env,
                             stack: Vec::new(),
                         };
-                        let func = match caps[open].idx {
+                        let func = match caps.as_slice()[open].idx {
                             0 => V::Nil,
                             idx => m.ktable[idx as usize - 1].clone(),
                         };
@@ -205,7 +357,7 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
                     if id > 0 {
                         dynvals.truncate(id - 1);
                     }
-                    let open_s = caps[open].s;
+                    let open_s = caps.as_slice()[open].s;
                     caps.truncate(open);
                     // resdyncaptures
                     let res = match results.first() {
@@ -246,8 +398,9 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
                     let s1 = s;
                     let last = caps.len() - 1;
                     // if possible, turn the capture into a full capture
-                    if caps[last].siz == 0 && s1 - caps[last].s < u8::MAX as usize {
-                        caps[last].siz = (s1 - caps[last].s + 1) as u8;
+                    let last_cap = &mut caps.as_mut_slice()[last];
+                    if last_cap.siz == 0 && s1 - last_cap.s < u8::MAX as usize {
+                        last_cap.siz = (s1 - last_cap.s + 1) as u8;
                         p += 1;
                         continue 'main;
                     }
@@ -285,7 +438,7 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
             return Ok(None);
         }
         if !dynvals.is_empty() {
-            let id = finddyncap(&caps, f.caplevel, caps.len());
+            let id = finddyncap(caps.as_slice(), f.caplevel, caps.len());
             if id > 0 {
                 dynvals.truncate(id - 1);
             }

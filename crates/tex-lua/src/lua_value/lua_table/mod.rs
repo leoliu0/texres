@@ -3,7 +3,7 @@ pub mod native_table;
 
 use super::lua_value::LuaValue;
 use crate::{LuaError, LuaResult, gc::TablePtr};
-use native_table::NativeTable;
+pub(crate) use native_table::NativeTable;
 
 /// Mask covering all TM flags — any bit set to 1 represents a cacheable TM.
 /// With u32, we cover all 26 TmKind values (bits 0-25).
@@ -81,6 +81,11 @@ impl LuaRawTable {
 
     pub fn len(&self) -> usize {
         self.impl_table.len()
+    }
+
+    #[inline(always)]
+    pub(crate) fn array_size(&self) -> usize {
+        self.impl_table.array_size()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -167,6 +172,14 @@ impl LuaRawTable {
         F: FnMut(LuaValue, LuaValue),
     {
         self.impl_table.for_each_entry(f);
+    }
+
+    #[inline]
+    pub(crate) fn for_each_gc_child<F>(&self, f: F)
+    where
+        F: FnMut(*const u8, u8),
+    {
+        self.impl_table.for_each_gc_child(f);
     }
 
     pub(crate) fn for_each_entry_in_direction<F>(&self, reverse_hash: bool, f: F)

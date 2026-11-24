@@ -176,6 +176,12 @@ impl RefInner {
         self.liveness.handle().ok_or(LuaError::StateClosed)
     }
 
+    /// Get a shared reference to the VM.
+    #[inline]
+    fn global_state(&self) -> LuaResult<&GlobalState> {
+        Ok(self.handle()?.as_ref())
+    }
+
     /// Get a mutable reference to the VM.
     #[allow(clippy::mut_from_ref)]
     #[inline]
@@ -682,6 +688,21 @@ impl LuaTableRef {
     }
 
     // ==================== Conversion ====================
+
+    /// Borrow the underlying raw table and string interner immutably without
+    /// allocating registry handles or mutating VM/GC state.
+    #[inline]
+    pub(crate) fn with_raw<R>(
+        &self,
+        f: impl FnOnce(&crate::lua_value::NativeTable, &crate::gc::StringInterner) -> R,
+    ) -> LuaResult<R> {
+        let vm = self.inner.global_state()?;
+        let table = self.inner.to_value();
+        let Some(tbl) = table.as_table() else {
+            return Err(LuaError::RuntimeError);
+        };
+        Ok(f(&tbl.impl_table, vm.object_allocator.strings()))
+    }
 
     /// Get the underlying LuaValue (retrieved from registry).
     pub fn to_value(&self) -> LuaValue {

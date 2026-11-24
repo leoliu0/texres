@@ -5,8 +5,8 @@ use crate::gc::{GcString, StringPtr};
 use crate::lua_value::{
     LuaValue,
     lua_value::{
-        LUA_TNIL, LUA_VEMPTY, LUA_VNIL, LUA_VNUMINT, LUA_VSHRSTR, Value, float_exact_integer,
-        novariant,
+        BIT_ISCOLLECTABLE, LUA_TNIL, LUA_VEMPTY, LUA_VNIL, LUA_VNUMINT, LUA_VSHRSTR, Value,
+        float_exact_integer, novariant,
     },
     short_string_ptr_eq,
 };
@@ -1958,9 +1958,53 @@ impl NativeTable {
         }
 
         // Key must be in hash part - search for it (Lua 5.5's getgeneric with deadok=1)
-        let size = self.sizenode();
-        if size == 0 {
+        if self.node.is_null() {
             return None; // No hash part, key not found
+        }
+
+        // Fast paths for the two dominant hash key types (short strings and integers)
+        if key.tt == LUA_VSHRSTR {
+            let key_ptr = key.string_ptr_raw();
+            let mut node = self.mainposition_string(key);
+            unsafe {
+                loop {
+                    if (*node).key_tt == LUA_VSHRSTR {
+                        let matched = if (*node).val_tt != LUA_VNIL {
+                            short_string_ptr_eq((*node).key_string_ptr(), key_ptr)
+                        } else {
+                            (*node).key_data.i == key.value.i
+                        };
+                        if matched {
+                            let hash_idx = (node as usize - self.node as usize)
+                                / std::mem::size_of::<Node>();
+                            return Some((hash_idx as u32 + 1) + self.asize);
+                        }
+                    }
+                    let next_offset = (*node).next;
+                    if next_offset == 0 {
+                        return None;
+                    }
+                    node = node.offset(next_offset as isize);
+                }
+            }
+        } else if key.tt == LUA_VNUMINT {
+            let k = key.ivalue();
+            let mask = (1usize << self.lsizenode) - 1;
+            let mut node = unsafe { self.node.add((k as u64 as usize) & mask) };
+            unsafe {
+                loop {
+                    if (*node).key_tt == LUA_VNUMINT && (*node).key_data.i == k {
+                        let hash_idx =
+                            (node as usize - self.node as usize) / std::mem::size_of::<Node>();
+                        return Some((hash_idx as u32 + 1) + self.asize);
+                    }
+                    let next_offset = (*node).next;
+                    if next_offset == 0 {
+                        return None;
+                    }
+                    node = node.offset(next_offset as isize);
+                }
+            }
         }
 
         let main_pos = self.mainposition(key);
@@ -2049,6 +2093,167 @@ impl NativeTable {
         }
 
         Ok(None) // No more elements
+    }
+
+    /// Allocated array slot count (O(1), unlike `len()`).
+    #[inline(always)]
+    pub(crate) fn array_size(&self) -> usize {
+        self.asize as usize
+    }
+
+    /// Fast GC marking pass: invokes `f(gc_ptr, tt)` only for live collectable
+    /// array values and hash keys/values, skipping non-collectable slots without
+    /// constructing `LuaValue`s or integer keys.
+    #[inline]
+    pub(crate) fn for_each_gc_child<F>(&self, mut f: F)
+    where
+        F: FnMut(*const u8, u8),
+    {
+        // Array part: tags are contiguous at array + 4; only collectable tags
+        // have BIT_ISCOLLECTABLE (0x40) set (empty/nil/int/float/bool do not).
+        let asize = self.asize as usize;
+        if asize > 0 && !self.array.is_null() {
+            unsafe {
+                let tags_ptr = self.array.add(std::mem::size_of::<u32>());
+                let vals_base = self.array as *const Value;
+                let mut k = 0usize;
+                #[cfg(target_endian = "little")]
+                {
+                    while k + 8 <= asize {
+                        let word = ptr::read_unaligned(tags_ptr.add(k) as *const u64);
+                        let mut bits = word & 0x4040_4040_4040_4040u64;
+                        while bits != 0 {
+                            let idx = k + ((bits.trailing_zeros() >> 3) as usize);
+                            let tt = *tags_ptr.add(idx);
+                            let p = (*vals_base.sub(1 + idx)).ptr;
+                            f(p, tt);
+                            bits &= bits - 1;
+                        }
+                        k += 8;
+                    }
+                }
+                while k < asize {
+                    let tt = *tags_ptr.add(k);
+                    if (tt & BIT_ISCOLLECTABLE) != 0 {
+                        let p = (*vals_base.sub(1 + k)).ptr;
+                        f(p, tt);
+                    }
+                    k += 1;
+                }
+            }
+        }
+
+        // Hash part: walk raw Node array directly.
+        if !self.node.is_null() {
+            let size = 1usize << self.lsizenode;
+            unsafe {
+                let mut node = self.node as *const Node;
+                let end = node.add(size);
+                while node < end {
+                    let val_tt = (*node).val_tt;
+                    let key_tt = (*node).key_tt;
+                    if val_tt != LUA_VNIL && novariant(key_tt) != LUA_TNIL {
+                        if (key_tt & BIT_ISCOLLECTABLE) != 0 {
+                            f((*node).key_data.ptr, key_tt);
+                        }
+                        if (val_tt & BIT_ISCOLLECTABLE) != 0 {
+                            f((*node).val_data.ptr, val_tt);
+                        }
+                    }
+                    node = node.add(1);
+                }
+            }
+        }
+    }
+
+    /// Fast short-string lookup returning `Option<LuaValue>` without allocating.
+    #[inline]
+    pub(crate) fn get_shortstr(&self, key: &LuaValue) -> Option<LuaValue> {
+        if self.node.is_null() {
+            return None;
+        }
+        let mut out = LuaValue::nil();
+        if self.get_shortstr_into(key, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Fallback read-only lookup by string bytes (for long strings or shared short strings).
+    pub(crate) fn get_str_bytes_fallback(&self, bytes: &[u8]) -> Option<LuaValue> {
+        if self.node.is_null() {
+            return None;
+        }
+        let size = 1usize << self.lsizenode;
+        unsafe {
+            for i in 0..size {
+                let node = self.node.add(i);
+                let ktt = (*node).key_tt;
+                if (*node).val_tt != LUA_VNIL
+                    && (ktt == LUA_VSHRSTR || ktt == crate::lua_value::lua_value::LUA_VLNGSTR)
+                {
+                    let kptr = (*node).key_string_ptr();
+                    let s = kptr.as_ref().data.as_bytes();
+                    if s == bytes {
+                        return Some((*node).value());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether the table has zero live entries without allocating.
+    pub(crate) fn is_empty_entries(&self) -> bool {
+        let asize = self.asize as usize;
+        if asize > 0 && !self.array.is_null() {
+            unsafe {
+                let tags = self.array.add(std::mem::size_of::<u32>());
+                for k in 0..asize {
+                    let tt = *tags.add(k);
+                    if tt != LUA_VNIL && tt != LUA_VEMPTY {
+                        return false;
+                    }
+                }
+            }
+        }
+        if !self.node.is_null() {
+            let size = 1usize << self.lsizenode;
+            unsafe {
+                for i in 0..size {
+                    let node = self.node.add(i);
+                    if novariant((*node).key_tt) != LUA_TNIL && (*node).val_tt != LUA_VNIL {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Fallible iteration over all live entries without allocating a `Vec`.
+    pub(crate) fn try_for_each_entry<E>(
+        &self,
+        mut f: impl FnMut(LuaValue, LuaValue) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for i in 1..=self.asize as i64 {
+            if let Some(val) = unsafe { self.read_array(i) } {
+                f(LuaValue::integer(i), val)?;
+            }
+        }
+        if !self.node.is_null() {
+            let size = 1usize << self.lsizenode;
+            for i in 0..size {
+                unsafe {
+                    let node = self.node.add(i);
+                    if novariant((*node).key_tt) != LUA_TNIL && (*node).val_tt != LUA_VNIL {
+                        f((*node).key(), (*node).value())?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// GC-safe iteration: call f for each entry

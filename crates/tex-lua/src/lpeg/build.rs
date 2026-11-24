@@ -1,7 +1,7 @@
 //! Pattern construction (lptree.c): patterns are trees plus the table of Lua
 //! values (the "ktable") their captures and rules refer to by index.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::tree::*;
@@ -12,6 +12,7 @@ pub struct Pat {
     pub tree: Vec<TTree>,
     pub ktable: Option<KTable>,
     pub code: RefCell<Option<Rc<Vec<u32>>>>,
+    pub has_runtime: Cell<bool>,
 }
 
 /// A failed construction: `Arg(n, msg)` is `luaL_argerror`, `Error(msg)` is
@@ -37,7 +38,7 @@ const USHRT_MAX: usize = 65535;
 
 impl Pat {
     pub fn new(tree: Vec<TTree>, ktable: Option<KTable>) -> Pat {
-        Pat { tree, ktable, code: RefCell::new(None) }
+        Pat { tree, ktable, code: RefCell::new(None), has_runtime: Cell::new(false) }
     }
 }
 

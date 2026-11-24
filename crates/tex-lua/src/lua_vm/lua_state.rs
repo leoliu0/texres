@@ -3133,6 +3133,96 @@ impl LuaState {
         Ok(results)
     }
 
+    /// Execute a call whose function and `arg_count` arguments are already
+    /// pushed at `func_idx..func_idx + 1 + arg_count`, passing the resulting
+    /// stack slice `func_idx..result_top` to `collect` before restoring the
+    /// stack. Avoids both input and output `Vec<LuaValue>` allocations and keeps
+    /// newly constructed arguments GC-rooted on the stack before the call.
+    pub(crate) fn call_from_stack<R>(
+        &mut self,
+        func_idx: usize,
+        arg_count: usize,
+        collect: impl FnOnce(&mut LuaState, usize, usize) -> R,
+    ) -> LuaResult<R> {
+        let initial_depth = self.call_depth();
+        self.stack_top = func_idx + 1 + arg_count;
+
+        self.nny += 1;
+        let me: *const LuaState = self;
+        let outer = std::mem::replace(&mut self.global_state_mut().executing, me);
+        let foreign = !outer.is_null() && !std::ptr::eq(outer, me);
+        let result = 'call: {
+            let (actual_arg_count, ccmt_depth) = match resolve_call_chain(self, func_idx, arg_count)
+            {
+                Ok(resolved) => resolved,
+                Err(error) => break 'call Err(error),
+            };
+            let func_val = self.stack[func_idx];
+            if func_val.is_c_callable() {
+                break 'call call_c_function(self, func_idx, actual_arg_count, -1);
+            }
+            let base = func_idx + 1;
+            if let Err(error) = self.push_frame(&func_val, base, actual_arg_count, -1) {
+                break 'call Err(error);
+            }
+            if ccmt_depth > 0 {
+                let frame_idx = self.call_depth - 1;
+                if let Some(frame) = self.call_stack.get_mut(frame_idx) {
+                    frame.call_status = call_status::set_ccmt_count(frame.call_status, ccmt_depth);
+                }
+            }
+            self.inc_n_ccalls().and_then(|()| {
+                let r = lua_execute(self, initial_depth);
+                self.dec_n_ccalls();
+                r
+            })
+        };
+        let result = match result {
+            Err(error) if !matches!(error, LuaError::Yield | LuaError::CloseThread) => {
+                if foreign {
+                    Err(self.unwind_foreign_error(error, initial_depth, func_idx))
+                } else if initial_depth == 0 {
+                    Err(self.unwind_host_error(error, func_idx))
+                } else {
+                    Err(error)
+                }
+            }
+            other => other,
+        };
+        self.global_state_mut().executing = outer;
+        self.nny -= 1;
+        result?;
+
+        let res_end = self.stack_top;
+        let out = collect(self, func_idx, res_end);
+
+        let clear_end = res_end.min(self.stack.len());
+        for i in func_idx..clear_end {
+            self.stack[i] = LuaValue::nil();
+        }
+        self.stack_top = func_idx;
+
+        if self.call_depth() > 0 {
+            let ci_idx = self.call_depth() - 1;
+            let frame_top = self.get_call_info(ci_idx).top as usize;
+            if self.stack_top < frame_top {
+                self.stack_top = frame_top;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Clear stack slots from `base..self.stack_top` and restore `stack_top = base`.
+    #[inline]
+    pub(crate) fn discard_stack_from(&mut self, base: usize) {
+        let clear_end = self.stack_top.min(self.stack.len());
+        for i in base..clear_end {
+            self.stack[i] = LuaValue::nil();
+        }
+        self.stack_top = base;
+    }
+
     /// Fast comparison call for sort — avoids Vec allocations entirely.
     /// Calls `func(a, b)` and returns whether the result is truthy.
     ///
@@ -4075,6 +4165,12 @@ impl LuaState {
     #[inline(always)]
     pub(crate) fn gc_barrier(&mut self, upvalue_ptr: UpvaluePtr, value_gc_ptr: GcObjectPtr) {
         let owner_ptr = GcObjectPtr::from(upvalue_ptr);
+        self.global_state
+            .gc_barrier(self as *mut LuaState, owner_ptr, value_gc_ptr);
+    }
+
+    #[inline(always)]
+    pub(crate) fn gc_barrier_obj(&mut self, owner_ptr: GcObjectPtr, value_gc_ptr: GcObjectPtr) {
         self.global_state
             .gc_barrier(self as *mut LuaState, owner_ptr, value_gc_ptr);
     }

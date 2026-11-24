@@ -20,7 +20,12 @@ pub use userdata_trait::{lua_value_to_udvalue, udvalue_to_lua_value};
 
 // Re-export the optimized LuaValue and type enum for pattern matching
 pub use lua_table::LuaRawTable;
+pub(crate) use lua_table::NativeTable;
 pub use lua_value::{BIT_ISCOLLECTABLE, LUA_VFALSE, LUA_VNIL, LUA_VNUMFLT, LUA_VNUMINT, LUA_VTRUE};
+pub(crate) use lua_value::{
+    LUA_CCLOSURE, LUA_TFUNCTION, LUA_TSTRING, LUA_VFUNCTION, LUA_VRCLOSURE, LUA_VTABLE,
+    LUA_VTHREAD, LUA_VUSERDATA,
+};
 pub use lua_value::{LuaValue, LuaValueKind};
 
 pub(crate) type LuaInnerValue = Value; // For internal use within LuaValue implementation

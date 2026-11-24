@@ -20,8 +20,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::{
-    CallbackLua, Lua, LuaApi, LuaBytes, LuaError, LuaFunction, LuaResult, LuaString, LuaTable, LuaValueKind,
-    LuaValueVisitor, UserDataTrait, Value, Variadic,
+    CallbackLua, Lua, LuaApi, LuaBytes, LuaError, LuaFunction, LuaResult, LuaState, LuaString,
+    LuaTable, LuaValue, LuaValueKind, LuaValueVisitor, UserDataTrait, Value,
 };
 
 use build::*;
@@ -92,12 +92,14 @@ fn value_to_v(value: Value) -> V {
 fn arg_v(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<V> {
     match cx.arg_kind(idx) {
         None | Some(LuaValueKind::Nil) => Ok(V::Nil),
-        Some(LuaValueKind::Boolean) => Ok(V::Bool(cx.arg::<bool>(idx)?)),
-        Some(LuaValueKind::Integer) => Ok(V::Int(cx.arg::<i64>(idx)?)),
-        Some(LuaValueKind::Float) => Ok(V::Num(cx.arg::<f64>(idx)?)),
+        Some(LuaValueKind::Boolean) => Ok(V::Bool(cx.arg_bool(idx).unwrap_or(false))),
+        Some(LuaValueKind::Integer) => Ok(V::Int(cx.arg_integer(idx).unwrap_or(0))),
+        Some(LuaValueKind::Float) => Ok(V::Num(cx.arg_number(idx).unwrap_or(0.0))),
         Some(LuaValueKind::String) => {
-            let s: LuaString = cx.arg(idx)?;
-            Ok(V::Str(Rc::from(s.to_bytes())))
+            let bytes = cx
+                .arg_bytes(idx, |b| Rc::from(b))
+                .unwrap_or_else(|| Rc::from(&[][..]));
+            Ok(V::Str(bytes))
         }
         Some(_) => Ok(V::Obj(cx.arg::<Value>(idx)?)),
     }
@@ -105,15 +107,23 @@ fn arg_v(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<V> {
 
 /// `luaL_checklstring`: a string or a number converted to one.
 fn check_bytes(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<Vec<u8>> {
-    match arg_v(cx, idx)? {
-        V::Str(s) => Ok(s.to_vec()),
-        v @ (V::Int(_) | V::Num(_)) => Ok(v.to_bytes().expect("number").into_owned()),
+    match cx.arg_kind(idx) {
+        Some(LuaValueKind::String) => Ok(cx.arg_bytes(idx, <[u8]>::to_vec).unwrap_or_default()),
+        Some(LuaValueKind::Integer) => {
+            Ok(V::Int(cx.arg_integer(idx).unwrap_or(0)).to_bytes().expect("number").into_owned())
+        }
+        Some(LuaValueKind::Float) => {
+            Ok(V::Num(cx.arg_number(idx).unwrap_or(0.0)).to_bytes().expect("number").into_owned())
+        }
         _ => Err(cx.type_error(idx, "string")),
     }
 }
 
 /// `luaL_checkinteger`.
 fn check_integer(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<i64> {
+    if let Some(i) = cx.arg_integer(idx) {
+        return Ok(i);
+    }
     let v = arg_v(cx, idx)?;
     integer_of(cx, idx, v)
 }
@@ -147,17 +157,43 @@ fn v_to_value(cx: &mut CallbackLua<'_>, v: &V) -> LuaResult<Value> {
     }
 }
 
+#[inline]
+fn v_to_lua(state: &mut LuaState, v: &V) -> LuaResult<LuaValue> {
+    match v {
+        V::Nil => Ok(LuaValue::nil()),
+        V::Bool(b) => Ok(LuaValue::boolean(*b)),
+        V::Int(i) => Ok(LuaValue::integer(*i)),
+        V::Num(n) => Ok(LuaValue::float(*n)),
+        V::Str(s) => state.create_bytes(s),
+        V::Obj(o) => Ok(o.to_value()),
+        V::ObjRaw(o) => Ok(*o),
+    }
+}
+
+#[inline]
+fn lua_to_v(state: &mut LuaState, value: LuaValue) -> V {
+    match value.kind() {
+        LuaValueKind::Nil => V::Nil,
+        LuaValueKind::Boolean => V::Bool(value.as_boolean().unwrap_or(false)),
+        LuaValueKind::Integer => V::Int(value.ivalue()),
+        LuaValueKind::Float => V::Num(value.fltvalue()),
+        LuaValueKind::String => V::Str(Rc::from(value.as_bytes().unwrap_or(&[]))),
+        _ => V::Obj(Value::new(state.to_any_ref(value))),
+    }
+}
+
+#[inline]
 fn push_v(cx: &mut CallbackLua<'_>, v: &V) -> LuaResult<usize> {
     match v {
-        V::Nil => cx.push(Option::<i64>::None),
-        V::Bool(b) => cx.push(*b),
-        V::Int(i) => cx.push(*i),
-        V::Num(n) => cx.push(*n),
-        V::Str(s) => cx.push(LuaBytes(s.to_vec())),
+        V::Nil => cx.push_nil(),
+        V::Bool(b) => cx.push_bool(*b),
+        V::Int(i) => cx.push_int(*i),
+        V::Num(n) => cx.push_float(*n),
+        V::Str(s) => cx.push_bytes(s),
         V::Obj(o) => cx.push(o),
         V::ObjRaw(o) => {
-            let rooted = cx.pack(*o)?;
-            cx.push(rooted)
+            cx.state().push_value(*o)?;
+            Ok(1)
         }
     }
 }
@@ -185,33 +221,70 @@ struct CxEnv<'a, 'b> {
 
 impl Env for CxEnv<'_, '_> {
     fn call(&mut self, f: &V, args: &[V]) -> LResult<Vec<V>> {
-        let function = match f {
-            V::Obj(value) => value.as_function(),
-            V::ObjRaw(_) => v_to_value(self.cx, f)?.as_function(),
-            _ => None,
+        let func = match f {
+            V::Obj(value) => value.to_value(),
+            V::ObjRaw(value) => *value,
+            _ => return Err(self.cx.error(format!("attempt to call a {} value", f.type_name()))),
         };
-        let Some(function) = function else {
+        if !matches!(
+            func.kind(),
+            LuaValueKind::Function
+                | LuaValueKind::CFunction
+                | LuaValueKind::CClosure
+                | LuaValueKind::RClosure
+        ) {
             return Err(self.cx.error(format!("attempt to call a {} value", f.type_name())));
-        };
-        let mut values = Vec::with_capacity(args.len());
-        for a in args {
-            values.push(v_to_value(self.cx, a)?);
         }
-        let results: Variadic<Value> = function.call(Variadic(values))?;
-        Ok(results.0.into_iter().map(value_to_v).collect())
+        let state = self.cx.state();
+        let func_idx = state.get_top();
+        if let Err(err) = state.push_value(func) {
+            state.discard_stack_from(func_idx);
+            return Err(err);
+        }
+        for a in args {
+            match v_to_lua(state, a).and_then(|v| state.push_value(v)) {
+                Ok(()) => {}
+                Err(err) => {
+                    state.discard_stack_from(func_idx);
+                    return Err(err);
+                }
+            }
+        }
+        state.call_from_stack(func_idx, args.len(), |state, start, end| {
+            let mut out = Vec::with_capacity(end - start);
+            for i in start..end {
+                if let Some(val) = state.stack_get(i) {
+                    out.push(lua_to_v(state, val));
+                }
+            }
+            out
+        })
     }
 
     fn index(&mut self, table: &V, key: &V) -> LResult<V> {
-        let table_handle = match table {
-            V::Obj(value) => value.as_table(),
-            V::ObjRaw(_) => v_to_value(self.cx, table)?.as_table(),
-            _ => None,
+        let tbl = match table {
+            V::Obj(value) => value.to_value(),
+            V::ObjRaw(value) => *value,
+            _ => return Err(self.cx.error(format!("attempt to index a {} value", table.type_name()))),
         };
-        let Some(t) = table_handle else {
+        if !tbl.is_table() {
             return Err(self.cx.error(format!("attempt to index a {} value", table.type_name())));
-        };
-        let key = v_to_value(self.cx, key)?;
-        Ok(value_to_v(t.get::<Value>(key)?))
+        }
+        let state = self.cx.state();
+        let base = state.get_top();
+        let key_val = v_to_lua(state, key)?;
+        let rooted = key_val.is_collectable();
+        if rooted {
+            if let Err(err) = state.push_value(key_val) {
+                state.discard_stack_from(base);
+                return Err(err);
+            }
+        }
+        let res = state.table_get(&tbl, &key_val);
+        if rooted {
+            state.discard_stack_from(base);
+        }
+        Ok(lua_to_v(state, res?.unwrap_or_default()))
     }
 
     fn new_table(&mut self) -> LResult<V> {
@@ -220,17 +293,38 @@ impl Env for CxEnv<'_, '_> {
     }
 
     fn table_set(&mut self, table: &V, key: &V, value: &V) -> LResult<()> {
-        let table_handle = match table {
-            V::Obj(value) => value.as_table(),
-            V::ObjRaw(_) => v_to_value(self.cx, table)?.as_table(),
-            _ => None,
+        let tbl = match table {
+            V::Obj(value) => value.to_value(),
+            V::ObjRaw(value) => *value,
+            _ => return Err(self.cx.error(format!("attempt to index a {} value", table.type_name()))),
         };
-        let Some(t) = table_handle else {
+        if !tbl.is_table() {
             return Err(self.cx.error(format!("attempt to index a {} value", table.type_name())));
+        }
+        let state = self.cx.state();
+        let base = state.get_top();
+        let key_val = v_to_lua(state, key)?;
+        let rooted = key_val.is_collectable();
+        if rooted {
+            if let Err(err) = state.push_value(key_val) {
+                state.discard_stack_from(base);
+                return Err(err);
+            }
+        }
+        let val = match v_to_lua(state, value) {
+            Ok(v) => v,
+            Err(err) => {
+                if rooted {
+                    state.discard_stack_from(base);
+                }
+                return Err(err);
+            }
         };
-        let key = v_to_value(self.cx, key)?;
-        let value = v_to_value(self.cx, value)?;
-        t.raw_set(key, value)
+        state.raw_set(&tbl, key_val, val);
+        if rooted {
+            state.discard_stack_from(base);
+        }
+        Ok(())
     }
 
     fn error(&mut self, message: String) -> LuaError {
@@ -383,7 +477,9 @@ fn compiled(cx: &mut CallbackLua<'_>, pat: &Pat) -> LuaResult<Rc<Vec<u32>>> {
     let ktable = pat.ktable.as_ref().map(|k| k.borrow());
     let ktable = ktable.as_deref().map(Vec::as_slice).unwrap_or(&[]);
     finalfix(&mut tree, 0, None, ktable, &val2str).map_err(|f| fail(cx, f))?;
-    let code = Rc::new(code::compile(&mut tree));
+    let raw = code::compile(&mut tree);
+    pat.has_runtime.set(has_runtime(&raw));
+    let code = Rc::new(raw);
     *pat.code.borrow_mut() = Some(code.clone());
     Ok(code)
 }
@@ -401,25 +497,54 @@ fn has_runtime(code: &[u32]) -> bool {
 
 /// `lpeg.match(pattern, subject [, init [, ...]])`.
 fn lp_match(cx: &mut CallbackLua<'_>, shared: &Shared) -> LuaResult<usize> {
-    let operand = getpatt(cx, shared, 1)?;
-    let code = compiled(cx, &operand.pat)?;
-    // the subject
-    let (subject_handle, subject_value): (Option<LuaString>, Option<Vec<u8>>) = match cx.arg_kind(2) {
-        Some(LuaValueKind::String) => (Some(cx.arg(2)?), None),
-        Some(LuaValueKind::Integer | LuaValueKind::Float) => (None, Some(check_bytes(cx, 2)?)),
-        _ => return Err(cx.type_error(2, "string")),
+    let pat = match cx.arg_userdata_ref::<PatUd, _>(1, |u| u.0.clone()) {
+        Some(pat) => pat,
+        None => getpatt(cx, shared, 1)?.pat,
     };
+    let code = compiled(cx, &pat)?;
+    // the subject: copy short strings onto the stack to avoid a registry handle
+    let mut inline_buf = [0u8; 256];
+    let mut inline_len: Option<usize> = None;
+    let mut subject_handle: Option<LuaString> = None;
+    let mut subject_value: Option<Vec<u8>> = None;
+    match cx.arg_kind(2) {
+        Some(LuaValueKind::String) => {
+            if let Some(Some(len)) = cx.arg_bytes(2, |b| {
+                if b.len() <= inline_buf.len() {
+                    inline_buf[..b.len()].copy_from_slice(b);
+                    Some(b.len())
+                } else {
+                    None
+                }
+            }) {
+                inline_len = Some(len);
+            } else {
+                subject_handle = Some(cx.arg(2)?);
+            }
+        }
+        Some(LuaValueKind::Integer | LuaValueKind::Float) => {
+            subject_value = Some(check_bytes(cx, 2)?);
+        }
+        _ => return Err(cx.type_error(2, "string")),
+    }
     let borrowed = subject_handle.as_ref().map(|h| h.as_bytes().expect("live subject"));
-    let subject: &[u8] = match (&borrowed, &subject_value) {
-        (Some(b), _) => b,
-        (_, Some(v)) => v,
-        _ => unreachable!("subject"),
+    let subject: &[u8] = if let Some(len) = inline_len {
+        &inline_buf[..len]
+    } else if let Some(b) = &borrowed {
+        b
+    } else if let Some(v) = &subject_value {
+        v
+    } else {
+        unreachable!("subject")
     };
     // the initial position
     let len = subject.len();
-    let init = match cx.arg_kind(3) {
-        None | Some(LuaValueKind::Nil) => 1,
-        _ => check_integer(cx, 3)?,
+    let init = if cx.arg_is_nil(3) {
+        1
+    } else if let Some(i) = cx.arg_integer(3) {
+        i
+    } else {
+        check_integer(cx, 3)?
     };
     let start = if init > 0 {
         if (init as u64) <= len as u64 { init as usize - 1 } else { len }
@@ -430,12 +555,12 @@ fn lp_match(cx: &mut CallbackLua<'_>, shared: &Shared) -> LuaResult<usize> {
     };
     // extra arguments
     let nargs = cx.arg_count();
-    let mut args = Vec::new();
+    let mut args = if nargs >= 4 { Vec::with_capacity(nargs - 3) } else { Vec::new() };
     for idx in 4..=nargs {
         args.push(arg_v(cx, idx)?);
     }
-    let subject_v = if has_runtime(&code) { value_to_v(cx.arg::<Value>(2)?) } else { V::Nil };
-    let ktable = operand.pat.ktable.as_ref().map(|k| k.borrow());
+    let subject_v = if pat.has_runtime.get() { arg_v(cx, 2)? } else { V::Nil };
+    let ktable = pat.ktable.as_ref().map(|k| k.borrow());
     let ktable = ktable.as_deref().map(Vec::as_slice).unwrap_or(&[]);
     let margs = vm::MatchArgs {
         subject,
@@ -446,12 +571,16 @@ fn lp_match(cx: &mut CallbackLua<'_>, shared: &Shared) -> LuaResult<usize> {
     };
     let matched = vm::run(&code, start, &margs, &mut CxEnv { cx })?;
     let Some(matched) = matched else {
-        return cx.push(Option::<i64>::None);
+        return cx.push_nil();
     };
     // getcaptures
+    let caps = matched.caps.as_slice();
+    if caps[0].isclose() {
+        return cx.push_int(matched.end as i64 + 1);
+    }
     let mut env = CxEnv { cx };
     let mut cs = CapState {
-        caps: &matched.caps,
+        caps,
         cap: 0,
         subject,
         ktable,
@@ -461,17 +590,15 @@ fn lp_match(cx: &mut CallbackLua<'_>, shared: &Shared) -> LuaResult<usize> {
         stack: Vec::new(),
     };
     let mut n = 0;
-    if !matched.caps[0].isclose() {
-        loop {
-            n += cs.pushcapture()?;
-            if cs.caps[cs.cap].isclose() {
-                break;
-            }
+    loop {
+        n += cs.pushcapture()?;
+        if cs.caps[cs.cap].isclose() {
+            break;
         }
     }
     let results = cs.stack;
     if n == 0 {
-        return cx.push(matched.end as i64 + 1 - 0);
+        return cx.push_int(matched.end as i64 + 1);
     }
     let mut pushed = 0;
     for v in &results {
@@ -647,12 +774,10 @@ fn lp_backref(cx: &mut CallbackLua<'_>, shared: &Shared) -> LuaResult<usize> {
 }
 
 fn lp_type(cx: &mut CallbackLua<'_>) -> LuaResult<usize> {
-    let is_pattern = matches!(cx.arg_kind(1), Some(LuaValueKind::Userdata))
-        && cx.arg::<Value>(1)?.as_userdata::<PatUd>().is_some();
-    if is_pattern {
-        cx.push("pattern")
+    if cx.arg_userdata_ref::<PatUd, _>(1, |_| ()).is_some() {
+        cx.push_bytes(b"pattern")
     } else {
-        cx.push(Option::<i64>::None)
+        cx.push_nil()
     }
 }
 

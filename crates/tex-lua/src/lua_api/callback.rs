@@ -22,6 +22,11 @@ pub struct CallbackLua<'a> {
 }
 
 impl CallbackLua<'_> {
+    #[inline(always)]
+    pub(crate) fn state(&mut self) -> &mut LuaState {
+        self.state
+    }
+
     /// Number of arguments passed to the call.
     #[inline]
     pub fn arg_count(&self) -> usize {
@@ -42,6 +47,37 @@ impl CallbackLua<'_> {
         value.as_bytes().map(f)
     }
 
+    /// Borrow typed userdata at argument `index` (1-based) immutably on the VM
+    /// stack without creating or dropping a registry handle.
+    #[inline]
+    pub fn arg_userdata_ref<T: UserDataTrait + 'static, R>(
+        &self,
+        index: usize,
+        f: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        let value = self.state.get_arg(index)?;
+        let ud_ptr = value.as_userdata_ptr()?;
+        let ud = &ud_ptr.as_ref().data;
+        if !ud.is_type::<T>() {
+            return None;
+        }
+        if !ud.try_host_borrow() {
+            ud.borrowed_by_host();
+        }
+        struct BorrowGuard<'a>(&'a crate::lua_value::LuaUserdata);
+        impl Drop for BorrowGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.release_host_borrow();
+            }
+        }
+        let _guard = BorrowGuard(ud);
+        // SAFETY: `is_type::<T>()` matched and `try_host_borrow()` holds
+        // shared access for the lifetime of `_guard`.
+        let data = unsafe { &*ud.data_ptr::<T>() };
+        Some(f(data))
+    }
+
     /// Borrow typed userdata at argument `index` (1-based) directly on the VM
     /// stack without creating or dropping a registry handle.
     #[inline]
@@ -51,8 +87,27 @@ impl CallbackLua<'_> {
         f: impl FnOnce(&mut T) -> R,
     ) -> Option<R> {
         let value = self.state.get_arg(index)?;
-        let ud = value.as_userdata_mut()?.downcast_mut::<T>()?;
-        Some(f(ud))
+        let ud_ptr = value.as_userdata_ptr()?;
+        let ud = &ud_ptr.as_ref().data;
+        if !ud.is_type::<T>() {
+            return None;
+        }
+        if !ud.try_host_borrow_mut() {
+            ud.borrowed_by_host();
+        }
+        struct BorrowGuard<'a>(&'a crate::lua_value::LuaUserdata);
+        impl Drop for BorrowGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.release_host_borrow_mut();
+            }
+        }
+        let _guard = BorrowGuard(ud);
+        // SAFETY: `is_type::<T>()` matched and `try_host_borrow_mut()` holds
+        // exclusive access for the lifetime of `_guard`; `f` has no VM handle
+        // so GC cannot collect or move `ud_ptr`.
+        let data = unsafe { &mut *ud.data_ptr::<T>() };
+        Some(f(data))
     }
 
     /// Exact integer value of argument `index` (Lua `math.tointeger` semantics:
@@ -62,10 +117,59 @@ impl CallbackLua<'_> {
         self.state.get_arg(index)?.as_integer()
     }
 
+    /// Lua `lua_tointeger` on argument `index` (coercing numeric strings);
+    /// returns `None` if absent/nil or not convertible to an exact integer.
+    #[inline]
+    pub fn arg_tointeger(&self, index: usize) -> Option<i64> {
+        let value = self.state.get_arg(index)?;
+        if let Some(i) = value.as_integer() {
+            return Some(i);
+        }
+        if let Some(s) = value.as_str() {
+            let parsed = crate::stdlib::basic::parse_number::parse_lua_number(s);
+            return parsed.as_integer();
+        }
+        None
+    }
+
     /// Numeric value of argument `index` (integer or float; strings not coerced).
     #[inline]
     pub fn arg_number(&self, index: usize) -> Option<f64> {
         self.state.get_arg(index)?.as_number()
+    }
+
+    /// Lua `lua_tonumber` on argument `index` (coercing numeric strings).
+    #[inline]
+    pub fn arg_tonumber(&self, index: usize) -> Option<f64> {
+        let value = self.state.get_arg(index)?;
+        if let Some(n) = value.as_number() {
+            return Some(n);
+        }
+        if let Some(s) = value.as_str() {
+            let parsed = crate::stdlib::basic::parse_number::parse_lua_number(s);
+            return parsed.as_number();
+        }
+        None
+    }
+
+    /// Boolean value of argument `index` (`None` if absent or not a boolean).
+    #[inline]
+    pub fn arg_bool(&self, index: usize) -> Option<bool> {
+        self.state.get_arg(index)?.as_boolean()
+    }
+
+    /// Lua truthiness (`lua_toboolean`) of argument `index` (false when absent, nil, or false).
+    #[inline]
+    pub fn arg_is_truthy(&self, index: usize) -> bool {
+        self.state
+            .get_arg(index)
+            .is_some_and(|v| !v.is_nil() && !v.ttisfalse())
+    }
+
+    /// Whether argument `index` is absent or `nil`.
+    #[inline]
+    pub fn arg_is_nil(&self, index: usize) -> bool {
+        self.state.get_arg(index).is_none_or(|v| v.is_nil())
     }
 
     /// Argument `index` (1-based) converted to `T`; an absent argument is nil.
@@ -97,6 +201,12 @@ impl CallbackLua<'_> {
         lauxlib::lual_error(self.state, message)
     }
 
+    /// Raise a plain string error without a caller-position prefix (matches
+    /// `Err(String)` returned from [`Lua::create_function`]).
+    pub fn raw_error(&mut self, message: impl AsRef<str>) -> LuaError {
+        self.state.error(message.as_ref().to_owned())
+    }
+
     /// Push `value` as a result of the call; returns the number of values
     /// pushed, to be added to the closure's result count.
     pub fn push<T: IntoLua>(&mut self, value: T) -> LuaResult<usize> {
@@ -121,6 +231,37 @@ impl CallbackLua<'_> {
     #[inline]
     pub fn push_int(&mut self, value: i64) -> LuaResult<usize> {
         self.state.push_value(crate::LuaValue::integer(value))?;
+        Ok(1)
+    }
+
+    /// Push an optional integer (`Some(v)` -> int, `None` -> nil).
+    #[inline]
+    pub fn push_opt_int(&mut self, value: Option<i64>) -> LuaResult<usize> {
+        match value {
+            Some(v) => self.push_int(v),
+            None => self.push_nil(),
+        }
+    }
+
+    /// Push a newly created userdata directly onto the VM stack (attaching its
+    /// registered metatable if `metatable_name()` is present in the registry)
+    /// without creating or dropping a registry handle.
+    #[inline]
+    pub fn push_userdata<T: UserDataTrait + 'static>(&mut self, data: T) -> LuaResult<usize> {
+        let meta_name = data.metatable_name();
+        let value = self.state.create_userdata(crate::LuaUserdata::new(data))?;
+        self.state.push_value(value)?;
+        if let Some(name) = meta_name
+            && let Some(meta) = self.state.global_state_mut().registry_get(name)?
+            && meta.as_table_ptr().is_some()
+            && let Some(ptr) = value.as_userdata_ptr()
+        {
+            ptr.as_mut_ref().data.set_metatable(meta);
+            if let Some(meta_ptr) = meta.as_gc_ptr() {
+                self.state
+                    .gc_barrier_obj(crate::gc::GcObjectPtr::from(ptr), meta_ptr);
+            }
+        }
         Ok(1)
     }
 
@@ -149,13 +290,23 @@ impl CallbackLua<'_> {
         let len = values.len();
         let tbl_val = self.state.create_table(len, 0)?;
         self.state.push_value(tbl_val)?;
+        let mut iter = values.enumerate();
+        let mut pending = None;
         if let Some(table) = tbl_val.as_table_mut() {
-            for (idx, v) in values.enumerate() {
+            while let Some((idx, v)) = iter.next() {
                 let key = (idx + 1) as i64;
                 let lv = crate::LuaValue::integer(v);
                 if !table.impl_table.fast_seti(key, lv) {
-                    self.state.raw_seti(&tbl_val, key, lv);
+                    pending = Some((key, lv));
+                    break;
                 }
+            }
+        }
+        if let Some((key, lv)) = pending {
+            self.state.raw_seti(&tbl_val, key, lv);
+            for (idx, v) in iter {
+                self.state
+                    .raw_seti(&tbl_val, (idx + 1) as i64, crate::LuaValue::integer(v));
             }
         }
         Ok(1)
@@ -195,6 +346,28 @@ impl Lua {
         F: Fn(&mut CallbackLua<'_>) -> LuaResult<usize> + 'static,
     {
         self.create_raw_function(move |state| f(&mut CallbackLua { state }))
+    }
+
+    /// Create a light C function (`LUA_VLCF`) from a stateless `Copy` callback
+    /// closure, avoiding `RClosure` GC allocation and virtual dispatch. Falls
+    /// back to a regular callback if the closure captures state.
+    pub fn create_c_callback<F>(&mut self, f: F) -> LuaResult<LuaFunction>
+    where
+        F: Fn(&mut CallbackLua<'_>) -> LuaResult<usize> + Copy + 'static,
+    {
+        if std::mem::size_of::<F>() == 0 && !std::mem::needs_drop::<F>() {
+            fn trampoline<F: Fn(&mut CallbackLua<'_>) -> LuaResult<usize> + Copy + 'static>(
+                state: &mut LuaState,
+            ) -> LuaResult<usize> {
+                // SAFETY: `F` is a zero-sized `Copy` type without drop glue,
+                // and an inhabited valid value `f` was witnessed by the caller.
+                let f: F = unsafe { std::ptr::NonNull::<F>::dangling().read() };
+                f(&mut CallbackLua { state })
+            }
+            let _ = f;
+            return self.value_to_function(crate::LuaValue::cfunction(trampoline::<F>));
+        }
+        self.create_callback(f)
     }
 }
 
@@ -316,5 +489,137 @@ mod tests {
             peak_kb < 32_768.0,
             "expected GC to bound peak memory below 32 MiB, got {peak_kb:.1} KiB"
         );
+    }
+
+    struct OtherUd;
+    impl UserDataTrait for OtherUd {
+        fn type_name(&self) -> &'static str {
+            "other"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn arg_userdata_mut_rejects_aliased_host_borrow() {
+        let mut lua = lua();
+        let counter = lua.create_userdata(Counter(10)).unwrap();
+        let alias = counter.clone();
+        let f = lua
+            .create_callback(move |cx| {
+                let rejected = cx
+                    .arg_userdata_mut::<Counter, _>(1, |c| {
+                        c.0 += 1;
+                        // Both shared and mutable host borrows must fail while arg_userdata_mut is live.
+                        alias.borrow().is_err() && alias.borrow_mut().is_err()
+                    })
+                    .unwrap();
+                cx.push_bool(rejected)
+            })
+            .unwrap();
+        lua.set_global("c", counter.clone()).unwrap();
+        lua.set_global("f", f).unwrap();
+        let rejected: bool = lua.load("return f(c)").eval().unwrap();
+        assert!(rejected, "expected aliased host borrow to be rejected");
+        // Drop guard must have released host_borrow after callback returns.
+        assert_eq!(counter.borrow().unwrap().0, 11);
+
+        // Verify drop guard also releases host_borrow on unwind (panic inside callback).
+        let panicky = lua
+            .create_callback(|cx| {
+                let _ = cx.arg_userdata_mut::<Counter, _>(1, |c| {
+                    c.0 += 1;
+                    panic!("intentional unwind");
+                });
+                Ok(0)
+            })
+            .unwrap();
+        lua.set_global("panicky", panicky).unwrap();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lua.load("panicky(c)").exec();
+        }));
+        assert!(res.is_err());
+        assert_eq!(counter.borrow().unwrap().0, 12);
+    }
+
+    #[test]
+    fn arg_userdata_mut_wrong_type_does_not_panic_on_host_borrowed_userdata() {
+        let mut lua = lua();
+        let other = lua.create_userdata(OtherUd).unwrap();
+        let f = lua
+            .create_callback(|cx| {
+                let matched = cx.arg_userdata_mut::<Counter, _>(1, |c| c.0).is_some();
+                cx.push_bool(matched)
+            })
+            .unwrap();
+        lua.set_global("u", other.clone()).unwrap();
+        lua.set_global("f", f).unwrap();
+        let _guard = other.borrow_mut().unwrap();
+        let matched: bool = lua.load("return f(u)").eval().unwrap();
+        assert!(!matched);
+    }
+
+    #[test]
+    fn push_int_array_handles_exact_size_iterator_overrun() {
+        struct LyingIter {
+            next: i64,
+            end: i64,
+        }
+        impl Iterator for LyingIter {
+            type Item = i64;
+            fn next(&mut self) -> Option<i64> {
+                if self.next <= self.end {
+                    let v = self.next;
+                    self.next += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        }
+        impl ExactSizeIterator for LyingIter {
+            fn len(&self) -> usize {
+                // Intentionally under-report length to force fallback to `raw_seti`.
+                2
+            }
+        }
+
+        let mut lua = lua();
+        let make = lua
+            .create_callback(|cx| cx.push_int_array(LyingIter { next: 1, end: 12 }))
+            .unwrap();
+        lua.set_global("make", make).unwrap();
+        let sum: i64 = lua
+            .load(
+                "local t = make(); local s = 0; for i = 1, 12 do s = s + t[i] end; return s",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(sum, 78);
+    }
+
+    #[test]
+    fn small_stepsize_does_not_force_fast_gc_mode() {
+        let mut lua = Lua::new(SafeOption::default());
+        lua.open_stdlib(Stdlib::All).unwrap();
+        // Configure stepsize < sizeof(*const ()) with non-zero stepmul; GC must remain incremental.
+        let ok: bool = lua
+            .load(
+                r#"
+                collectgarbage("incremental")
+                collectgarbage("param", "stepsize", 1)
+                collectgarbage("param", "stepmul", 200)
+                local t = {}
+                for i = 1, 2000 do t[i] = { i, i + 1 } end
+                return #t == 2000
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
     }
 }

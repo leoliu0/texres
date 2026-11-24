@@ -1,4 +1,155 @@
+use std::marker::PhantomData;
+
+use crate::gc::StringInterner;
+use crate::lua_value::NativeTable;
 use crate::{FromLua, FromLuaMulti, IntoLua, LuaFunction, LuaResult, LuaTableRef, LuaValue};
+
+/// Pre-resolved short-string key scoped to a [`LuaTable::with_raw`] borrow.
+/// Avoids repeating string hashing and interner lookup across many tables.
+#[derive(Clone, Copy)]
+pub struct RawStrKey<'a> {
+    value: Option<LuaValue>,
+    _marker: PhantomData<&'a ()>,
+}
+
+/// Borrowed, read-only view of a Lua value inside [`LuaTable::with_raw`].
+/// Zero registry handles, zero GC allocations.
+#[derive(Clone, Copy)]
+pub struct RawValue<'a> {
+    value: LuaValue,
+    strings: &'a StringInterner,
+}
+
+impl<'a> RawValue<'a> {
+    #[inline(always)]
+    pub fn is_nil(self) -> bool {
+        self.value.is_nil()
+    }
+
+    #[inline(always)]
+    pub fn as_number(self) -> Option<f64> {
+        self.value.as_number()
+    }
+
+    #[inline(always)]
+    pub fn as_integer(self) -> Option<i64> {
+        self.value.as_integer()
+    }
+
+    #[inline(always)]
+    pub fn as_boolean(self) -> Option<bool> {
+        self.value.as_boolean()
+    }
+
+    /// Zero-copy borrow of string bytes directly from the VM string object.
+    #[inline(always)]
+    pub fn as_bytes(self) -> Option<&'a [u8]> {
+        self.value.as_string_ptr().map(|ptr| {
+            // SAFETY: `RawValue<'a>` is bound to an immutable borrow of the VM
+            // (`LuaTable::with_raw`), during which no GC or mutation can occur.
+            unsafe { &*ptr.as_raw_ptr() }.data.as_bytes()
+        })
+    }
+
+    /// Borrow a nested table without creating a registry handle.
+    #[inline(always)]
+    pub fn as_table(self) -> Option<RawTable<'a>> {
+        self.value.as_table_ptr().map(|ptr| RawTable {
+            // SAFETY: `RawValue<'a>` is bound to an immutable borrow of the VM
+            // (`LuaTable::with_raw`), during which no GC or mutation can occur.
+            table: &unsafe { &*ptr.as_raw_ptr() }.data.impl_table,
+            strings: self.strings,
+        })
+    }
+}
+
+/// Borrowed, read-only view of a Lua table inside [`LuaTable::with_raw`].
+/// Zero registry handles, zero GC allocations, and no VM mutation is possible
+/// for the lifetime `'a`.
+#[derive(Clone, Copy)]
+pub struct RawTable<'a> {
+    table: &'a NativeTable,
+    strings: &'a StringInterner,
+}
+
+impl<'a> RawTable<'a> {
+    /// Pre-resolve a short string key (<= 40 bytes) once against the VM's
+    /// string interner without allocating or mutating GC state.
+    #[inline]
+    pub fn resolve_key(self, key: &str) -> RawStrKey<'a> {
+        RawStrKey {
+            value: self.strings.lookup_short(key.as_bytes()),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Look up a pre-resolved short string key without metamethods or allocation.
+    #[inline]
+    pub fn get_key(self, key: RawStrKey<'a>) -> Option<RawValue<'a>> {
+        let key_val = key.value?;
+        self.table.get_shortstr(&key_val).map(|value| RawValue {
+            value,
+            strings: self.strings,
+        })
+    }
+
+    /// Raw lookup by string key without allocating a GC string or registry handle.
+    #[inline]
+    pub fn get_str(self, key: &str) -> Option<RawValue<'a>> {
+        let bytes = key.as_bytes();
+        if let Some(key_val) = self.strings.lookup_short(bytes) {
+            return self.table.get_shortstr(&key_val).map(|value| RawValue {
+                value,
+                strings: self.strings,
+            });
+        }
+        #[cfg(not(feature = "shared-proto"))]
+        if bytes.len() <= StringInterner::SHORT_STRING_LIMIT {
+            return None;
+        }
+        self.table.get_str_bytes_fallback(bytes).map(|value| RawValue {
+            value,
+            strings: self.strings,
+        })
+    }
+
+    /// Raw lookup by integer key without creating a registry handle.
+    #[inline]
+    pub fn get_int(self, key: i64) -> Option<RawValue<'a>> {
+        self.table.get_int(key).map(|value| RawValue {
+            value,
+            strings: self.strings,
+        })
+    }
+
+    /// Raw array length (`#t`).
+    #[inline]
+    pub fn raw_len(self) -> usize {
+        self.table.len()
+    }
+
+    /// Returns true if the table has no live entries (array or hash).
+    #[inline]
+    pub fn is_empty_entries(self) -> bool {
+        self.table.is_empty_entries()
+    }
+
+    /// Iterate over all live `(key, value)` pairs without allocating a `Vec`
+    /// or creating registry handles.
+    #[inline]
+    pub fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(RawValue<'a>, RawValue<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let strings = self.strings;
+        self.table.try_for_each_entry(|k, v| {
+            f(
+                RawValue { value: k, strings },
+                RawValue { value: v, strings },
+            )
+        })
+    }
+}
 
 /// Safe wrapper around a Lua table handle.
 #[derive(Clone, Debug)]
@@ -136,6 +287,14 @@ impl LuaTable {
     #[inline]
     pub fn sequence_values<T: FromLua>(&self) -> LuaResult<Vec<T>> {
         self.inner.sequence_values()
+    }
+
+    /// Borrow this table for read-only raw inspection without allocating
+    /// registry handles or GC strings.
+    #[inline]
+    pub fn with_raw<R>(&self, f: impl FnOnce(RawTable<'_>) -> R) -> LuaResult<R> {
+        self.inner
+            .with_raw(|table, strings| f(RawTable { table, strings }))
     }
 
     /// Append a value to the array portion of the table.

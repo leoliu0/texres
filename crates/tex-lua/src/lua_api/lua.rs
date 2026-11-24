@@ -198,6 +198,12 @@ impl Lua {
         self.value_to_function(value)
     }
 
+    /// Current total memory accounted by the Lua garbage collector, in bytes.
+    #[inline]
+    pub fn gc_total_bytes(&self) -> usize {
+        self.global_state_owner.gc.get_total_bytes().max(0) as usize
+    }
+
     /// The underlying VM state (crate-internal: it hands out unrooted values).
     pub(crate) fn global_state_mut(&mut self) -> &mut GlobalState {
         &mut self.global_state_owner

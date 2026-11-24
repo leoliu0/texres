@@ -244,23 +244,30 @@ impl StringInterner {
 
         let hash = self.hash_bytes(bytes);
 
-        if let Ok(index) = self.find_slot(hash, bytes)
-            && let Some(ts) = self.slots[index].occupied()
-        {
-            let gc_str = ts.as_ref();
-            if gc_str.header.is_white() {
-                ts.as_mut_ref().header.make_black();
+        let known_slot = match self.find_slot(hash, bytes) {
+            Ok(index) => {
+                if let Some(ts) = self.slots[index].occupied() {
+                    let gc_str = ts.as_ref();
+                    if gc_str.header.is_white() {
+                        ts.as_mut_ref().header.make_black();
+                    }
+                    let value = LuaValue::shortstring(ts);
+                    if slen == 1 {
+                        self.byte_cache[bytes[0] as usize] = value;
+                    }
+                    return Ok(value);
+                }
+                Some(index)
             }
-            let value = LuaValue::shortstring(ts);
-            if slen == 1 {
-                self.byte_cache[bytes[0] as usize] = value;
-            }
-            return Ok(value);
-        }
+            Err(slot) => Some(slot),
+        };
 
-        if self.should_grow() {
+        let slot = if self.should_grow() {
             self.grow(gc);
-        }
+            None
+        } else {
+            known_slot
+        };
         let value = self.create_short_string(
             Self::make_short_string_repr(bytes),
             hash,
@@ -268,6 +275,7 @@ impl StringInterner {
             current_white,
             gc,
             string_pool,
+            slot,
         )?;
         if slen == 1 {
             self.byte_cache[bytes[0] as usize] = value;
@@ -305,34 +313,67 @@ impl StringInterner {
             return Ok(LuaValue::longstring(ptr));
         }
 
+        if slen == 1 {
+            let b = bytes[0] as usize;
+            if let Some(sp) = self.byte_cache[b].as_string_ptr() {
+                let gc_str = sp.as_ref();
+                if gc_str.data.as_bytes() == bytes.as_slice() {
+                    if gc_str.header.is_white() {
+                        sp.as_mut_ref().header.make_black();
+                    }
+                    return Ok(self.byte_cache[b]);
+                }
+            }
+        }
+
         let hash = self.hash_bytes(&bytes);
 
-        if let Ok(index) = self.find_slot(hash, &bytes)
-            && let Some(ts) = self.slots[index].occupied()
-        {
-            let gc_str = ts.as_ref();
-            if gc_str.header.is_white() {
-                ts.as_mut_ref().header.make_black();
+        let known_slot = match self.find_slot(hash, &bytes) {
+            Ok(index) => {
+                if let Some(ts) = self.slots[index].occupied() {
+                    let gc_str = ts.as_ref();
+                    if gc_str.header.is_white() {
+                        ts.as_mut_ref().header.make_black();
+                    }
+                    let value = LuaValue::shortstring(ts);
+                    if slen == 1 {
+                        self.byte_cache[bytes[0] as usize] = value;
+                    }
+                    return Ok(value);
+                }
+                Some(index)
             }
-            return Ok(LuaValue::shortstring(ts));
-        }
+            Err(slot) => Some(slot),
+        };
 
-        if self.should_grow() {
+        let slot = if self.should_grow() {
             self.grow(gc);
-        }
-        self.create_short_string(
+            None
+        } else {
+            known_slot
+        };
+        let b0 = bytes.first().copied();
+        let value = self.create_short_string(
             Self::make_short_string_repr(&bytes),
             hash,
             utf8_known,
             current_white,
             gc,
             string_pool,
-        )
+            slot,
+        )?;
+        if slen == 1 {
+            if let Some(b) = b0 {
+                self.byte_cache[b as usize] = value;
+            }
+        }
+        Ok(value)
     }
 
     /// `utf8_known`: the caller holds a `str`/`String`, so the bytes are valid
     /// UTF-8 and need not be validated again.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn create_short_string(
         &mut self,
         s: LuaStrRepr,
@@ -341,14 +382,18 @@ impl StringInterner {
         current_white: u8,
         gc: &mut GC,
         string_pool: &mut PagedPool<GcString>,
+        known_slot: Option<usize>,
     ) -> CreateResult {
         let size = Self::short_string_size();
         let lua_string = Self::lua_string(s, hash, utf8_known);
         let gc_string = Self::alloc_string_owner(current_white, lua_string, size, string_pool);
         let ptr = gc_string.as_str_ptr().unwrap();
 
-        let slot = match self.find_slot(hash, ptr.as_ref().data.as_bytes()) {
-            Ok(index) | Err(index) => index,
+        let slot = match known_slot {
+            Some(index) => index,
+            None => match self.find_slot(hash, ptr.as_ref().data.as_bytes()) {
+                Ok(index) | Err(index) => index,
+            },
         };
         if matches!(self.slots[slot], StringSlot::Tombstone) {
             self.ndead -= 1;
@@ -360,11 +405,34 @@ impl StringInterner {
         Ok(LuaValue::shortstring(ptr))
     }
 
+    /// Read-only lookup of an already-interned short string without allocating
+    /// or mutating GC state.
+    #[inline]
+    pub(crate) fn lookup_short(&self, bytes: &[u8]) -> Option<LuaValue> {
+        let slen = bytes.len();
+        if slen > Self::SHORT_STRING_LIMIT {
+            return None;
+        }
+        if slen == 1 {
+            let val = self.byte_cache[bytes[0] as usize];
+            if !val.is_nil() {
+                return Some(val);
+            }
+        }
+        let hash = self.hash_bytes(bytes);
+        if let Ok(index) = self.find_slot(hash, bytes)
+            && let Some(ts) = self.slots[index].occupied()
+        {
+            return Some(LuaValue::shortstring(ts));
+        }
+        None
+    }
+
     #[inline(always)]
     /// Fast deterministic string hash, similar to Lua C's `luaS_hash`.
     /// ahash's random hasher costs more than it saves for short interned strings.
     #[inline]
-    fn hash_bytes(&self, s: &[u8]) -> u64 {
+    pub(crate) fn hash_bytes(&self, s: &[u8]) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (s.len() as u64);
         for &b in s {
             h ^= b as u64;

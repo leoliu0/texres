@@ -20,7 +20,9 @@
 
 use crate::{
     Instruction, LUA_MASKCALL, LUA_MASKLINE, LUA_MASKRET, LuaResult, LuaState, LuaValue, OpCode,
-    lua_value::{BIT_ISCOLLECTABLE, LuaProto},
+    lua_value::{
+        BIT_ISCOLLECTABLE, LUA_TFUNCTION, LUA_VFUNCTION, LUA_VTABLE, LUA_VUSERDATA, LuaProto,
+    },
     lua_vm::{
         LuaError, StkId, TmKind,
         call_info::call_status::{CIST_C, CIST_CLSRET, CIST_PENDING_FINISH},
@@ -59,6 +61,38 @@ fn init_oldpc(lua_state: &mut LuaState, pc: usize, chunk: &LuaProto) {
             u32::MAX
         };
     }
+}
+
+#[cold]
+#[inline(never)]
+fn call_non_function(
+    lua_state: &mut LuaState,
+    func_idx: usize,
+    mut nargs: usize,
+    nresults: i32,
+) -> LuaResult<bool> {
+    let mut ccmt_depth = 0u8;
+    loop {
+        let v = unsafe { *lua_state.stack().get_unchecked(func_idx) };
+        if !v.is_table() {
+            break;
+        }
+        match insert_table_call_mm(lua_state, func_idx, nargs, ccmt_depth)? {
+            Some((_mm, new_nargs)) => {
+                nargs = new_nargs;
+                ccmt_depth += 1;
+            }
+            None => break,
+        }
+    }
+    let pushed_lua = precall(lua_state, func_idx, nargs, nresults)?;
+    if pushed_lua && ccmt_depth > 0 {
+        unsafe {
+            (*lua_state.current_ci_ptr()).call_status |=
+                crate::lua_vm::call_info::call_status::set_ccmt_count(0, ccmt_depth);
+        }
+    }
+    Ok(pushed_lua)
 }
 
 #[inline]
@@ -790,25 +824,31 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                 OpCode::Jmp => {
                     let sj = instr.get_sj();
                     pc = (pc as isize + sj as isize) as usize;
-                    updatetrap!();
                 }
                 OpCode::Eq => {
                     let a = instr.get_a();
                     let b = instr.get_b();
-                    let ra = base_stk.offset(a as usize).get();
-                    let rb = base_stk.offset(b as usize).get();
-                    savestate!();
-                    let cond = eq_fallback(lua_state, ci, ra, rb)?;
-                    syncbase!();
-                    updatetrap!();
+                    let ra = base_stk.offset(a as usize).get_ref();
+                    let rb = base_stk.offset(b as usize).get_ref();
+                    let cond = if ra == rb {
+                        true
+                    } else if ra.tt == rb.tt && (ra.tt == LUA_VTABLE || ra.tt == LUA_VUSERDATA) {
+                        let va = *ra;
+                        let vb = *rb;
+                        savestate!();
+                        let res = eq_fallback(lua_state, ci, va, vb)?;
+                        syncbase!();
+                        updatetrap!();
+                        res
+                    } else {
+                        false
+                    };
                     let k = instr.get_k();
                     if cond != k {
                         pc += 1;
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        syncbase!();
-                        updatetrap!();
                     }
                 }
                 OpCode::Lt => {
@@ -849,7 +889,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::Le => {
@@ -890,7 +929,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::EqK => {
@@ -907,7 +945,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::EqI => {
@@ -928,7 +965,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::LtI => {
@@ -964,7 +1000,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::LeI => {
@@ -1000,7 +1035,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::GtI => {
@@ -1037,7 +1071,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::GeI => {
@@ -1074,7 +1107,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::Test => {
@@ -1089,7 +1121,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     } else {
                         let jmp = instr_at(code, pc);
                         pc = ((pc + 1) as isize + jmp.get_sj() as isize) as usize;
-                        updatetrap!();
                     }
                 }
                 OpCode::TestSet => {
@@ -1111,7 +1142,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                         pc += 1; // Move past the JMP instruction
                         let sj = next_instr.get_sj();
                         pc = (pc as isize + sj as isize) as usize; // Execute the jump
-                        updatetrap!();
                     }
                 }
                 OpCode::Call => {
@@ -1119,38 +1149,15 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     let b = instr.get_b() as usize;
                     let nresults = instr.get_c() as i32 - 1;
                     let func_idx = ci.base + a as usize;
-                    let mut nargs = if b != 0 {
+                    let nargs = if b != 0 {
                         lua_state.set_top_raw(func_idx + b);
                         b - 1
                     } else {
                         lua_state.get_top() - func_idx - 1
                     };
 
-                    // __call 单步解析只对不是 Lua/C 函数的值启用，
-                    // 普通调用的快路径只多一次 tag 判断。
-                    let mut func = unsafe { *lua_state.stack().get_unchecked(func_idx) };
-                    let mut ccmt_depth: u8 = 0;
-                    if !func.is_lua_function() && !func.is_c_callable() {
-                        loop {
-                            let v = unsafe { *lua_state.stack().get_unchecked(func_idx) };
-                            if !v.is_table() {
-                                break;
-                            }
-                            match insert_table_call_mm(lua_state, func_idx, nargs, ccmt_depth)? {
-                                Some((_mm, new_nargs)) => {
-                                    nargs = new_nargs;
-                                    ccmt_depth += 1;
-                                }
-                                None => break,
-                            }
-                        }
-                        func = unsafe { *lua_state.stack().get_unchecked(func_idx) };
-                    }
-
-                    // Fast path: peek at func to inline the exact-match Lua call.
-                    // Avoids the flush->precall->reload round-trip through CallInfo.
-                    if func.is_lua_function() {
-                        // Extract raw data before borrowing issues
+                    let func = unsafe { *lua_state.stack().get_unchecked(func_idx) };
+                    if func.tt == LUA_VFUNCTION {
                         let (param_count, max_stack_size, chunk_ptr, new_upvalue_ptrs) = {
                             let lf = func.as_lua_function().unwrap();
                             let c = lf.chunk();
@@ -1162,9 +1169,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                             )
                         };
                         let new_base = func_idx + 1;
-                        // Fast path: exact arg count + reusable CallInfo slot + physical
-                        // stack 有余量。直接写入精简帧并返回 (ci_ptr, base_stk)，
-                        // 省掉 current_ci_ptr()/ci.base_stk 的二次往返。
                         if nargs == param_count
                             && let Some((ci_ptr, new_base_stk)) = lua_state.enter_lua_frame_fast(
                                 new_base,
@@ -1174,17 +1178,10 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                                 new_upvalue_ptrs,
                             )
                         {
-                            // Save caller pc before switching frames.
                             ci.save_pc(pc);
                             ci = unsafe { &mut *ci_ptr };
                             base_stk = new_base_stk;
                             pc = 0;
-                            if ccmt_depth > 0 {
-                                ci.call_status |=
-                                    crate::lua_vm::call_info::call_status::set_ccmt_count(
-                                        0, ccmt_depth,
-                                    );
-                            }
                             chunk = unsafe { &*chunk_ptr };
                             code = &chunk.code;
                             constants = &chunk.constants;
@@ -1199,7 +1196,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                             init_oldpc(lua_state, 0, chunk);
                             continue;
                         }
-                        // Exact match failed (e.g. stack overflow), fall through
                         ci.save_pc(pc);
                         lua_state.push_lua_frame(
                             new_base,
@@ -1210,33 +1206,17 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                             chunk_ptr,
                             new_upvalue_ptrs,
                         )?;
-                        if ccmt_depth > 0 {
-                            unsafe {
-                                (*lua_state.current_ci_ptr()).call_status |=
-                                    crate::lua_vm::call_info::call_status::set_ccmt_count(
-                                        0, ccmt_depth,
-                                    );
-                            }
-                        }
                         reload_after_call!();
                         continue;
-                    }
-
-                    // Fast C-callable path, else cold __call metamethod path
-                    ci.save_pc(pc);
-                    if func.is_c_callable() {
+                    } else if (func.tt & 0x0F) == LUA_TFUNCTION {
+                        ci.save_pc(pc);
                         call_c_function(lua_state, func_idx, nargs, nresults)?;
-                    } else if precall(lua_state, func_idx, nargs, nresults)? {
-                        if ccmt_depth > 0 {
-                            unsafe {
-                                (*lua_state.current_ci_ptr()).call_status |=
-                                    crate::lua_vm::call_info::call_status::set_ccmt_count(
-                                        0, ccmt_depth,
-                                    );
-                            }
+                    } else {
+                        ci.save_pc(pc);
+                        if call_non_function(lua_state, func_idx, nargs, nresults)? {
+                            reload_after_call!();
+                            continue;
                         }
-                        reload_after_call!();
-                        continue;
                     }
 
                     // C call completed
@@ -1437,7 +1417,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     limit_slot.set_float(limit);
                     step_slot.set_float(step);
                     pc += instr.get_bx() as usize;
-                    updatetrap!();
                 }
                 OpCode::ForLoop53 => {
                     let a = instr.get_a() as usize;
@@ -1457,7 +1436,7 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                             limit <= index
                         };
                         if keep_going {
-                            index_slot.set_integer(index);
+                            index_slot.change_i(index);
                             index_slot.offset(3).set_integer(index);
                         }
                         keep_going
@@ -1479,32 +1458,51 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     if continue_loop {
                         pc -= instr.get_bx() as usize;
                     }
-                    updatetrap!();
                 }
                 OpCode::TForCall53 => {
                     let a = instr.get_a() as usize;
                     let result_count = instr.get_c() as usize;
                     let function_index = ci.base + a + 3;
+                    let func_stk = base_stk.offset(a);
                     base_stk.offset(a + 5).set(base_stk.offset(a + 2));
                     base_stk.offset(a + 4).set(base_stk.offset(a + 1));
-                    base_stk.offset(a + 3).set(base_stk.offset(a));
+                    base_stk.offset(a + 3).set(func_stk);
                     lua_state.set_top_raw(function_index + 3);
                     ci.save_pc(pc);
-                    if precall(lua_state, function_index, 2, result_count as i32)? {
+                    let func = func_stk.get();
+                    if func.tt != LUA_VFUNCTION && (func.tt & 0x0F) == LUA_TFUNCTION {
+                        call_c_function(lua_state, function_index, 2, result_count as i32)?;
+                        syncbase!();
+                        updatetrap!();
+                        if !trap {
+                            let next_instr = instr_at(code, pc);
+                            if next_instr.get_opcode() == OpCode::TForLoop53 {
+                                pc += 1;
+                                let la = next_instr.get_a() as usize;
+                                let next_stk = base_stk.offset(la + 3);
+                                if !next_stk.is_nil() {
+                                    base_stk.offset(la + 2).set(next_stk);
+                                    pc -= next_instr.get_bx() as usize;
+                                }
+                                continue;
+                            }
+                        }
+                    } else if precall(lua_state, function_index, 2, result_count as i32)? {
                         reload_after_call!();
                         continue;
+                    } else {
+                        syncbase!();
+                        updatetrap!();
                     }
                     if lua_state.hook_mask & LUA_MASKLINE != 0 {
                         lua_state.oldpc = (pc - 1) as u32;
                     }
-                    syncbase!();
-                    updatetrap!();
                 }
                 OpCode::TForLoop53 => {
                     let a = instr.get_a() as usize;
-                    let next = base_stk.offset(a + 3).get();
-                    if !next.is_nil() {
-                        base_stk.offset(a + 2).write(&next);
+                    let next_stk = base_stk.offset(a + 3);
+                    if !next_stk.is_nil() {
+                        base_stk.offset(a + 2).set(next_stk);
                         pc -= instr.get_bx() as usize;
                     }
                 }
@@ -1541,8 +1539,6 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                         // Jump back if loop continues
                         pc -= bx;
                     }
-
-                    updatetrap!();
                 }
                 OpCode::ForPrep => {
                     let a = instr.get_a();

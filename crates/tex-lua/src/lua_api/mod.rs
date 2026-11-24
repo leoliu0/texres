@@ -18,7 +18,7 @@ pub use function::LuaFunction;
 pub use lua::Lua;
 pub use lua_string::{LuaBytes, LuaString};
 pub use scope::{Scope, ScopedFunction};
-pub use table::LuaTable;
+pub use table::{LuaTable, RawStrKey, RawTable, RawValue};
 pub use value::Value;
 pub use variadic::Variadic;
 

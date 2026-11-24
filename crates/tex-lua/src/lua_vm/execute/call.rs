@@ -194,15 +194,7 @@ pub fn call_c_function(
     nresults: i32,
 ) -> LuaResult<()> {
     // Get the function (already validated as c_callable by caller)
-    let func = lua_state.stack_mut()[func_idx];
-
-    // Extract CFunction pointer (light C function or CClosure).
-    // RClosure has no raw fn ptr — handled via trait object.
-    let c_func: Option<CFunction> = if let Some(f) = func.as_cfunction() {
-        Some(f)
-    } else {
-        func.as_cclosure().map(|cc| cc.func())
-    };
+    let func = unsafe { *lua_state.stack().get_unchecked(func_idx) };
 
     let call_base = func_idx + 1;
 
@@ -217,8 +209,10 @@ pub fn call_c_function(
 
     // Call the function — `?` propagates errors including Yield
     // (on Yield the frame stays on the stack for resume)
-    let n = if let Some(c_func) = c_func {
+    let n = if let Some(c_func) = func.as_cfunction() {
         c_func(lua_state)?
+    } else if let Some(cc) = func.as_cclosure() {
+        cc.func()(lua_state)?
     } else {
         func.as_rclosure().unwrap().call(lua_state)?
     };
@@ -234,34 +228,52 @@ pub fn call_c_function(
     // Pop frame
     lua_state.pop_c_frame();
 
-    // Move results + restore caller top. Top-level host calls can invoke a
-    // C function without any enclosing Lua frame, so after popping the C frame
-    // call_depth may be zero here.
+    // Move results + restore caller top. Copy only `value` and `tt` via StkId
+    // instead of whole-struct `LuaValue` assignment so LLVM never emits
+    // unaligned padding stores that stall store-to-load forwarding.
+    // Top-level host calls can invoke a C function without any enclosing Lua
+    // frame, so after popping the C frame call_depth may be zero here.
     {
         let stack = lua_state.stack_mut();
+        let sp = stack.as_mut_ptr();
+        let dst = StkId::from_stack(sp, func_idx);
         match nresults {
             0 => { /* nothing to move */ }
             1 => {
-                stack[func_idx] = if n > 0 {
-                    stack[first_result]
+                if n > 0 {
+                    dst.set(StkId::from_stack(sp, first_result));
                 } else {
-                    LuaValue::nil()
-                };
+                    dst.set_nil();
+                }
             }
             _ if nresults > 0 => {
                 let wanted = nresults as usize;
                 let copy_count = n.min(wanted);
                 if copy_count != 0 && func_idx != first_result {
-                    stack.copy_within(first_result..first_result + copy_count, func_idx);
+                    if copy_count <= 4 {
+                        let src = StkId::from_stack(sp, first_result);
+                        for i in 0..copy_count {
+                            dst.offset(i).set(src.offset(i));
+                        }
+                    } else {
+                        stack.copy_within(first_result..first_result + copy_count, func_idx);
+                    }
                 }
                 for i in copy_count..wanted {
-                    stack[func_idx + i] = LuaValue::nil();
+                    dst.offset(i).set_nil();
                 }
             }
             _ => {
                 // MULTRET (-1)
                 if n != 0 && func_idx != first_result {
-                    stack.copy_within(first_result..first_result + n, func_idx);
+                    if n <= 4 {
+                        let src = StkId::from_stack(sp, first_result);
+                        for i in 0..n {
+                            dst.offset(i).set(src.offset(i));
+                        }
+                    } else {
+                        stack.copy_within(first_result..first_result + n, func_idx);
+                    }
                 }
             }
         }
@@ -278,8 +290,10 @@ pub fn call_c_function(
         return Ok(());
     }
 
-    let caller_ci = unsafe { &mut *lua_state.current_ci_ptr() };
-    let frame_top = caller_ci.top as usize;
+    // Access caller frame via raw pointer to avoid creating an `&mut CallInfo`
+    // that aliases `lua_execute`'s live `ci` reference.
+    let caller_ci_ptr = lua_state.current_ci_ptr();
+    let frame_top = unsafe { (*caller_ci_ptr).top as usize };
     if nresults >= 0 {
         // Fixed results: restore caller's frame top
         lua_state.set_top_raw(frame_top);
@@ -287,7 +301,9 @@ pub fn call_c_function(
         // MULTRET: top = func_idx + n
         let new_top = func_idx + n;
         if frame_top < new_top {
-            caller_ci.top = new_top as u32;
+            unsafe {
+                (*caller_ci_ptr).top = new_top as u32;
+            }
         }
         lua_state.set_top_raw(new_top);
     }
@@ -684,12 +700,13 @@ fn moveresults(lua_state: &mut LuaState, res: usize, nres: usize, wanted: i32) {
         }
         1 => {
             // One value needed (most common case)
-            let first_result = top - nres;
-            lua_state.stack_mut()[res] = if nres == 0 {
-                LuaValue::nil()
+            let sp = lua_state.stack_mut().as_mut_ptr();
+            let dst = StkId::from_stack(sp, res);
+            if nres == 0 {
+                dst.set_nil();
             } else {
-                lua_state.stack()[first_result]
-            };
+                dst.set(StkId::from_stack(sp, top - nres));
+            }
             lua_state.set_top_raw(res + 1);
         }
         -1 => {
@@ -717,11 +734,20 @@ fn genmoveresults(
 ) {
     let copy_count = nres.min(wanted);
     let stack = lua_state.stack_mut();
+    let sp = stack.as_mut_ptr();
+    let dst = StkId::from_stack(sp, res);
     if copy_count != 0 && res != first_result {
-        stack.copy_within(first_result..first_result + copy_count, res);
+        if copy_count <= 4 {
+            let src = StkId::from_stack(sp, first_result);
+            for i in 0..copy_count {
+                dst.offset(i).set(src.offset(i));
+            }
+        } else {
+            stack.copy_within(first_result..first_result + copy_count, res);
+        }
     }
     for i in copy_count..wanted {
-        stack[res + i] = LuaValue::nil();
+        dst.offset(i).set_nil();
     }
     lua_state.set_top_raw(res + wanted);
 }

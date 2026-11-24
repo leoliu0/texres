@@ -1105,9 +1105,14 @@ impl GC {
 
         // l_mem work2do = applygcparam(g, STEPMUL, bytes_to_pay / cast_int(sizeof(void*)));
         let ptr_size = std::mem::size_of::<*const ()>() as isize;
-        let mut work2do = self.apply_param(STEPMUL, bytes_to_pay / ptr_size);
-        // int fast = (work2do == 0);
-        let fast = work2do == 0;
+        let fast = self.gc_params[STEPMUL] == 0;
+        let total_work = if fast {
+            0
+        } else {
+            self.apply_param(STEPMUL, (bytes_to_pay / ptr_size).max(1))
+        };
+        let mut work2do = total_work;
+        let mut atomic_break = false;
 
         // Repeat until enough work is done (like Lua 5.5's do-while loop)
         loop {
@@ -1125,6 +1130,7 @@ impl GC {
                 StepResult::AtomicStep => {
                     // Atomic step completed (atomicstep in Lua)
                     if !fast {
+                        atomic_break = true;
                         break;
                     }
                     // In fast mode, continue
@@ -1145,6 +1151,15 @@ impl GC {
 
         if self.gc_state == GcState::Pause {
             self.set_pause();
+            l.global_state_mut().object_allocator.trim_after_full_gc();
+            self.trim_after_full_gc();
+        } else if atomic_break && work2do > 0 && overdue > 0 && total_work > 0 {
+            // Preserve unpaid overdue debt across AtomicStep so a large burst
+            // allocation sweeps promptly on the next allocation instead of
+            // forgiving its deficit.
+            let unpaid_overdue =
+                ((overdue as i128 * work2do as i128) / total_work as i128) as isize;
+            self.set_debt(stepsize.saturating_sub(unpaid_overdue));
         } else {
             // Lua 5.5: luaE_setdebt(g, stepsize);
             // Set positive debt = buffer before next GC
@@ -1682,12 +1697,45 @@ impl GC {
         }
     }
 
-    fn mark_value(&mut self, l: &mut LuaState, value: &LuaValue) {
-        let Some(gc_ptr) = value.as_gc_ptr() else {
+    #[inline(always)]
+    fn mark_raw_gc(&mut self, l: &mut LuaState, ptr: *const u8, tt: u8) {
+        // SAFETY: every collectable LuaValue points to a #[repr(C)] Gc<T>
+        // whose first field is GcHeader.
+        let header = unsafe { &*(ptr as *const GcHeader) };
+        if !header.is_white() {
             return;
-        };
+        }
+        // Leaf string fast path: mark black directly without constructing GcObjectPtr.
+        if (tt & 0x0F) == crate::lua_value::LUA_TSTRING {
+            self.gc_marked += header.size() as isize;
+            header.make_black();
+            return;
+        }
+        self.really_mark_raw_non_string(l, ptr, tt);
+    }
 
-        self.mark_object(l, gc_ptr);
+    #[cold]
+    #[inline(never)]
+    fn really_mark_raw_non_string(&mut self, l: &mut LuaState, ptr: *const u8, tt: u8) {
+        let tag = match tt {
+            crate::lua_value::LUA_VTABLE => GcObjectPtr::TAG_TABLE,
+            crate::lua_value::LUA_VFUNCTION => GcObjectPtr::TAG_FUNCTION,
+            crate::lua_value::LUA_CCLOSURE => GcObjectPtr::TAG_CCLOSURE,
+            crate::lua_value::LUA_VRCLOSURE => GcObjectPtr::TAG_RCLOSURE,
+            crate::lua_value::LUA_VTHREAD => GcObjectPtr::TAG_THREAD,
+            crate::lua_value::LUA_VUSERDATA => GcObjectPtr::TAG_USERDATA,
+            _ => return,
+        };
+        let gc_ptr = GcObjectPtr::new_tagged(ptr as u64, tag);
+        self.really_mark_object(l, gc_ptr);
+    }
+
+    #[inline(always)]
+    fn mark_value(&mut self, l: &mut LuaState, value: &LuaValue) {
+        if (value.tt & crate::lua_value::BIT_ISCOLLECTABLE) == 0 {
+            return;
+        }
+        self.mark_raw_gc(l, unsafe { value.value.ptr }, value.tt);
     }
 
     fn traverse_proto(&mut self, l: &mut LuaState, proto_ptr: ProtoPtr) -> usize {
@@ -1696,9 +1744,7 @@ impl GC {
 
         let chunk = &gc_proto.data;
         for constant in &chunk.constants {
-            if let Some(gc_ptr) = constant.as_gc_ptr() {
-                self.mark_object(l, gc_ptr);
-            }
+            self.mark_value(l, constant);
         }
 
         for child_proto in &chunk.child_protos {
@@ -1733,16 +1779,8 @@ impl GC {
         let gc_table = table_ptr.as_mut_ref();
         let table = &gc_table.data;
 
-        // Use for_each_entry() to iterate all entries (both array and hash parts)
-        // This avoids both allocating Vec (iter_all) and repeated lookups (next)
-        // Port of Lua 5.5's direct pointer iteration: `for (n = gnode(h, 0); n < limit; n++)`
-        table.for_each_entry(|k, v| {
-            if let Some(k_ptr) = k.as_gc_ptr() {
-                self.mark_object(l, k_ptr);
-            }
-            if let Some(v_ptr) = v.as_gc_ptr() {
-                self.mark_object(l, v_ptr);
-            }
+        table.for_each_gc_child(|ptr, tt| {
+            self.mark_raw_gc(l, ptr, tt);
         });
 
         self.gen_link(table_ptr.into());
@@ -1969,8 +2007,8 @@ impl GC {
             }
         }
 
-        // Estimate work done: 1 + total entries (array + hash)
-        1 + gc_table.data.len() + gc_table.data.hash_size()
+        // Estimate work done: 1 + array slots + hash slots (matches C Lua's `1 + h->asize + sizenode(h)`).
+        1 + gc_table.data.array_size() + gc_table.data.hash_size()
     }
 
     fn traverse_function(&mut self, l: &mut LuaState, func_ptr: FunctionPtr) -> usize {
@@ -2579,38 +2617,26 @@ impl GC {
             SweepGc::AllGc(index) => {
                 // Phase 1: Sweep allgc (G_NEW objects)
                 while *index < self.allgc.len() && sweep_count > 0 {
-                    let gc_ptr = self.allgc.get(*index).unwrap().as_gc_ptr();
+                    let owner = self.allgc.get_owner(*index);
+                    let gc_ptr = owner.as_gc_ptr();
+                    let header = owner.header();
 
-                    if let Some(header) = gc_ptr.header() {
-                        // 检查是否是死对象（other white）
-                        if header.is_dead(other_white) {
-                            // BUG FIX: Check FINALIZEDBIT - objects with finalizers must
-                            // go to tobefnz, not be freed, to avoid dangling finobj pointers
-                            if header.to_finalize() {
-                                self.tobefnz.push_back(gc_ptr);
-                                if let Some(header_mut) = gc_ptr.header_mut() {
-                                    header_mut.make_white(self.current_white);
-                                    header_mut.set_age(G_NEW);
-                                }
-                                *index += 1;
-                            } else {
-                                if gc_ptr.is_string() {
-                                    Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
-                                }
-
-                                let obj = self.allgc.remove(gc_ptr);
-                                self.total_bytes -= obj.size() as isize;
-                                Self::release_object(obj);
-                            }
-                        } else {
-                            // 存活对象：重置为当前白色 + G_NEW
-                            if let Some(header_mut) = gc_ptr.header_mut() {
-                                header_mut.make_white(self.current_white);
-                                header_mut.set_age(G_NEW);
-                            }
+                    if header.is_dead(other_white) {
+                        if header.to_finalize() {
+                            self.tobefnz.push_back(gc_ptr);
+                            header.reset_to_new_white(self.current_white);
                             *index += 1;
+                        } else {
+                            if gc_ptr.is_string() {
+                                Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
+                            }
+
+                            let obj = self.allgc.remove_at(*index);
+                            self.total_bytes -= obj.size() as isize;
+                            Self::release_object(obj);
                         }
                     } else {
+                        header.reset_to_new_white(self.current_white);
                         *index += 1;
                     }
 
@@ -2626,36 +2652,26 @@ impl GC {
             SweepGc::Survival(index) => {
                 // Phase 2: Sweep survival list (G_SURVIVAL objects)
                 while *index < self.survival.len() && sweep_count > 0 {
-                    let gc_ptr = self.survival.get(*index).unwrap().as_gc_ptr();
+                    let owner = self.survival.get_owner(*index);
+                    let gc_ptr = owner.as_gc_ptr();
+                    let header = owner.header();
 
-                    if let Some(header) = gc_ptr.header() {
-                        if header.is_dead(other_white) {
-                            // BUG FIX: Check FINALIZEDBIT (same as AllGc phase)
-                            if header.to_finalize() {
-                                self.tobefnz.push_back(gc_ptr);
-                                if let Some(header_mut) = gc_ptr.header_mut() {
-                                    header_mut.make_white(self.current_white);
-                                    header_mut.set_age(G_NEW);
-                                }
-                                *index += 1;
-                            } else {
-                                if gc_ptr.is_string() {
-                                    Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
-                                }
-
-                                let obj = self.survival.remove(gc_ptr);
-                                self.total_bytes -= obj.size() as isize;
-                                Self::release_object(obj);
-                            }
-                        } else {
-                            // 存活对象：重置为当前白色 + G_NEW，移回 allgc
-                            if let Some(header_mut) = gc_ptr.header_mut() {
-                                header_mut.make_white(self.current_white);
-                                header_mut.set_age(G_NEW);
-                            }
+                    if header.is_dead(other_white) {
+                        if header.to_finalize() {
+                            self.tobefnz.push_back(gc_ptr);
+                            header.reset_to_new_white(self.current_white);
                             *index += 1;
+                        } else {
+                            if gc_ptr.is_string() {
+                                Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
+                            }
+
+                            let obj = self.survival.remove_at(*index);
+                            self.total_bytes -= obj.size() as isize;
+                            Self::release_object(obj);
                         }
                     } else {
+                        header.reset_to_new_white(self.current_white);
                         *index += 1;
                     }
 
@@ -2671,36 +2687,26 @@ impl GC {
             SweepGc::Old(index) => {
                 // Phase 3: Sweep old list (G_OLD1, G_OLD, G_TOUCHED* objects)
                 while *index < self.old.len() && sweep_count > 0 {
-                    let gc_ptr = self.old.get(*index).unwrap().as_gc_ptr();
+                    let owner = self.old.get_owner(*index);
+                    let gc_ptr = owner.as_gc_ptr();
+                    let header = owner.header();
 
-                    if let Some(header) = gc_ptr.header() {
-                        if header.is_dead(other_white) {
-                            // BUG FIX: Check FINALIZEDBIT (same as AllGc phase)
-                            if header.to_finalize() {
-                                self.tobefnz.push_back(gc_ptr);
-                                if let Some(header_mut) = gc_ptr.header_mut() {
-                                    header_mut.make_white(self.current_white);
-                                    header_mut.set_age(G_NEW);
-                                }
-                                *index += 1;
-                            } else {
-                                if gc_ptr.is_string() {
-                                    Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
-                                }
-
-                                let obj = self.old.remove(gc_ptr);
-                                self.total_bytes -= obj.size() as isize;
-                                Self::release_object(obj);
-                            }
-                        } else {
-                            // 存活对象：重置为当前白色 + G_NEW，移回 allgc
-                            if let Some(header_mut) = gc_ptr.header_mut() {
-                                header_mut.make_white(self.current_white);
-                                header_mut.set_age(G_NEW);
-                            }
+                    if header.is_dead(other_white) {
+                        if header.to_finalize() {
+                            self.tobefnz.push_back(gc_ptr);
+                            header.reset_to_new_white(self.current_white);
                             *index += 1;
+                        } else {
+                            if gc_ptr.is_string() {
+                                Self::remove_dead_string_from_intern(l, gc_ptr.as_string_ptr());
+                            }
+
+                            let obj = self.old.remove_at(*index);
+                            self.total_bytes -= obj.size() as isize;
+                            Self::release_object(obj);
                         }
                     } else {
+                        header.reset_to_new_white(self.current_white);
                         *index += 1;
                     }
 

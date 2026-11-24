@@ -105,6 +105,7 @@ impl<'a> Reader<'a> {
         })
     }
 
+    #[inline(always)]
     fn bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
         let end = self
             .at
@@ -118,8 +119,19 @@ impl<'a> Reader<'a> {
         Ok(result)
     }
 
+    #[inline(always)]
     fn byte(&mut self) -> Result<u8, String> {
-        Ok(self.bytes(1)?[0])
+        if self.at >= self.data.len() {
+            return Err("truncated Lua 5.3 binary chunk".to_string());
+        }
+        let b = self.data[self.at];
+        self.at += 1;
+        Ok(b)
+    }
+
+    #[inline(always)]
+    fn is_little(&self) -> bool {
+        matches!(self.endian, Endian::Little)
     }
 
     fn unsigned_width(&mut self, width: usize) -> Result<u64, String> {
@@ -150,11 +162,17 @@ impl<'a> Reader<'a> {
         }
     }
 
+    #[inline]
     fn int(&mut self) -> Result<i32, String> {
+        if self.is_little() && self.int_size == 4 {
+            let b = self.bytes(4)?;
+            return Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
         let value = self.signed_width(self.int_size)?;
         i32::try_from(value).map_err(|_| "Lua 5.3 int is out of range".to_string())
     }
 
+    #[inline]
     fn count(&mut self, what: &str) -> Result<usize, String> {
         let value = self.int()?;
         if value < 0 {
@@ -167,15 +185,67 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    #[inline]
     fn uint32(&mut self) -> Result<u32, String> {
+        if self.is_little() && self.instruction_size == 4 {
+            let b = self.bytes(4)?;
+            return Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
         let value = self.unsigned_width(self.instruction_size)?;
         u32::try_from(value).map_err(|_| "Lua 5.3 instruction is wider than 32 bits".to_string())
     }
 
+    fn read_raw_code(&mut self, count: usize) -> Result<Vec<u32>, String> {
+        if self.is_little() && self.instruction_size == 4 {
+            let byte_len = count
+                .checked_mul(4)
+                .ok_or_else(|| "Lua 5.3 chunk offset overflow".to_string())?;
+            let slice = self.bytes(byte_len)?;
+            let mut out = Vec::with_capacity(count);
+            for chunk in slice.chunks_exact(4) {
+                out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.uint32()?);
+        }
+        Ok(out)
+    }
+
+    fn read_old_lines(&mut self, count: usize) -> Result<Vec<u32>, String> {
+        if self.is_little() && self.int_size == 4 {
+            let byte_len = count
+                .checked_mul(4)
+                .ok_or_else(|| "Lua 5.3 chunk offset overflow".to_string())?;
+            let slice = self.bytes(byte_len)?;
+            let mut out = Vec::with_capacity(count);
+            for chunk in slice.chunks_exact(4) {
+                let v = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                out.push(v.max(0) as u32);
+            }
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.int()?.max(0) as u32);
+        }
+        Ok(out)
+    }
+
+    #[inline]
     fn lua_integer(&mut self) -> Result<i64, String> {
+        if self.is_little() && self.integer_size == 8 {
+            let b = self.bytes(8)?;
+            return Ok(i64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]));
+        }
         self.signed_width(self.integer_size)
     }
 
+    #[inline]
     fn lua_number(&mut self) -> Result<f64, String> {
         if self.number_size != 8 {
             return Err(format!(
@@ -183,17 +253,31 @@ impl<'a> Reader<'a> {
                 self.number_size
             ));
         }
+        if self.is_little() {
+            let b = self.bytes(8)?;
+            return Ok(f64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]));
+        }
         let bits = self.unsigned_width(8)?;
         Ok(f64::from_bits(bits))
     }
 
+    #[inline]
     fn size_t(&mut self) -> Result<usize, String> {
+        if self.is_little() && self.size_t_size == 8 {
+            let b = self.bytes(8)?;
+            let v = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            return usize::try_from(v)
+                .map_err(|_| "Lua 5.3 size_t is out of range".to_string());
+        }
         let width = self.size_t_size;
         usize::try_from(self.unsigned_width(width)?)
             .map_err(|_| "Lua 5.3 size_t is out of range".to_string())
     }
 
-    fn string(&mut self) -> Result<Option<Vec<u8>>, String> {
+    #[inline]
+    fn string_slice(&mut self) -> Result<Option<&'a [u8]>, String> {
         let marker = self.byte()?;
         if marker == 0 {
             return Ok(None);
@@ -209,7 +293,7 @@ impl<'a> Reader<'a> {
         if len > MAX_STRING_BYTES {
             return Err("Lua 5.3 string exceeds the 64 MiB safety limit".to_string());
         }
-        Ok(Some(self.bytes(len)?.to_vec()))
+        Ok(Some(self.bytes(len)?))
     }
 }
 
@@ -578,15 +662,28 @@ fn arithmetic53(op: u8) -> Option<(OpCode, TmKind)> {
     })
 }
 
+#[inline]
+fn small_int_imm(k: &LuaValue) -> Option<u32> {
+    if k.is_integer() {
+        let iv = k.ivalue();
+        if (-127..=128).contains(&iv) {
+            return Some((iv as i32 + Instruction::OFFSET_SB) as u32);
+        }
+    }
+    None
+}
+
 fn translate_code53(
     raw: &[u32],
-    constants_len: usize,
+    constants: &[LuaValue],
     upvalue_count: usize,
     child_count: usize,
+    has_local_captures: bool,
     old_lines: &[u32],
     old_max_stack: u8,
     is_vararg: bool,
 ) -> Result<(Vec<Instruction>, Vec<u32>, Vec<usize>, u8), String> {
+    let constants_len = constants.len();
     validate_code53(
         raw,
         constants_len,
@@ -607,20 +704,20 @@ fn translate_code53(
     }
 
     for (pc, &instruction) in raw.iter().enumerate() {
-        map[pc] = code.len();
+        let start = code.len();
+        map[pc] = start;
         let line = old_lines.get(pc).copied().unwrap_or(0);
         let op = op53(instruction);
         let a = a53(instruction);
         let b = b53(instruction);
         let c = c53(instruction);
-        let mut emitted = Vec::new();
 
         match op {
-            OP_MOVE => emitted.push(Instruction::create_abck(OpCode::Move, a, b, 0, false)),
-            OP_LOADK => emit_loadk(&mut emitted, a, bx53(instruction))?,
-            OP_LOADKX => emitted.push(Instruction::create_abx(OpCode::LoadKX, a, 0)),
+            OP_MOVE => code.push(Instruction::create_abck(OpCode::Move, a, b, 0, false)),
+            OP_LOADK => emit_loadk(&mut code, a, bx53(instruction))?,
+            OP_LOADKX => code.push(Instruction::create_abx(OpCode::LoadKX, a, 0)),
             OP_LOADBOOL => {
-                emitted.push(Instruction::create_abck(
+                code.push(Instruction::create_abck(
                     if b == 0 {
                         OpCode::LoadFalse
                     } else {
@@ -632,8 +729,8 @@ fn translate_code53(
                     false,
                 ));
                 if c != 0 {
-                    let at = code.len() + emitted.len();
-                    emitted.push(Instruction::create_sj(OpCode::Jmp, 0));
+                    let at = code.len();
+                    code.push(Instruction::create_sj(OpCode::Jmp, 0));
                     patches.push(Patch {
                         instruction: at,
                         target_old: pc as isize + 2,
@@ -641,12 +738,15 @@ fn translate_code53(
                     });
                 }
             }
-            OP_LOADNIL => emitted.push(Instruction::create_abck(OpCode::LoadNil, a, b, 0, false)),
-            OP_GETUPVAL => emitted.push(Instruction::create_abck(OpCode::GetUpval, a, b, 0, false)),
-            OP_SETUPVAL => emitted.push(Instruction::create_abck(OpCode::SetUpval, a, b, 0, false)),
+            OP_LOADNIL => code.push(Instruction::create_abck(OpCode::LoadNil, a, b, 0, false)),
+            OP_GETUPVAL => code.push(Instruction::create_abck(OpCode::GetUpval, a, b, 0, false)),
+            OP_SETUPVAL => code.push(Instruction::create_abck(OpCode::SetUpval, a, b, 0, false)),
             OP_GETTABUP => {
-                if c & BITRK != 0 && (c & !BITRK) <= u8::MAX as u32 {
-                    emitted.push(Instruction::create_abck(
+                if c & BITRK != 0
+                    && (c & !BITRK) <= u8::MAX as u32
+                    && constants[(c & !BITRK) as usize].is_short_string()
+                {
+                    code.push(Instruction::create_abck(
                         OpCode::GetTabUp,
                         a,
                         b,
@@ -654,15 +754,15 @@ fn translate_code53(
                         false,
                     ));
                 } else {
-                    let key = load_rk(&mut emitted, constants_len, c, scratch)?;
-                    emitted.push(Instruction::create_abck(
+                    let key = load_rk(&mut code, constants_len, c, scratch)?;
+                    code.push(Instruction::create_abck(
                         OpCode::GetUpval,
                         scratch + 1,
                         b,
                         0,
                         false,
                     ));
-                    emitted.push(Instruction::create_abck(
+                    code.push(Instruction::create_abck(
                         OpCode::GetTable,
                         a,
                         scratch + 1,
@@ -673,37 +773,60 @@ fn translate_code53(
                 }
             }
             OP_GETTABLE => {
-                let key = load_rk(&mut emitted, constants_len, c, scratch)?;
-                max_stack = max_stack.max(scratch + 1);
-                emitted.push(Instruction::create_abck(OpCode::GetTable, a, b, key, false));
+                if c & BITRK != 0 {
+                    let idx = c & !BITRK;
+                    let kval = &constants[idx as usize];
+                    if idx <= u8::MAX as u32 && kval.is_short_string() {
+                        code.push(Instruction::create_abck(OpCode::GetField, a, b, idx, false));
+                    } else if kval.is_integer() && (0..=255).contains(&kval.ivalue()) {
+                        code.push(Instruction::create_abck(
+                            OpCode::GetI,
+                            a,
+                            b,
+                            kval.ivalue() as u32,
+                            false,
+                        ));
+                    } else {
+                        let key = load_rk(&mut code, constants_len, c, scratch)?;
+                        max_stack = max_stack.max(scratch + 1);
+                        code.push(Instruction::create_abck(OpCode::GetTable, a, b, key, false));
+                    }
+                } else {
+                    code.push(Instruction::create_abck(OpCode::GetTable, a, b, c, false));
+                }
             }
             OP_SETTABUP => {
-                if b & BITRK != 0 && (b & !BITRK) <= u8::MAX as u32 {
+                if b & BITRK != 0
+                    && (b & !BITRK) <= u8::MAX as u32
+                    && constants[(b & !BITRK) as usize].is_short_string()
+                {
                     let constant_value = c & BITRK != 0 && (c & !BITRK) <= u8::MAX as u32;
                     let value = if constant_value {
                         c & !BITRK
                     } else {
-                        load_rk(&mut emitted, constants_len, c, scratch)?
+                        if c & BITRK != 0 {
+                            max_stack = max_stack.max(scratch + 1);
+                        }
+                        load_rk(&mut code, constants_len, c, scratch)?
                     };
-                    emitted.push(Instruction::create_abck(
+                    code.push(Instruction::create_abck(
                         OpCode::SetTabUp,
                         a,
                         b & !BITRK,
                         value,
                         constant_value,
                     ));
-                    max_stack = max_stack.max(scratch + 1);
                 } else {
-                    let key = load_rk(&mut emitted, constants_len, b, scratch)?;
-                    let value = load_rk(&mut emitted, constants_len, c, scratch + 1)?;
-                    emitted.push(Instruction::create_abck(
+                    let key = load_rk(&mut code, constants_len, b, scratch)?;
+                    let value = load_rk(&mut code, constants_len, c, scratch + 1)?;
+                    code.push(Instruction::create_abck(
                         OpCode::GetUpval,
                         scratch + 2,
                         a,
                         0,
                         false,
                     ));
-                    emitted.push(Instruction::create_abck(
+                    code.push(Instruction::create_abck(
                         OpCode::SetTable,
                         scratch + 2,
                         key,
@@ -714,16 +837,79 @@ fn translate_code53(
                 }
             }
             OP_SETTABLE => {
-                let key = load_rk(&mut emitted, constants_len, b, scratch)?;
-                let value = load_rk(&mut emitted, constants_len, c, scratch + 1)?;
-                max_stack = max_stack.max(scratch + 2);
-                emitted.push(Instruction::create_abck(
-                    OpCode::SetTable,
-                    a,
-                    key,
-                    value,
-                    false,
-                ));
+                let val_is_k = c & BITRK != 0 && (c & !BITRK) <= u8::MAX as u32;
+                if b & BITRK != 0 {
+                    let idx = b & !BITRK;
+                    let kval = &constants[idx as usize];
+                    if idx <= u8::MAX as u32 && kval.is_short_string() {
+                        let val_arg = if val_is_k {
+                            c & !BITRK
+                        } else if c & BITRK != 0 {
+                            max_stack = max_stack.max(scratch + 1);
+                            load_rk(&mut code, constants_len, c, scratch)?
+                        } else {
+                            c
+                        };
+                        code.push(Instruction::create_abck(
+                            OpCode::SetField,
+                            a,
+                            idx,
+                            val_arg,
+                            val_is_k,
+                        ));
+                    } else if kval.is_integer() && (0..=255).contains(&kval.ivalue()) {
+                        let val_arg = if val_is_k {
+                            c & !BITRK
+                        } else if c & BITRK != 0 {
+                            max_stack = max_stack.max(scratch + 1);
+                            load_rk(&mut code, constants_len, c, scratch)?
+                        } else {
+                            c
+                        };
+                        code.push(Instruction::create_abck(
+                            OpCode::SetI,
+                            a,
+                            kval.ivalue() as u32,
+                            val_arg,
+                            val_is_k,
+                        ));
+                    } else {
+                        let key = load_rk(&mut code, constants_len, b, scratch)?;
+                        let val_arg = if val_is_k {
+                            max_stack = max_stack.max(scratch + 1);
+                            c & !BITRK
+                        } else if c & BITRK != 0 {
+                            max_stack = max_stack.max(scratch + 2);
+                            load_rk(&mut code, constants_len, c, scratch + 1)?
+                        } else {
+                            max_stack = max_stack.max(scratch + 1);
+                            c
+                        };
+                        code.push(Instruction::create_abck(
+                            OpCode::SetTable,
+                            a,
+                            key,
+                            val_arg,
+                            val_is_k,
+                        ));
+                    }
+                } else {
+                    let val_arg = if val_is_k {
+                        c & !BITRK
+                    } else if c & BITRK != 0 {
+                        max_stack = max_stack.max(scratch + 1);
+                        load_rk(&mut code, constants_len, c, scratch)?
+                    } else {
+                        c
+                    };
+                    code.push(Instruction::create_abck(
+                        OpCode::SetTable,
+                        a,
+                        b,
+                        val_arg,
+                        val_is_k,
+                    ));
+                }
             }
             OP_NEWTABLE => {
                 let array_size = fb2int(b);
@@ -735,7 +921,7 @@ fn translate_code53(
                 };
                 let low = array_size & 0x3ff;
                 let extra = array_size >> 10;
-                emitted.push(Instruction::create_vabck(
+                code.push(Instruction::create_vabck(
                     OpCode::NewTable,
                     a,
                     hash_bits,
@@ -744,20 +930,28 @@ fn translate_code53(
                 ));
                 // The native VM reserves the following instruction for the
                 // extended array-size payload even when the low field suffices.
-                emitted.push(Instruction::create_ax(OpCode::ExtraArg, extra));
+                code.push(Instruction::create_ax(OpCode::ExtraArg, extra));
             }
             OP_SELF => {
-                if c & BITRK != 0 {
-                    emitted.push(Instruction::create_abck(
+                if c & BITRK != 0
+                    && (c & !BITRK) <= u8::MAX as u32
+                    && constants[(c & !BITRK) as usize].is_short_string()
+                {
+                    code.push(Instruction::create_abck(
                         OpCode::Self_,
                         a,
                         b,
                         c & !BITRK,
                         false,
                     ));
+                } else if c & BITRK != 0 {
+                    let key = load_rk(&mut code, constants_len, c, scratch)?;
+                    max_stack = max_stack.max(scratch + 1);
+                    code.push(Instruction::create_abck(OpCode::Move, a + 1, b, 0, false));
+                    code.push(Instruction::create_abck(OpCode::GetTable, a, b, key, false));
                 } else {
-                    emitted.push(Instruction::create_abck(OpCode::Move, a + 1, b, 0, false));
-                    emitted.push(Instruction::create_abck(OpCode::GetTable, a, b, c, false));
+                    code.push(Instruction::create_abck(OpCode::Move, a + 1, b, 0, false));
+                    code.push(Instruction::create_abck(OpCode::GetTable, a, b, c, false));
                 }
             }
             OP_UNM | OP_BNOT | OP_NOT | OP_LEN => {
@@ -767,7 +961,7 @@ fn translate_code53(
                     OP_NOT => OpCode::Not,
                     _ => OpCode::Len,
                 };
-                emitted.push(Instruction::create_abck(native, a, b, 0, false));
+                code.push(Instruction::create_abck(native, a, b, 0, false));
             }
             OP_CONCAT => {
                 if c < b {
@@ -777,46 +971,123 @@ fn translate_code53(
                 if count > 255 {
                     return Err("Lua 5.3 CONCAT has too many operands".to_string());
                 }
-                for offset in 0..count {
-                    emitted.push(Instruction::create_abck(
-                        OpCode::Move,
-                        scratch + offset,
-                        b + offset,
+                if a == b {
+                    code.push(Instruction::create_abck(OpCode::Concat, a, count, 0, false));
+                } else {
+                    for offset in 0..count {
+                        code.push(Instruction::create_abck(
+                            OpCode::Move,
+                            scratch + offset,
+                            b + offset,
+                            0,
+                            false,
+                        ));
+                    }
+                    max_stack = max_stack.max(scratch + count);
+                    code.push(Instruction::create_abck(
+                        OpCode::Concat,
+                        scratch,
+                        count,
                         0,
                         false,
                     ));
+                    code.push(Instruction::create_abck(OpCode::Move, a, scratch, 0, false));
                 }
-                max_stack = max_stack.max(scratch + count);
-                emitted.push(Instruction::create_abck(OpCode::Concat, a, count, 0, false));
             }
             OP_JMP => {
                 if a != 0 {
-                    emitted.push(Instruction::create_abck(OpCode::Close, a - 1, 0, 0, false));
+                    code.push(Instruction::create_abck(OpCode::Close, a - 1, 0, 0, false));
                 }
-                let at = code.len() + emitted.len();
-                emitted.push(Instruction::create_sj(OpCode::Jmp, 0));
+                let at = code.len();
+                code.push(Instruction::create_sj(OpCode::Jmp, 0));
                 patches.push(Patch {
                     instruction: at,
                     target_old: pc as isize + 1 + sbx53(instruction) as isize,
                     kind: PatchKind::Jump,
                 });
             }
-            OP_EQ | OP_LT | OP_LE => {
-                let left = load_rk(&mut emitted, constants_len, b, scratch)?;
-                let right = load_rk(&mut emitted, constants_len, c, scratch + 1)?;
-                max_stack = max_stack.max(scratch + 2);
-                let native = match op {
-                    OP_EQ => OpCode::Eq,
-                    OP_LT => OpCode::Lt,
-                    _ => OpCode::Le,
-                };
-                emitted.push(Instruction::create_abck(native, left, right, 0, a != 0));
+            OP_EQ => {
+                let k = a != 0;
+                if b & BITRK == 0 && c & BITRK != 0 {
+                    let idx = c & !BITRK;
+                    if let Some(sb) = small_int_imm(&constants[idx as usize]) {
+                        code.push(Instruction::create_abck(OpCode::EqI, b, sb, 0, k));
+                    } else if idx <= u8::MAX as u32 {
+                        code.push(Instruction::create_abck(OpCode::EqK, b, idx, 0, k));
+                    } else {
+                        let right = load_rk(&mut code, constants_len, c, scratch)?;
+                        max_stack = max_stack.max(scratch + 1);
+                        code.push(Instruction::create_abck(OpCode::Eq, b, right, 0, k));
+                    }
+                } else if b & BITRK != 0 && c & BITRK == 0 {
+                    let idx = b & !BITRK;
+                    if let Some(sb) = small_int_imm(&constants[idx as usize]) {
+                        code.push(Instruction::create_abck(OpCode::EqI, c, sb, 0, k));
+                    } else if idx <= u8::MAX as u32 {
+                        code.push(Instruction::create_abck(OpCode::EqK, c, idx, 0, k));
+                    } else {
+                        let left = load_rk(&mut code, constants_len, b, scratch)?;
+                        max_stack = max_stack.max(scratch + 1);
+                        code.push(Instruction::create_abck(OpCode::Eq, left, c, 0, k));
+                    }
+                } else {
+                    let left = load_rk(&mut code, constants_len, b, scratch)?;
+                    let right = load_rk(&mut code, constants_len, c, scratch + 1)?;
+                    if b & BITRK != 0 || c & BITRK != 0 {
+                        max_stack = max_stack.max(scratch + 2);
+                    }
+                    code.push(Instruction::create_abck(OpCode::Eq, left, right, 0, k));
+                }
             }
-            OP_TEST => emitted.push(Instruction::create_abck(OpCode::Test, a, 0, 0, c != 0)),
-            OP_TESTSET => emitted.push(Instruction::create_abck(OpCode::TestSet, a, b, 0, c != 0)),
-            OP_CALL => emitted.push(Instruction::create_abck(OpCode::Call, a, b, c, false)),
-            OP_TAILCALL => emitted.push(Instruction::create_abck(OpCode::TailCall, a, b, c, true)),
-            OP_RETURN => emitted.push(Instruction::create_abck(OpCode::Return, a, b, 0, true)),
+            OP_LT | OP_LE => {
+                let k = a != 0;
+                if b & BITRK == 0
+                    && c & BITRK != 0
+                    && let Some(sb) = small_int_imm(&constants[(c & !BITRK) as usize])
+                {
+                    let native = if op == OP_LT { OpCode::LtI } else { OpCode::LeI };
+                    code.push(Instruction::create_abck(native, b, sb, 0, k));
+                } else if b & BITRK != 0
+                    && c & BITRK == 0
+                    && let Some(sb) = small_int_imm(&constants[(b & !BITRK) as usize])
+                {
+                    let native = if op == OP_LT { OpCode::GtI } else { OpCode::GeI };
+                    code.push(Instruction::create_abck(native, c, sb, 0, k));
+                } else {
+                    let left = load_rk(&mut code, constants_len, b, scratch)?;
+                    let right = load_rk(&mut code, constants_len, c, scratch + 1)?;
+                    if b & BITRK != 0 || c & BITRK != 0 {
+                        max_stack = max_stack.max(scratch + 2);
+                    }
+                    let native = if op == OP_LT { OpCode::Lt } else { OpCode::Le };
+                    code.push(Instruction::create_abck(native, left, right, 0, k));
+                }
+            }
+            OP_TEST => code.push(Instruction::create_abck(OpCode::Test, a, 0, 0, c != 0)),
+            OP_TESTSET => code.push(Instruction::create_abck(OpCode::TestSet, a, b, 0, c != 0)),
+            OP_CALL => code.push(Instruction::create_abck(OpCode::Call, a, b, c, false)),
+            OP_TAILCALL => {
+                code.push(Instruction::create_abck(
+                    OpCode::TailCall,
+                    a,
+                    b,
+                    c,
+                    has_local_captures,
+                ));
+            }
+            OP_RETURN => {
+                if !has_local_captures {
+                    if b == 1 {
+                        code.push(Instruction::create_abck(OpCode::Return0, a, 1, 0, false));
+                    } else if b == 2 {
+                        code.push(Instruction::create_abck(OpCode::Return1, a, 2, 0, false));
+                    } else {
+                        code.push(Instruction::create_abck(OpCode::Return, a, b, 0, false));
+                    }
+                } else {
+                    code.push(Instruction::create_abck(OpCode::Return, a, b, 0, true));
+                }
+            }
             OP_FORLOOP | OP_FORPREP | OP_TFORLOOP => {
                 let native = match op {
                     OP_FORLOOP => OpCode::ForLoop53,
@@ -829,8 +1100,8 @@ fn translate_code53(
                 } else {
                     a
                 };
-                let at = code.len() + emitted.len();
-                emitted.push(Instruction::create_abx(native, loop_base, 0));
+                let at = code.len();
+                code.push(Instruction::create_abx(native, loop_base, 0));
                 patches.push(Patch {
                     instruction: at,
                     target_old: pc as isize + 1 + sbx53(instruction) as isize,
@@ -842,7 +1113,7 @@ fn translate_code53(
                 });
             }
             OP_TFORCALL => {
-                emitted.push(Instruction::create_abck(OpCode::TForCall53, a, 0, c, false))
+                code.push(Instruction::create_abck(OpCode::TForCall53, a, 0, c, false))
             }
             OP_SETLIST => {
                 let block = if c == 0 {
@@ -860,12 +1131,12 @@ fn translate_code53(
                 if block == 0 {
                     return Err("invalid zero Lua 5.3 SETLIST block".to_string());
                 }
-                let start = (block - 1)
+                let start_idx = (block - 1)
                     .checked_mul(50)
                     .ok_or_else(|| "Lua 5.3 SETLIST index overflow".to_string())?;
-                let low = start & 0x3ff;
-                let extra = start >> 10;
-                emitted.push(Instruction::create_vabck(
+                let low = start_idx & 0x3ff;
+                let extra = start_idx >> 10;
+                code.push(Instruction::create_vabck(
                     OpCode::SetList,
                     a,
                     b,
@@ -873,44 +1144,209 @@ fn translate_code53(
                     extra != 0,
                 ));
                 if extra != 0 {
-                    emitted.push(Instruction::create_ax(OpCode::ExtraArg, extra));
+                    code.push(Instruction::create_ax(OpCode::ExtraArg, extra));
                 }
             }
-            OP_CLOSURE => emitted.push(Instruction::create_abx(
+            OP_CLOSURE => code.push(Instruction::create_abx(
                 OpCode::Closure,
                 a,
                 bx53(instruction),
             )),
-            OP_VARARG => emitted.push(Instruction::create_abck(OpCode::Vararg, a, 0, b, false)),
+            OP_VARARG => code.push(Instruction::create_abck(OpCode::Vararg, a, 0, b, false)),
             OP_EXTRAARG => {
                 if pc == 0 || !matches!(op53(raw[pc - 1]), OP_LOADKX | OP_SETLIST) {
                     return Err("orphan Lua 5.3 EXTRAARG instruction".to_string());
                 }
                 if op53(raw[pc - 1]) == OP_LOADKX {
-                    emitted.push(Instruction::create_ax(OpCode::ExtraArg, ax53(instruction)));
+                    code.push(Instruction::create_ax(OpCode::ExtraArg, ax53(instruction)));
                 }
             }
             _ => {
                 if let Some((native, event)) = arithmetic53(op) {
-                    let left = load_rk(&mut emitted, constants_len, b, scratch)?;
-                    let right = load_rk(&mut emitted, constants_len, c, scratch + 1)?;
-                    max_stack = max_stack.max(scratch + 2);
-                    emitted.push(Instruction::create_abck(native, a, left, right, false));
-                    emitted.push(Instruction::create_abck(
-                        OpCode::MmBin,
-                        left,
-                        right,
-                        event as u32,
-                        false,
-                    ));
+                    let specialized = match op {
+                        OP_ADD => {
+                            if b & BITRK == 0
+                                && c & BITRK != 0
+                                && let Some(sc) = small_int_imm(&constants[(c & !BITRK) as usize])
+                            {
+                                code.push(Instruction::create_abck(OpCode::AddI, a, b, sc, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinI,
+                                    b,
+                                    sc,
+                                    event as u32,
+                                    false,
+                                ));
+                                true
+                            } else if b & BITRK != 0
+                                && c & BITRK == 0
+                                && let Some(sc) = small_int_imm(&constants[(b & !BITRK) as usize])
+                            {
+                                code.push(Instruction::create_abck(OpCode::AddI, a, c, sc, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinI,
+                                    c,
+                                    sc,
+                                    event as u32,
+                                    true,
+                                ));
+                                true
+                            } else if b & BITRK == 0
+                                && c & BITRK != 0
+                                && (c & !BITRK) <= u8::MAX as u32
+                                && constants[(c & !BITRK) as usize].is_number()
+                            {
+                                let idx = c & !BITRK;
+                                code.push(Instruction::create_abck(OpCode::AddK, a, b, idx, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinK,
+                                    b,
+                                    idx,
+                                    event as u32,
+                                    false,
+                                ));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        OP_SUB | OP_MUL | OP_MOD | OP_POW | OP_DIV | OP_IDIV => {
+                            if b & BITRK == 0
+                                && c & BITRK != 0
+                                && (c & !BITRK) <= u8::MAX as u32
+                                && constants[(c & !BITRK) as usize].is_number()
+                            {
+                                let idx = c & !BITRK;
+                                let opk = match op {
+                                    OP_SUB => OpCode::SubK,
+                                    OP_MUL => OpCode::MulK,
+                                    OP_MOD => OpCode::ModK,
+                                    OP_POW => OpCode::PowK,
+                                    OP_DIV => OpCode::DivK,
+                                    _ => OpCode::IDivK,
+                                };
+                                code.push(Instruction::create_abck(opk, a, b, idx, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinK,
+                                    b,
+                                    idx,
+                                    event as u32,
+                                    false,
+                                ));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        OP_BAND | OP_BOR | OP_BXOR => {
+                            if b & BITRK == 0
+                                && c & BITRK != 0
+                                && (c & !BITRK) <= u8::MAX as u32
+                                && constants[(c & !BITRK) as usize].is_integer()
+                            {
+                                let idx = c & !BITRK;
+                                let opk = match op {
+                                    OP_BAND => OpCode::BAndK,
+                                    OP_BOR => OpCode::BOrK,
+                                    _ => OpCode::BXorK,
+                                };
+                                code.push(Instruction::create_abck(opk, a, b, idx, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinK,
+                                    b,
+                                    idx,
+                                    event as u32,
+                                    false,
+                                ));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        OP_SHR => {
+                            if b & BITRK == 0
+                                && c & BITRK != 0
+                                && let Some(sc) = small_int_imm(&constants[(c & !BITRK) as usize])
+                            {
+                                code.push(Instruction::create_abck(OpCode::ShrI, a, b, sc, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinI,
+                                    b,
+                                    sc,
+                                    event as u32,
+                                    false,
+                                ));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        OP_SHL => {
+                            if b & BITRK != 0
+                                && c & BITRK == 0
+                                && let Some(sc) = small_int_imm(&constants[(b & !BITRK) as usize])
+                            {
+                                code.push(Instruction::create_abck(OpCode::ShlI, a, c, sc, false));
+                                code.push(Instruction::create_abck(
+                                    OpCode::MmBinI,
+                                    c,
+                                    sc,
+                                    event as u32,
+                                    true,
+                                ));
+                                true
+                            } else if b & BITRK == 0 && c & BITRK != 0 {
+                                let k = &constants[(c & !BITRK) as usize];
+                                if k.is_integer() && (-127..=127).contains(&k.ivalue()) {
+                                    let iv = k.ivalue() as i32;
+                                    let neg_sc = (-iv + Instruction::OFFSET_SC) as u32;
+                                    let orig_sb = (iv + Instruction::OFFSET_SB) as u32;
+                                    code.push(Instruction::create_abck(
+                                        OpCode::ShrI,
+                                        a,
+                                        b,
+                                        neg_sc,
+                                        false,
+                                    ));
+                                    code.push(Instruction::create_abck(
+                                        OpCode::MmBinI,
+                                        b,
+                                        orig_sb,
+                                        event as u32,
+                                        false,
+                                    ));
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !specialized {
+                        let left = load_rk(&mut code, constants_len, b, scratch)?;
+                        let right = load_rk(&mut code, constants_len, c, scratch + 1)?;
+                        if b & BITRK != 0 || c & BITRK != 0 {
+                            max_stack = max_stack.max(scratch + 2);
+                        }
+                        code.push(Instruction::create_abck(native, a, left, right, false));
+                        code.push(Instruction::create_abck(
+                            OpCode::MmBin,
+                            left,
+                            right,
+                            event as u32,
+                            false,
+                        ));
+                    }
                 } else {
                     return Err(format!("unsupported Lua 5.3 opcode {op}"));
                 }
             }
         }
 
-        lines.extend(std::iter::repeat_n(line, emitted.len()));
-        code.extend(emitted);
+        lines.extend(std::iter::repeat_n(line, code.len() - start));
     }
     map[raw.len()] = code.len();
 
@@ -1015,9 +1451,8 @@ fn read_proto(
     if depth > MAX_PROTO_DEPTH {
         return Err("Lua 5.3 prototype nesting exceeds the safety limit".to_string());
     }
-    let source_bytes = reader.string()?;
+    let source_bytes = reader.string_slice()?;
     let source = source_bytes
-        .as_deref()
         .map(String::from_utf8_lossy)
         .map(|s| s.into_owned())
         .or_else(|| parent_source.map(str::to_owned))
@@ -1032,10 +1467,7 @@ fn read_proto(
     }
 
     let code_count = reader.count("instruction")?;
-    let mut raw_code = Vec::with_capacity(code_count);
-    for _ in 0..code_count {
-        raw_code.push(reader.uint32()?);
-    }
+    let raw_code = reader.read_raw_code(code_count)?;
 
     let constant_count = reader.count("constant")?;
     let mut constants = Vec::with_capacity(constant_count);
@@ -1047,9 +1479,9 @@ fn read_proto(
             19 => LuaValue::integer(reader.lua_integer()?),
             4 | 20 => {
                 let bytes = reader
-                    .string()?
+                    .string_slice()?
                     .ok_or_else(|| "nil Lua 5.3 string constant".to_string())?;
-                vm.create_bytes(&bytes).map_err(|error| error.to_string())?
+                vm.create_bytes(bytes).map_err(|error| error.to_string())?
             }
             tag => return Err(format!("unknown Lua 5.3 constant tag {tag}")),
         };
@@ -1074,10 +1506,7 @@ fn read_proto(
     }
 
     let line_count = reader.count("line")?;
-    let mut old_lines = Vec::with_capacity(line_count);
-    for _ in 0..line_count {
-        old_lines.push(reader.int()?.max(0) as u32);
-    }
+    let old_lines = reader.read_old_lines(line_count)?;
     if !old_lines.is_empty() && old_lines.len() != raw_code.len() {
         return Err("Lua 5.3 line table length does not match the code".to_string());
     }
@@ -1086,8 +1515,8 @@ fn read_proto(
     let mut raw_locals = Vec::with_capacity(locvar_count);
     for _ in 0..locvar_count {
         let name = reader
-            .string()?
-            .map(Vec::into_boxed_slice)
+            .string_slice()?
+            .map(Box::<[u8]>::from)
             .unwrap_or_default();
         let start = reader.int()?.max(0) as usize;
         let end = reader.int()?.max(0) as usize;
@@ -1100,16 +1529,20 @@ fn read_proto(
     }
     for descriptor in upvalue_descs.iter_mut().take(upvalue_name_count) {
         descriptor.name = reader
-            .string()?
-            .map(Vec::into_boxed_slice)
+            .string_slice()?
+            .map(Box::<[u8]>::from)
             .unwrap_or_default();
     }
 
+    let has_local_captures = child_protos
+        .iter()
+        .any(|child| child.as_ref().data.upvalue_descs.iter().any(|u| u.is_local));
     let (code, line_info, pc_map, max_stack_size) = translate_code53(
         &raw_code,
-        constants.len(),
+        &constants,
         upvalue_count,
         child_count,
+        has_local_captures,
         &old_lines,
         old_max_stack,
         is_vararg,
