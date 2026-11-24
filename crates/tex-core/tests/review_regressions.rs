@@ -2102,3 +2102,25 @@ fn ifcsname_fast_path_preserves_lookup_and_non_interning() {
     assert!(e.term.contains("MISS2=OK"), "{}", e.term);
     assert!(e.cs.lookup(b"neverdefinedxyz").is_none());
 }
+
+/// Regression for pass-2 #3: an `\unexpanded` toks register control sequence
+/// stored as a macro parameter delimiter carries `UNEXPANDED_CS_FLAG`
+/// (`0xE000_0000`); `take_delimited_run` and `delim_eq` must mask with
+/// `cs_id()` (`0x1FFF_FFFF`), not `0x3FFF_FFFF`, so the delimiter matches plain
+/// CS tokens in both the fast path and the `\outer`-enabled slow path.
+#[test]
+fn unexpanded_toks_cs_delimiter_matches_in_delimited_argument() {
+    let e = engine(
+        r"\toksdef\mydelim=0
+\mydelim={\baz}
+\expandafter\def\expandafter\bar\expandafter#\expandafter 1\unexpanded\mydelim{[#1]}
+\def\run{\bar hello\baz}
+\message{FAST=\run}
+\outer\def\sentinel{}
+\message{SLOW=\run}
+\end",
+    );
+    assert!(e.term.contains("FAST=[hello]"), "{}", e.term);
+    assert!(e.term.contains("SLOW=[hello]"), "{}", e.term);
+    assert_eq!(e.error_count, 0, "{}", e.term);
+}

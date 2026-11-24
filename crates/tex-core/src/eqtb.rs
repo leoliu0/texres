@@ -208,20 +208,28 @@ pub struct Macro {
 /// a single pointer-sized word:
 /// - low 2 bits: cached active-CS scan (`0` = unchecked, `1` = none, `2` = has active CS)
 /// - upper bits (`raw & !3`): `0` or an owned `Rc::into_raw(Rc<MacroReplacement>)`
-///   pointer (guaranteed >= 8-byte aligned).
-/// Packing both into one word keeps `Macro` at 80 bytes (`RcBox<Macro>` = 96B).
+///   pointer (guaranteed >= 4-byte aligned).
+/// `PhantomData<Rc<MacroReplacement>>` keeps the type `!Send` and `!Sync`, and
+/// packing both into one word keeps `Macro` at 80 bytes on 64-bit targets.
 #[derive(Default)]
-pub struct CachedReplacement(std::cell::Cell<usize>);
+pub struct CachedReplacement(
+    std::cell::Cell<usize>,
+    std::marker::PhantomData<Rc<MacroReplacement>>,
+);
 
 const ACTIVE_CS_TAG_MASK: usize = 3;
-const _: () = assert!(std::mem::align_of::<MacroReplacement>() >= 8);
-const _: () = assert!(std::mem::size_of::<CachedReplacement>() == 8);
+const _: () = assert!(std::mem::align_of::<MacroReplacement>() >= 4);
+const _: () = assert!(std::mem::size_of::<CachedReplacement>() == std::mem::size_of::<usize>());
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Macro>() == 80);
 
 impl CachedReplacement {
     #[inline(always)]
     pub(crate) fn with_active_cs(has_active: bool) -> Self {
-        CachedReplacement(std::cell::Cell::new(if has_active { 2 } else { 1 }))
+        CachedReplacement(
+            std::cell::Cell::new(if has_active { 2 } else { 1 }),
+            std::marker::PhantomData,
+        )
     }
 
     #[inline(always)]
@@ -255,7 +263,7 @@ impl Clone for CachedReplacement {
                 Rc::increment_strong_count(ptr);
             }
         }
-        CachedReplacement(std::cell::Cell::new(raw))
+        CachedReplacement(std::cell::Cell::new(raw), std::marker::PhantomData)
     }
 }
 
@@ -335,10 +343,15 @@ impl Macro {
         let new_ptr = Rc::into_raw(Rc::clone(&built)) as usize;
         debug_assert_eq!(new_ptr & ACTIVE_CS_TAG_MASK, 0);
         let old = self.replacement.0.get();
-        self.replacement
-            .0
-            .set(new_ptr | (old & ACTIVE_CS_TAG_MASK));
         let old_ptr = (old & !ACTIVE_CS_TAG_MASK) as *const MacroReplacement;
+        // Keep the cached active-CS tag only when populating the first plan
+        // for the same body; an in-place body change invalidates the cached tag.
+        let tag = if old_ptr.is_null() {
+            old & ACTIVE_CS_TAG_MASK
+        } else {
+            0
+        };
+        self.replacement.0.set(new_ptr | tag);
         if !old_ptr.is_null() {
             // SAFETY: old pointer is no longer stored in `self.replacement`.
             unsafe {
@@ -777,8 +790,6 @@ fn compute_cs_flags(equiv: Option<&Equiv>) -> u8 {
         _ => 0,
     }
 }
-
-const _: () = assert!(std::mem::size_of::<Option<Equiv>>() == 16);
 
 /// Deduplicated LuaTeX attribute lists: `Attr(n)` names the n-th distinct
 /// list of sorted `(attribute number, value)` pairs, `Attr::NONE` the empty
@@ -3308,14 +3319,47 @@ mod tests {
         drop(cloned);
         assert_eq!(Rc::strong_count(&p1), 2);
 
-        let active_macro = Macro {
+        let mut active_macro = Macro {
             body: vec![Token::from_cs(active_id)].into(),
             replacement: Default::default(),
-            ..plain_macro
+            ..plain_macro.clone()
         };
         assert!(active_macro.has_active_cs(&cs));
         let _ = active_macro.cached_plan();
         assert!(active_macro.has_active_cs(&cs));
+
+        // Replacing `body` in place must invalidate a previously cached active-CS tag
+        // when `cached_plan()` detects the body mismatch.
+        let mut mutated = plain_macro;
+        assert!(!mutated.has_active_cs(&cs));
+        let _ = mutated.cached_plan();
+        mutated.body = vec![Token::from_cs(active_id), Token(0x4000_0001)].into();
+        let _ = mutated.cached_plan();
+        assert!(mutated.has_active_cs(&cs));
+        active_macro.body = vec![Token::from_cs(plain_id)].into();
+        let _ = active_macro.cached_plan();
+        assert!(!active_macro.has_active_cs(&cs));
+
+        // Verify `CachedReplacement` is neither `Send` nor `Sync` (E0034 if it were).
+        trait IsSend {
+            fn assert_not_send() {}
+        }
+        impl<T: Send> IsSend for T {}
+        trait NotSend {
+            fn assert_not_send() {}
+        }
+        impl NotSend for CachedReplacement {}
+        CachedReplacement::assert_not_send();
+
+        trait IsSync {
+            fn assert_not_sync() {}
+        }
+        impl<T: Sync> IsSync for T {}
+        trait NotSync {
+            fn assert_not_sync() {}
+        }
+        impl NotSync for CachedReplacement {}
+        CachedReplacement::assert_not_sync();
     }
 
     fn prim_of(eq: &Eqtb, id: CsId) -> Option<Prim> {

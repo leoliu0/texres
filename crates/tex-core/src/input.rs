@@ -356,6 +356,10 @@ pub enum Source {
     MacroFrame(MacroFrame),
 }
 
+const CURSOR_OFFSET: usize = std::mem::align_of::<ListCursor>();
+const _: () = assert!(std::mem::align_of::<Source>() == CURSOR_OFFSET);
+const _: () = assert!(std::mem::align_of::<MacroFrame>() == CURSOR_OFFSET);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Source>() == 64);
 
 impl Source {
@@ -366,11 +370,17 @@ impl Source {
         if matches!(self, Source::File { .. }) {
             return None;
         }
-        // SAFETY: `Source` is `#[repr(C, u8)]` with 8-byte payload alignment,
-        // so every variant payload starts at byte offset 8, and `TokRc`,
-        // `TokVec`, and `MacroFrame` all begin with `(seg, pos, end, trace_depth)`
-        // matching `ListCursor` (verified by unit test `source_cursor_layout`).
-        Some(unsafe { &*(self as *const Source as *const u8).add(8).cast::<ListCursor>() })
+        // SAFETY: `Source` is `#[repr(C, u8)]` with `align_of::<Source>() ==
+        // CURSOR_OFFSET == align_of::<ListCursor>() == align_of::<MacroFrame>()`,
+        // so every variant payload starts at byte offset `CURSOR_OFFSET`, and
+        // `TokRc`, `TokVec`, and `MacroFrame` all begin with `(seg, pos, end,
+        // trace_depth, maybe_active_cs)` matching `ListCursor` (verified by
+        // unit test `source_cursor_layout_matches_all_list_variants`).
+        Some(unsafe {
+            &*(self as *const Source as *const u8)
+                .add(CURSOR_OFFSET)
+                .cast::<ListCursor>()
+        })
     }
 
     #[inline(always)]
@@ -379,17 +389,27 @@ impl Source {
             return None;
         }
         // SAFETY: see `Source::cursor`.
-        Some(unsafe { &mut *(self as *mut Source as *mut u8).add(8).cast::<ListCursor>() })
+        Some(unsafe {
+            &mut *(self as *mut Source as *mut u8)
+                .add(CURSOR_OFFSET)
+                .cast::<ListCursor>()
+        })
     }
 }
 
 /// Arguments of one macro call stored contiguously in a single pooled buffer:
 /// `toks[0..9]` holds the end offset of each collected argument, and argument
 /// `i` occupies `toks[start(i)..toks[i].0 as usize]` (starting at `ARG_HEADER_LEN`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MacroArgs {
     toks: Vec<Token>,
     count: u8,
+}
+
+impl Default for MacroArgs {
+    fn default() -> Self {
+        Self::with_buffer(Vec::new())
+    }
 }
 
 impl MacroArgs {
@@ -1675,6 +1695,16 @@ mod tests {
         let s_frame = Source::MacroFrame(frame);
         let c = s_frame.cursor().expect("MacroFrame cursor");
         assert_eq!((c.pos, c.end, c.trace_depth, c.maybe_active_cs), (8, 9, 7, true));
+    }
+
+    #[test]
+    fn macro_args_default_has_valid_header() {
+        let mut args = MacroArgs::default();
+        assert_eq!(args.total_arg_tokens(), 0);
+        args.buffer().push(Token::letter(b'Z'));
+        args.finish_arg();
+        assert_eq!(args.total_arg_tokens(), 1);
+        assert_eq!(args.get(0), Some(&[Token::letter(b'Z')][..]));
     }
 
     #[test]

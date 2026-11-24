@@ -408,7 +408,7 @@ impl Engine {
     }
     fn delim_eq(&self, a: Token, b: Token) -> bool {
         if a.is_cs() && b.is_cs() {
-            (a.0 & 0x3FFF_FFFF) == (b.0 & 0x3FFF_FFFF)
+            a.cs_id() == b.cs_id()
         } else if a.is_char() && b.is_char() {
             a.cc() == b.cc() && a.chr() == b.chr()
         } else if a.is_cs() && b.is_char() && b.cc() == 13 {
@@ -981,11 +981,17 @@ impl Engine {
 
             let mut equiv = self.eqtb.get(id);
             if let Some(Equiv::Alias(mut next)) = equiv {
-                while let Some(Equiv::Alias(n)) = self.eqtb.get(next) {
-                    next = *n;
+                equiv = None;
+                for _ in 0..1024 {
+                    match self.eqtb.get(next) {
+                        Some(Equiv::Alias(n)) => next = *n,
+                        other => {
+                            equiv = other;
+                            break;
+                        }
+                    }
                 }
                 id = next;
-                equiv = self.eqtb.get(id);
             }
             if let Some(Equiv::Macro(m)) = equiv {
                 let m = std::rc::Rc::clone(m);
@@ -1475,11 +1481,17 @@ impl Engine {
 
                 let mut equiv = self.eqtb.get(id);
                 if let Some(Equiv::Alias(mut next)) = equiv {
-                    while let Some(Equiv::Alias(n)) = self.eqtb.get(next) {
-                        next = *n;
+                    equiv = None;
+                    for _ in 0..1024 {
+                        match self.eqtb.get(next) {
+                            Some(Equiv::Alias(n)) => next = *n,
+                            other => {
+                                equiv = other;
+                                break;
+                            }
+                        }
                     }
                     id = next;
-                    equiv = self.eqtb.get(id);
                 }
                 // Ordered checks avoid an unpredictable indirect jump table
                 // across all 16 `Equiv` variants; Macro and Prim cover >95%.
@@ -5487,7 +5499,7 @@ impl Engine {
         // (`delim_eq`); a control sequence equals its marked forms and the
         // active character it is the meaning of.
         let first_char = first.0 < 0x0D00_0000;
-        let first_cs = first.is_cs().then_some(first.0 & 0x3FFF_FFFF);
+        let first_cs = first.is_cs().then(|| first.cs_id());
         // When no alignment row delimiters, `\outer` macros, or active-CS
         // tokens can appear in `segment`, and `first` is either a non-active
         // char or a non-active CS, a plain non-brace token matches `first` iff
@@ -5557,7 +5569,7 @@ impl Engine {
                         if (!long && t == partoken)
                             || (maybe_active_cs && self.cs.is_active(t.cs_id()))
                             || match first_cs {
-                                Some(id) => t.0 & 0x3FFF_FFFF == id,
+                                Some(id) => t.cs_id() == id,
                                 None => !first_char && self.delim_eq(t, first),
                             }
                             || (outer && self.is_outer_macro_token(t))
