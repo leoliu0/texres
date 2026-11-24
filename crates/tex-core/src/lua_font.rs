@@ -740,7 +740,7 @@ impl Engine {
                     None
                 }
             };
-            return match value {
+            let defined = match value {
                 Some(v) => {
                     if let Some(t) = v.as_table() {
                         self.lua_do_vf_table(&t);
@@ -783,6 +783,30 @@ impl Engine {
                     None
                 }
             };
+            // Large CJK / pan-Unicode font definitions (e.g. luaotfload parsing
+            // an OTF into a huge intermediate table and dumping a .luc cache)
+            // can leave >100 MiB of dead temporary Lua tables behind. Reclaim
+            // them right after the font is installed so consecutive large font
+            // loads do not stack their transient loader peaks in memory.
+            if let Some(id) = defined {
+                const LARGE_FONT_CHARS: usize = 4096;
+                const LARGE_HEAP_BYTES: usize = 128 * 1024 * 1024;
+                let large_font = self
+                    .eqtb
+                    .fonts
+                    .get(usize::from(id))
+                    .and_then(|font| font.lua.as_ref())
+                    .is_some_and(|lf| lf.chars.len() >= LARGE_FONT_CHARS);
+                if large_font
+                    && self
+                        .lua
+                        .as_ref()
+                        .is_some_and(|lua| lua.gc_total_bytes() >= LARGE_HEAP_BYTES)
+                {
+                    let _ = self.lua_run(|lua| lua.collect_garbage());
+                }
+            }
+            return defined;
         }
         let base = String::from_utf8_lossy(name).into_owned();
         let resource_mode = self.lua_res_mode();
@@ -839,6 +863,19 @@ impl crate::engine_lua::LuaEngine {
         if let Ok(Some(cache)) = self.lua.registry_get::<tex_lua::LuaTable>(crate::lua_bridge::REG_FONT_CACHE) {
             let _ = cache.raw_seti(i64::from(f), t);
         }
+    }
+
+    /// Run a full garbage collection cycle on the Lua VM.
+    pub(crate) fn collect_garbage(&mut self) -> Result<(), String> {
+        use tex_lua::LuaApi;
+        self.lua
+            .collect_garbage()
+            .map_err(|e| self.lua.get_error_message(e).message().to_string())
+    }
+
+    /// Current total memory accounted by the Lua garbage collector, in bytes.
+    pub(crate) fn gc_total_bytes(&self) -> usize {
+        self.lua.gc_total_bytes()
     }
 }
 

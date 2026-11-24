@@ -42,6 +42,7 @@ impl Drop for ActiveGuard {
 }
 
 /// Run `f` on the engine whose Lua call is in progress.
+#[inline(always)]
 pub(crate) fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Result<R, String> {
     let engine = ACTIVE.with(Cell::get);
     if engine.is_null() {

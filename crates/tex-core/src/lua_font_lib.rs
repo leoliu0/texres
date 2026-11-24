@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use tex_lua::{CallbackLua, LuaBytes, LuaTable, Value};
+use tex_lua::{CallbackLua, LuaBytes, LuaTable, RawStrKey, RawTable, RawValue, Value};
 
 use crate::engine::Engine;
 use crate::lua_font::*;
@@ -643,233 +643,845 @@ fn local_fonts_of(
     }
 }
 
+/// Pre-resolved string keys for zero-allocation raw character table inspection.
+#[derive(Clone, Copy)]
+struct CharKeys<'a> {
+    width: RawStrKey<'a>,
+    height: RawStrKey<'a>,
+    depth: RawStrKey<'a>,
+    italic: RawStrKey<'a>,
+    vert_italic: RawStrKey<'a>,
+    index: RawStrKey<'a>,
+    expansion_factor: RawStrKey<'a>,
+    left_protruding: RawStrKey<'a>,
+    right_protruding: RawStrKey<'a>,
+    used: RawStrKey<'a>,
+    name: RawStrKey<'a>,
+    tounicode: RawStrKey<'a>,
+    top_accent: RawStrKey<'a>,
+    bot_accent: RawStrKey<'a>,
+    next: RawStrKey<'a>,
+    extensible: RawStrKey<'a>,
+    top: RawStrKey<'a>,
+    bot: RawStrKey<'a>,
+    mid: RawStrKey<'a>,
+    rep: RawStrKey<'a>,
+    horiz_variants: RawStrKey<'a>,
+    vert_variants: RawStrKey<'a>,
+    glyph: RawStrKey<'a>,
+    extender: RawStrKey<'a>,
+    start: RawStrKey<'a>,
+    end: RawStrKey<'a>,
+    advance: RawStrKey<'a>,
+    mathkern: RawStrKey<'a>,
+    top_left: RawStrKey<'a>,
+    top_right: RawStrKey<'a>,
+    bottom_right: RawStrKey<'a>,
+    bottom_left: RawStrKey<'a>,
+    kern: RawStrKey<'a>,
+    kerns: RawStrKey<'a>,
+    commands: RawStrKey<'a>,
+    ligatures: RawStrKey<'a>,
+    char_key: RawStrKey<'a>,
+    type_key: RawStrKey<'a>,
+}
+
+impl<'a> CharKeys<'a> {
+    fn resolve(t: RawTable<'a>) -> Self {
+        Self {
+            width: t.resolve_key("width"),
+            height: t.resolve_key("height"),
+            depth: t.resolve_key("depth"),
+            italic: t.resolve_key("italic"),
+            vert_italic: t.resolve_key("vert_italic"),
+            index: t.resolve_key("index"),
+            expansion_factor: t.resolve_key("expansion_factor"),
+            left_protruding: t.resolve_key("left_protruding"),
+            right_protruding: t.resolve_key("right_protruding"),
+            used: t.resolve_key("used"),
+            name: t.resolve_key("name"),
+            tounicode: t.resolve_key("tounicode"),
+            top_accent: t.resolve_key("top_accent"),
+            bot_accent: t.resolve_key("bot_accent"),
+            next: t.resolve_key("next"),
+            extensible: t.resolve_key("extensible"),
+            top: t.resolve_key("top"),
+            bot: t.resolve_key("bot"),
+            mid: t.resolve_key("mid"),
+            rep: t.resolve_key("rep"),
+            horiz_variants: t.resolve_key("horiz_variants"),
+            vert_variants: t.resolve_key("vert_variants"),
+            glyph: t.resolve_key("glyph"),
+            extender: t.resolve_key("extender"),
+            start: t.resolve_key("start"),
+            end: t.resolve_key("end"),
+            advance: t.resolve_key("advance"),
+            mathkern: t.resolve_key("mathkern"),
+            top_left: t.resolve_key("top_left"),
+            top_right: t.resolve_key("top_right"),
+            bottom_right: t.resolve_key("bottom_right"),
+            bottom_left: t.resolve_key("bottom_left"),
+            kern: t.resolve_key("kern"),
+            kerns: t.resolve_key("kerns"),
+            commands: t.resolve_key("commands"),
+            ligatures: t.resolve_key("ligatures"),
+            char_key: t.resolve_key("char"),
+            type_key: t.resolve_key("type"),
+        }
+    }
+}
+
+#[inline]
+fn raw_value_number(v: RawValue<'_>) -> Option<f64> {
+    if let Some(n) = v.as_number() {
+        return Some(n);
+    }
+    let bytes = v.as_bytes()?;
+    std::str::from_utf8(bytes).ok()?.trim().parse::<f64>().ok()
+}
+
+#[inline]
+fn raw_num_key(t: RawTable<'_>, key: RawStrKey<'_>, default: i32) -> i32 {
+    t.get_key(key).and_then(raw_value_number).map_or(default, round)
+}
+
+#[inline]
+fn raw_num_str(t: RawTable<'_>, key: &str, default: i32) -> i32 {
+    t.get_str(key).and_then(raw_value_number).map_or(default, round)
+}
+
+#[inline]
+fn raw_clamp_str(t: RawTable<'_>, key: &str, default: i32, min: i32, max: i32) -> i32 {
+    raw_num_str(t, key, default).clamp(min, max)
+}
+
+#[inline]
+fn raw_bool_key(t: RawTable<'_>, key: RawStrKey<'_>, default: bool) -> bool {
+    t.get_key(key).and_then(RawValue::as_boolean).unwrap_or(default)
+}
+
+#[inline]
+fn raw_bool_str(t: RawTable<'_>, key: &str, default: bool) -> bool {
+    t.get_str(key).and_then(RawValue::as_boolean).unwrap_or(default)
+}
+
+#[inline]
+fn raw_str_key(t: RawTable<'_>, key: RawStrKey<'_>) -> Option<Vec<u8>> {
+    t.get_key(key)?.as_bytes().map(<[u8]>::to_vec)
+}
+
+#[inline]
+fn raw_str_field(t: RawTable<'_>, key: &str) -> Option<Vec<u8>> {
+    t.get_str(key)?.as_bytes().map(<[u8]>::to_vec)
+}
+
+#[inline]
+fn raw_enum_val(v: Option<RawValue<'_>>, default: usize, names: &[&str]) -> usize {
+    let Some(v) = v else {
+        return default;
+    };
+    if let Some(n) = v.as_number() {
+        return round(n).max(0) as usize;
+    }
+    if let Some(s) = v.as_bytes() {
+        if let Some(i) = names.iter().position(|n| n.as_bytes() == s) {
+            return i;
+        }
+    }
+    default
+}
+
+#[inline]
+fn raw_lig_kern_key(key: RawValue<'_>) -> Option<i32> {
+    if let Some(n) = key.as_number() {
+        let k = n as i64;
+        return (k >= 0).then(|| k as i32);
+    }
+    (key.as_bytes()? == b"right_boundary").then_some(RIGHT_BOUNDARY)
+}
+
+fn raw_tounicode(t: RawTable<'_>, key: RawStrKey<'_>) -> Option<LuaCharToUnicode> {
+    let v = t.get_key(key)?;
+    if let Some(n) = v.as_number() {
+        let u = i64::from(round(n));
+        if u < 0 {
+            return None;
+        }
+        let mut out = ToUnicodeBuffer::new();
+        tounicode_hex(&mut out, u);
+        return Some(out.finish());
+    }
+    if let Some(tab) = v.as_table() {
+        let mut out = ToUnicodeBuffer::new();
+        let mut idx = 1i64;
+        while let Some(item) = tab.get_int(idx) {
+            if item.is_nil() {
+                break;
+            }
+            let Some(n) = item.as_number() else { break };
+            let u = i64::from(round(n));
+            if u < 0 {
+                return None;
+            }
+            tounicode_hex(&mut out, u);
+            idx += 1;
+        }
+        return (!out.is_empty()).then(|| out.finish());
+    }
+    v.as_bytes().map(LuaCharToUnicode::from_bytes)
+}
+
+fn raw_store_math_kerns(mk: RawTable<'_>, key: RawStrKey<'_>, keys: &CharKeys<'_>) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    if let Some(tab) = mk.get_key(key).and_then(RawValue::as_table) {
+        let n = tab.raw_len();
+        for i in 1..=n {
+            let Some(entry) = tab.get_int(i as i64).and_then(RawValue::as_table) else {
+                continue;
+            };
+            let h = entry.get_key(keys.height).and_then(raw_value_number).map(round);
+            let k = entry.get_key(keys.kern).and_then(raw_value_number).map(round);
+            if let (Some(h), Some(k)) = (h, k) {
+                out.push((h, k));
+            }
+        }
+    }
+    out
+}
+
+fn raw_read_variants(t: RawTable<'_>, key: RawStrKey<'_>, keys: &CharKeys<'_>) -> Option<Vec<MathVariant>> {
+    let tab = t.get_key(key)?.as_table()?;
+    let mut out = Vec::new();
+    let mut k = 1i64;
+    while let Some(entry) = tab.get_int(k).and_then(RawValue::as_table) {
+        out.push(MathVariant {
+            glyph: raw_num_key(entry, keys.glyph, 0),
+            extender: raw_num_key(entry, keys.extender, 0),
+            start: raw_num_key(entry, keys.start, 0),
+            end: raw_num_key(entry, keys.end, 0),
+            advance: raw_num_key(entry, keys.advance, 0),
+        });
+        k += 1;
+    }
+    Some(out)
+}
+
+fn raw_pdf_literal_mode(v: Option<RawValue<'_>>) -> u8 {
+    let Some(v) = v else { return crate::lua_font::PDF_SET_ORIGIN };
+    if let Some(s) = v.as_bytes() {
+        return match s {
+            b"direct" => crate::lua_font::PDF_DIRECT_ALWAYS,
+            b"page" => crate::lua_font::PDF_DIRECT_PAGE,
+            b"text" => crate::lua_font::PDF_DIRECT_TEXT,
+            b"font" => crate::lua_font::PDF_DIRECT_FONT,
+            b"raw" => crate::lua_font::PDF_DIRECT_RAW,
+            _ => crate::lua_font::PDF_SET_ORIGIN,
+        };
+    }
+    let n = round(v.as_number().unwrap_or(0.0));
+    if (0..crate::lua_font::PDF_SCAN_SPECIAL as i32).contains(&n) {
+        n as u8
+    } else {
+        crate::lua_font::PDF_SET_ORIGIN
+    }
+}
+
+enum RawCommands {
+    None,
+    Ready(Vec<VfCommand>),
+    NeedsRooted,
+}
+
+fn raw_read_commands(t: RawTable<'_>, keys: &CharKeys<'_>, ctx: &ParseCtx<'_>) -> Result<RawCommands, String> {
+    let Some(tab) = t.get_key(keys.commands).and_then(RawValue::as_table) else {
+        return Ok(RawCommands::None);
+    };
+    if tab.is_empty_entries() {
+        return Ok(RawCommands::None);
+    }
+    let l_fonts = ctx.local_fonts;
+    let max_f = l_fonts.len().saturating_sub(1);
+    let first = l_fonts.get(1).copied().unwrap_or(0);
+    let local = |n: i32| -> FontId {
+        if n == 0 {
+            0
+        } else if n as usize > max_f || n < 0 {
+            first
+        } else {
+            l_fonts[n as usize]
+        }
+    };
+    let n = tab.raw_len();
+    let mut out = Vec::with_capacity(n);
+    let mut have_font = false;
+    for i in 1..=n {
+        let Some(cmd) = tab.get_int(i as i64).and_then(RawValue::as_table) else {
+            return Err("vf command: commands has to be a table".to_string());
+        };
+        let Some(name) = cmd.get_int(1).and_then(RawValue::as_bytes) else {
+            continue;
+        };
+        let arg = |k: i64| cmd.get_int(k).filter(|v| !v.is_nil());
+        let arg_num = |k: i64| arg(k).and_then(raw_value_number).map_or(0, round);
+        match name {
+            b"font" => {
+                if l_fonts.is_empty() {
+                    return Err("vf command: no font table found".to_string());
+                }
+                have_font = true;
+                out.push(VfCommand::Font(local(arg_num(2))));
+            }
+            b"char" => {
+                if l_fonts.is_empty() {
+                    return Err("vf command: no font table found".to_string());
+                }
+                if !have_font {
+                    out.push(VfCommand::Font(first));
+                    have_font = true;
+                }
+                out.push(VfCommand::Char(arg_num(2) as u32));
+            }
+            b"slot" => {
+                if l_fonts.is_empty() {
+                    return Err("vf command: no font table found".to_string());
+                }
+                let n = arg_num(2);
+                let sf = if n == 0 { ctx.font } else { local(n) };
+                out.push(VfCommand::Font(sf));
+                have_font = true;
+                out.push(VfCommand::Char(arg_num(3) as u32));
+            }
+            b"comment" | b"nop" => out.push(VfCommand::Nop),
+            b"push" => out.push(VfCommand::Push),
+            b"pop" => out.push(VfCommand::Pop),
+            b"rule" => {
+                out.push(VfCommand::Rule(sp_to_dvi(arg_num(2), ctx.atsize), sp_to_dvi(arg_num(3), ctx.atsize)))
+            }
+            b"right" => out.push(VfCommand::Right(sp_to_dvi(arg_num(2), ctx.atsize))),
+            b"down" => out.push(VfCommand::Down(sp_to_dvi(arg_num(2), ctx.atsize))),
+            b"pdf" => {
+                let len = cmd.raw_len();
+                let mut mode = 0u8;
+                let mut is_mode = false;
+                let text;
+                if len == 3 {
+                    let second = arg(2);
+                    let mode_value = match second.and_then(RawValue::as_bytes) {
+                        Some(b"mode") => {
+                            is_mode = true;
+                            arg(3)
+                        }
+                        _ => second,
+                    };
+                    mode = raw_pdf_literal_mode(mode_value);
+                    text = arg(3);
+                } else {
+                    text = arg(2);
+                }
+                if is_mode {
+                    out.push(VfCommand::PdfMode(mode));
+                } else {
+                    let Some(s) = text.and_then(RawValue::as_bytes) else {
+                        return Err("vf command: invalid packet pdf literal".to_string());
+                    };
+                    out.push(VfCommand::Pdf { mode, data: s.to_vec() });
+                }
+            }
+            b"special" => {
+                let Some(s) = arg(2).and_then(RawValue::as_bytes) else {
+                    return Err("vf command: invalid packet special".to_string());
+                };
+                out.push(VfCommand::Special(s.to_vec()));
+            }
+            b"lua" | b"node" | b"image" => return Ok(RawCommands::NeedsRooted),
+            b"scale" => {
+                let f = arg(2).and_then(raw_value_number).unwrap_or(0.0);
+                out.push(VfCommand::Scale(f as f32));
+            }
+            _ => return Err("vf command: unknown packet command".to_string()),
+        }
+    }
+    Ok(RawCommands::Ready(out))
+}
+
+/// Zero-registry-handle `font_char_from_lua`. Returns `(char_info, needs_rooted_commands)`.
+fn char_from_raw(
+    t: RawTable<'_>,
+    code: i32,
+    keys: &CharKeys<'_>,
+    ctx: &mut ParseCtx<'_>,
+) -> Result<(LuaCharInfo, bool), String> {
+    let mut co = LuaCharInfo::default();
+    let mut extras = LuaCharExtras::default();
+    co.width = raw_num_key(t, keys.width, 0);
+    co.height = raw_num_key(t, keys.height, 0);
+    co.depth = raw_num_key(t, keys.depth, 0);
+    co.italic = raw_num_key(t, keys.italic, 0);
+    co.vert_italic = raw_num_key(t, keys.vert_italic, 0);
+    co.index = raw_num_key(t, keys.index, 0) as u32;
+    co.expansion_factor = raw_num_key(t, keys.expansion_factor, 1000);
+    co.left_protruding = raw_num_key(t, keys.left_protruding, 0);
+    co.right_protruding = raw_num_key(t, keys.right_protruding, 0);
+    co.used = raw_bool_key(t, keys.used, false);
+    extras.name = raw_str_key(t, keys.name);
+    co.tounicode = raw_tounicode(t, keys.tounicode);
+    if ctx.has_math {
+        co.top_accent = raw_num_key(t, keys.top_accent, i32::MIN);
+        co.bot_accent = raw_num_key(t, keys.bot_accent, i32::MIN);
+        let next = raw_num_key(t, keys.next, -1);
+        if next >= 0 {
+            extras.next = Some(next as u32);
+        }
+        if let Some(ext) = t.get_key(keys.extensible).and_then(RawValue::as_table) {
+            let e = Extensible {
+                top: raw_num_key(ext, keys.top, 0),
+                bot: raw_num_key(ext, keys.bot, 0),
+                mid: raw_num_key(ext, keys.mid, 0),
+                rep: raw_num_key(ext, keys.rep, 0),
+            };
+            if e.top != 0 || e.bot != 0 || e.mid != 0 || e.rep != 0 {
+                extras.vert_variants = extensible_variants(&e);
+                extras.extensible = Some(e);
+            } else {
+                ctx.warnings.push(format!(
+                    "lua-loaded font {} char U+{:X} has an invalid extensible field",
+                    ctx.name, code
+                ));
+            }
+        }
+        if let Some(v) = raw_read_variants(t, keys.horiz_variants, keys) {
+            extras.hor_variants = v;
+        }
+        if let Some(v) = raw_read_variants(t, keys.vert_variants, keys) {
+            extras.vert_variants = v;
+            extras.extensible = None;
+        }
+        if let Some(mk) = t.get_key(keys.mathkern).and_then(RawValue::as_table) {
+            extras.math_kerns = MathKerns {
+                top_left: raw_store_math_kerns(mk, keys.top_left, keys),
+                top_right: raw_store_math_kerns(mk, keys.top_right, keys),
+                bottom_right: raw_store_math_kerns(mk, keys.bottom_right, keys),
+                bottom_left: raw_store_math_kerns(mk, keys.bottom_left, keys),
+            };
+        }
+    }
+    if let Some(kt) = t.get_key(keys.kerns).and_then(RawValue::as_table) {
+        let mut any_kern = false;
+        let _ = kt.try_for_each::<()>(|k, v| {
+            any_kern = true;
+            match raw_lig_kern_key(k) {
+                Some(key) => {
+                    let kern = raw_value_number(v).map_or(0, round);
+                    extras.kerns.insert(key, kern);
+                }
+                None => ctx.warnings.push(format!(
+                    "lua-loaded font {} char U+{:X} has an invalid kern field",
+                    ctx.name, code
+                )),
+            }
+            Ok(())
+        });
+        if any_kern && extras.kerns.is_empty() {
+            ctx.warnings.push(format!(
+                "lua-loaded font {} char U+{:X} has an invalid kerns field",
+                ctx.name, code
+            ));
+        }
+    }
+    let mut needs_rooted_cmds = false;
+    match raw_read_commands(t, keys, ctx)? {
+        RawCommands::None => {}
+        RawCommands::Ready(cmds) => extras.commands = Some(cmds),
+        RawCommands::NeedsRooted => needs_rooted_cmds = true,
+    }
+    if let Some(lt) = t.get_key(keys.ligatures).and_then(RawValue::as_table) {
+        let mut any_lig = false;
+        let _ = lt.try_for_each::<()>(|k, v| {
+            any_lig = true;
+            let key = raw_lig_kern_key(k);
+            let entry = v.as_table();
+            let r = entry.map_or(-1, |e| raw_num_key(e, keys.char_key, -1));
+            match (key, entry) {
+                (Some(key), Some(entry)) if r != -1 => {
+                    let op = raw_enum_val(entry.get_key(keys.type_key), 0, LIGATURE_TYPE_STRINGS) as u8;
+                    extras.ligatures.insert(key, LuaLig { op, replacement: r as u32 });
+                }
+                _ => ctx.warnings.push(format!(
+                    "lua-loaded font {} char U+{:X} has an invalid ligature field",
+                    ctx.name, code
+                )),
+            }
+            Ok(())
+        });
+        if any_lig && extras.ligatures.is_empty() {
+            ctx.warnings.push(format!(
+                "lua-loaded font {} char U+{:X} has an invalid ligatures field",
+                ctx.name, code
+            ));
+        }
+    }
+    if !extras.is_empty() {
+        co.extras = Some(Box::new(extras));
+    }
+    Ok((co, needs_rooted_cmds))
+}
+
+enum RootedCmdTarget {
+    Char(u32),
+    LeftBoundary,
+    RightBoundary,
+}
+
+fn fill_rooted_commands(
+    ct: &LuaTable,
+    targets: &[RootedCmdTarget],
+    lf: &mut LuaFont,
+    ctx: &mut ParseCtx<'_>,
+) -> Result<(), String> {
+    for target in targets {
+        let (ctab, slot) = match target {
+            RootedCmdTarget::Char(code) => (
+                ct.raw_geti::<Option<Value>>(i64::from(*code))
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.as_table()),
+                lf.chars.get_mut(code),
+            ),
+            RootedCmdTarget::LeftBoundary => (
+                field(ct, "left_boundary").and_then(|v| v.as_table()),
+                lf.left_boundary.as_mut(),
+            ),
+            RootedCmdTarget::RightBoundary => (
+                field(ct, "right_boundary").and_then(|v| v.as_table()),
+                lf.right_boundary.as_mut(),
+            ),
+        };
+        if let (Some(ctab), Some(co)) = (ctab, slot) {
+            if let Some(cmds) = read_commands(&ctab, ctx)? {
+                co.extras.get_or_insert_with(|| Box::new(LuaCharExtras::default())).commands = Some(cmds);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// luatex `font_from_lua`: read the font table `t` as font `f`.
 pub(crate) fn font_from_lua(eng: &mut Engine, f: FontId, t: &LuaTable) -> Result<ParsedFont, String> {
-    let mut lf = LuaFont::default();
-    let mut warnings = Vec::new();
-    lf.area = Some(str_field(t, "area").unwrap_or_default());
-    lf.filename = str_field(t, "filename");
-    lf.encodingname = str_field(t, "encodingname");
-    let Some(name) = str_field(t, "name") else {
-        return Err(format!("lua-loaded font '{f}' has no name!"));
-    };
-    lf.name = name.clone();
-    lf.fullname = Some(str_field(t, "fullname").unwrap_or_else(|| name.clone()));
-    lf.psname = str_field(t, "psname");
-    lf.units_per_em = num_field(t, "units_per_em", 0);
-    lf.designsize = num_field(t, "designsize", 655360);
-    lf.size = num_field(t, "size", lf.designsize);
-    lf.checksum = field(t, "checksum").and_then(|v| value_number(&v)).map_or(0, |n| n as i64 as u32);
-    lf.direction = num_field(t, "direction", 0);
-    lf.encodingbytes = num_field(t, "encodingbytes", 0) as u8;
-    lf.streamprovider = num_field(t, "streamprovider", 0) as u8;
-    lf.oldmath = bool_field(t, "oldmath", false);
-    lf.tounicode = num_field(t, "tounicode", 0) as u8;
-    lf.slant = clamp_field(t, "slant", 0, -2000, 2000);
-    lf.extend = clamp_field(t, "extend", 1000, -5000, 5000);
-    lf.squeeze = clamp_field(t, "squeeze", 1000, -5000, 5000);
-    lf.width = clamp_field(t, "width", 0, 0, 5000);
-    lf.mode = clamp_field(t, "mode", 0, 0, 3);
     let default_hyphen = eng.eqtb.int_params[crate::prim::IntParam::Defaulthyphenchar.idx() as usize];
     let default_skew = eng.eqtb.int_params[crate::prim::IntParam::Defaultskewchar.idx() as usize];
-    let hyphen_char = num_field(t, "hyphenchar", default_hyphen);
-    let skew_char = num_field(t, "skewchar", default_skew);
-    lf.used = bool_field(t, "used", false);
-    lf.attributes = str_field(t, "attributes").filter(|s| !s.is_empty());
-    lf.ftype = match enum_field(t, "type", 0, FONT_TYPE_STRINGS) {
-        1 => FontType::Virtual,
-        2 => FontType::Real,
-        _ => FontType::Unknown,
-    };
-    lf.format = match enum_field(t, "format", 0, FONT_FORMAT_STRINGS) {
-        1 => FontFormat::Type1,
-        2 => FontFormat::Type3,
-        3 => FontFormat::TrueType,
-        4 => FontFormat::OpenType,
-        _ => FontFormat::Unknown,
-    };
-    let mode_of = |n: usize| match n {
-        1 => FontMode::Horizontal,
-        2 => FontMode::Vertical,
-        _ => FontMode::Unknown,
-    };
-    lf.writingmode = mode_of(enum_field(t, "writingmode", 0, FONT_MODE_STRINGS));
-    lf.identity = mode_of(enum_field(t, "identity", 0, FONT_MODE_STRINGS));
-    lf.embedding = match enum_field(t, "embedding", 0, FONT_EMBEDDING_STRINGS) {
-        1 => FontEmbedding::No,
-        2 => FontEmbedding::Subset,
-        3 => FontEmbedding::Full,
-        _ => FontEmbedding::Unknown,
-    };
-    if lf.encodingbytes == 0 && matches!(lf.format, FontFormat::OpenType | FontFormat::TrueType) {
-        lf.encodingbytes = 2;
+
+    // Phase 1: read top-level metadata, parameters, MathConstants, cidinfo, and
+    // local font specs inside a single zero-handle raw borrow.
+    enum LocalFontSpec {
+        Id(i32),
+        Name(Vec<u8>, i32),
     }
-    lf.subfont = num_field(t, "subfont", 0);
-
-    let local_fonts = local_fonts_of(eng, t, f, &name, lf.ftype == FontType::Virtual, false)?;
-
-    // parameters
-    let mut params = vec![0i32; 7];
-    if let Some(pt) = field(t, "parameters").and_then(|v| v.as_table()) {
-        let pairs = pt.pairs::<Value, Value>().map_err(|e| format!("{e:?}"))?;
-        let mut n = 7usize;
-        for (k, _) in &pairs {
-            if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
-                n = n.max(i as i64 as usize);
-            }
-        }
-        params.resize(n, 0);
-        for i in 1..=7i64 {
-            if let Some(v) = pt.raw_geti::<Option<Value>>(i).ok().flatten().and_then(|v| v.as_number()) {
-                params[i as usize - 1] = round(v);
-            }
-        }
-        for (k, v) in &pairs {
-            let value = value_number(v).map_or(0, round);
-            if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
-                let i = i as i64;
-                if i >= 8 {
-                    params[i as usize - 1] = if v.as_number().is_some() { value } else { 0 };
-                }
-            } else if let Some(s) = k.as_string_handle() {
-                let idx = match s.to_bytes().as_slice() {
-                    b"slant" => 1,
-                    b"space" => 2,
-                    b"space_stretch" => 3,
-                    b"space_shrink" => 4,
-                    b"x_height" => 5,
-                    b"quad" => 6,
-                    b"extra_space" => 7,
-                    _ => 0,
-                };
-                if idx > 0 {
-                    params[idx - 1] = value;
-                }
-            }
-        }
-    }
-
-    // math parameters
-    lf.nomath = bool_field(t, "nomath", false);
-    if !lf.nomath {
-        if let Some(mt) = field(t, "MathConstants").and_then(|v| v.as_table()) {
-            for (k, v) in mt.pairs::<Value, Value>().map_err(|e| format!("{e:?}"))? {
-                let idx = if let Some(n) = k.as_number() {
-                    round(n)
-                } else if let Some(s) = k.as_string_handle() {
-                    let s = s.to_bytes();
-                    MATH_PARAM_NAMES
-                        .iter()
-                        .position(|n| n.as_bytes() == s.as_slice())
-                        .map_or(-1, |p| p as i32)
-                } else {
-                    0
-                };
-                let value = value_number(&v).map_or(0, round);
-                if idx > 0 {
-                    let idx = idx as usize;
-                    if lf.math_params.len() < idx {
-                        lf.math_params.resize(idx, crate::eqtb::UNDEFINED_MATH_PARAMETER);
-                    }
-                    lf.math_params[idx - 1] = value;
-                }
-            }
-            lf.oldmath = false;
-        } else {
-            lf.oldmath = true;
-        }
-        if bool_field(t, "oldmath", false) {
-            lf.oldmath = true;
-        }
-    } else {
-        lf.oldmath = true;
-    }
-
-    // cidinfo
-    if let Some(ct) = field(t, "cidinfo").and_then(|v| v.as_table()) {
-        lf.cidinfo = Some(CidInfo {
-            version: num_field(&ct, "version", 0),
-            supplement: num_field(&ct, "supplement", 0),
-            registry: str_field(&ct, "registry").unwrap_or_else(|| b"Adobe".to_vec()),
-            ordering: str_field(&ct, "ordering").unwrap_or_else(|| b"Identity".to_vec()),
-        });
-    }
-
-    // characters
-    let name_str = String::from_utf8_lossy(&name).into_owned();
-    if let Some(ct) = field(t, "characters").and_then(|v| v.as_table()) {
-        let pairs = ct.pairs::<Value, Value>().map_err(|e| format!("{e:?}"))?;
-        let mut bc: i32 = -1;
-        let mut ec: i32 = 0;
-        let mut any = false;
-        for (k, v) in &pairs {
-            if let (Some(n), Some(_)) = (k.as_number(), v.as_table()) {
-                let i = n as i64;
-                if i >= 0 {
-                    let i = i as i32;
-                    any = true;
-                    ec = ec.max(i);
-                    if bc < 0 || i < bc {
-                        bc = i;
-                    }
-                }
-            }
-        }
-        if any {
-            lf.bc = bc;
-            lf.ec = ec;
-            let mut ctx = ParseCtx {
-                font: f,
-                name: &name_str,
-                has_math: !lf.nomath,
-                local_fonts: &local_fonts,
-                atsize: lf.size,
-                warnings: &mut warnings,
+    let (mut lf, params, hyphen_char, skew_char, local_specs, has_characters) = t
+        .with_raw(|raw| -> Result<_, String> {
+            let mut lf = LuaFont::default();
+            lf.area = Some(raw_str_field(raw, "area").unwrap_or_default());
+            lf.filename = raw_str_field(raw, "filename");
+            lf.encodingname = raw_str_field(raw, "encodingname");
+            let Some(name) = raw_str_field(raw, "name") else {
+                return Err(format!("lua-loaded font '{f}' has no name!"));
             };
-            for (k, v) in &pairs {
-                let Some(ctab) = v.as_table() else { continue };
-                if let Some(n) = k.as_number() {
-                    let i = n as i64;
-                    if i >= 0 {
-                        let co = char_from_lua(&ctab, i as i32, &mut ctx)?;
-                        lf.chars.insert(i as u32, co);
-                    }
-                } else if let Some(s) = k.as_string_handle() {
-                    match s.to_bytes().as_slice() {
-                        b"left_boundary" => lf.left_boundary = Some(char_from_lua(&ctab, LEFT_BOUNDARY, &mut ctx)?),
-                        b"right_boundary" => {
-                            lf.right_boundary = Some(char_from_lua(&ctab, RIGHT_BOUNDARY, &mut ctx)?)
+            lf.name = name.clone();
+            lf.fullname = Some(raw_str_field(raw, "fullname").unwrap_or_else(|| name.clone()));
+            lf.psname = raw_str_field(raw, "psname");
+            lf.units_per_em = raw_num_str(raw, "units_per_em", 0);
+            lf.designsize = raw_num_str(raw, "designsize", 655360);
+            lf.size = raw_num_str(raw, "size", lf.designsize);
+            lf.checksum = raw.get_str("checksum").and_then(raw_value_number).map_or(0, |n| n as i64 as u32);
+            lf.direction = raw_num_str(raw, "direction", 0);
+            lf.encodingbytes = raw_num_str(raw, "encodingbytes", 0) as u8;
+            lf.streamprovider = raw_num_str(raw, "streamprovider", 0) as u8;
+            lf.oldmath = raw_bool_str(raw, "oldmath", false);
+            lf.tounicode = raw_num_str(raw, "tounicode", 0) as u8;
+            lf.slant = raw_clamp_str(raw, "slant", 0, -2000, 2000);
+            lf.extend = raw_clamp_str(raw, "extend", 1000, -5000, 5000);
+            lf.squeeze = raw_clamp_str(raw, "squeeze", 1000, -5000, 5000);
+            lf.width = raw_clamp_str(raw, "width", 0, 0, 5000);
+            lf.mode = raw_clamp_str(raw, "mode", 0, 0, 3);
+            let hyphen_char = raw_num_str(raw, "hyphenchar", default_hyphen);
+            let skew_char = raw_num_str(raw, "skewchar", default_skew);
+            lf.used = raw_bool_str(raw, "used", false);
+            lf.attributes = raw_str_field(raw, "attributes").filter(|s| !s.is_empty());
+            lf.ftype = match raw_enum_val(raw.get_str("type"), 0, FONT_TYPE_STRINGS) {
+                1 => FontType::Virtual,
+                2 => FontType::Real,
+                _ => FontType::Unknown,
+            };
+            lf.format = match raw_enum_val(raw.get_str("format"), 0, FONT_FORMAT_STRINGS) {
+                1 => FontFormat::Type1,
+                2 => FontFormat::Type3,
+                3 => FontFormat::TrueType,
+                4 => FontFormat::OpenType,
+                _ => FontFormat::Unknown,
+            };
+            let mode_of = |n: usize| match n {
+                1 => FontMode::Horizontal,
+                2 => FontMode::Vertical,
+                _ => FontMode::Unknown,
+            };
+            lf.writingmode = mode_of(raw_enum_val(raw.get_str("writingmode"), 0, FONT_MODE_STRINGS));
+            lf.identity = mode_of(raw_enum_val(raw.get_str("identity"), 0, FONT_MODE_STRINGS));
+            lf.embedding = match raw_enum_val(raw.get_str("embedding"), 0, FONT_EMBEDDING_STRINGS) {
+                1 => FontEmbedding::No,
+                2 => FontEmbedding::Subset,
+                3 => FontEmbedding::Full,
+                _ => FontEmbedding::Unknown,
+            };
+            if lf.encodingbytes == 0 && matches!(lf.format, FontFormat::OpenType | FontFormat::TrueType) {
+                lf.encodingbytes = 2;
+            }
+            lf.subfont = raw_num_str(raw, "subfont", 0);
+
+            // Local font specs (resolved against engine outside `with_raw`)
+            let name_str = String::from_utf8_lossy(&name).into_owned();
+            let mut local_specs: Option<Vec<LocalFontSpec>> = None;
+            if let Some(ft) = raw.get_str("fonts").and_then(RawValue::as_table) {
+                let mut count = 0usize;
+                let _ = ft.try_for_each::<()>(|_, _| {
+                    count += 1;
+                    Ok(())
+                });
+                if count > 0 {
+                    let mut specs = Vec::with_capacity(count);
+                    for i in 1..=count {
+                        let Some(entry) = ft.get_int(i as i64).and_then(RawValue::as_table) else {
+                            return Err(format!("invalid local font at index {i} in lua-loaded font '{name_str}' (1)"));
+                        };
+                        if let Some(id) = entry.get_str("id").and_then(raw_value_number) {
+                            specs.push(LocalFontSpec::Id(round(id)));
+                        } else {
+                            let Some(lname) = raw_str_field(entry, "name") else {
+                                return Err(format!("invalid local font at index {i} in lua-loaded font '{name_str}' (1)"));
+                            };
+                            let size = raw_num_str(entry, "size", -1000);
+                            specs.push(LocalFontSpec::Name(lname, size));
                         }
-                        _ => {}
                     }
+                    local_specs = Some(specs);
                 }
             }
-            // `kerns`/`ligatures` mentioning `right_boundary` create the
-            // (empty) right boundary character.
-            if lf.right_boundary.is_none()
-                && lf.chars.values().any(|c| {
-                    c.kerns().is_some_and(|kerns| kerns.contains_key(&RIGHT_BOUNDARY))
-                        || c.ligatures().is_some_and(|ligatures| ligatures.contains_key(&RIGHT_BOUNDARY))
-                })
-            {
-                lf.right_boundary = Some(LuaCharInfo::default());
+
+            // parameters
+            let mut params = vec![0i32; 7];
+            if let Some(pt) = raw.get_str("parameters").and_then(RawValue::as_table) {
+                let mut n = 7usize;
+                let _ = pt.try_for_each::<()>(|k, _| {
+                    if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
+                        n = n.max(i as i64 as usize);
+                    }
+                    Ok(())
+                });
+                params.resize(n, 0);
+                for i in 1..=7i64 {
+                    if let Some(v) = pt.get_int(i).and_then(RawValue::as_number) {
+                        params[i as usize - 1] = round(v);
+                    }
+                }
+                let _ = pt.try_for_each::<()>(|k, v| {
+                    let value = raw_value_number(v).map_or(0, round);
+                    if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
+                        let i = i as i64;
+                        if i >= 8 {
+                            params[i as usize - 1] = if v.as_number().is_some() { value } else { 0 };
+                        }
+                    } else if let Some(s) = k.as_bytes() {
+                        let idx = match s {
+                            b"slant" => 1,
+                            b"space" => 2,
+                            b"space_stretch" => 3,
+                            b"space_shrink" => 4,
+                            b"x_height" => 5,
+                            b"quad" => 6,
+                            b"extra_space" => 7,
+                            _ => 0,
+                        };
+                        if idx > 0 {
+                            params[idx - 1] = value;
+                        }
+                    }
+                    Ok(())
+                });
             }
-            // font expansion (handled last, like luatex)
-            let mut step = num_field(t, "step", 0).clamp(0, 100);
-            if step != 0 {
-                let mut shrink = num_field(t, "shrink", 0).clamp(0, 500);
-                shrink -= shrink % step;
-                let mut stretch = num_field(t, "stretch", 0).clamp(0, 1000);
-                stretch -= stretch % step;
-                lf.step = step;
-                lf.shrink = shrink.max(0);
-                lf.stretch = stretch.max(0);
+
+            // math parameters
+            lf.nomath = raw_bool_str(raw, "nomath", false);
+            if !lf.nomath {
+                if let Some(mt) = raw.get_str("MathConstants").and_then(RawValue::as_table) {
+                    let _ = mt.try_for_each::<()>(|k, v| {
+                        let idx = if let Some(n) = k.as_number() {
+                            round(n)
+                        } else if let Some(s) = k.as_bytes() {
+                            MATH_PARAM_NAMES
+                                .iter()
+                                .position(|n| n.as_bytes() == s)
+                                .map_or(-1, |p| p as i32)
+                        } else {
+                            0
+                        };
+                        let value = raw_value_number(v).map_or(0, round);
+                        if idx > 0 {
+                            let idx = idx as usize;
+                            if lf.math_params.len() < idx {
+                                lf.math_params.resize(idx, crate::eqtb::UNDEFINED_MATH_PARAMETER);
+                            }
+                            lf.math_params[idx - 1] = value;
+                        }
+                        Ok(())
+                    });
+                    lf.oldmath = false;
+                } else {
+                    lf.oldmath = true;
+                }
+                if raw_bool_str(raw, "oldmath", false) {
+                    lf.oldmath = true;
+                }
             } else {
-                step = 0;
-                lf.step = step;
+                lf.oldmath = true;
             }
-        } else {
-            warnings.push(format!("lua-loaded font '{f}' with name '{name_str}' has no characters"));
+
+            // cidinfo
+            if let Some(ct) = raw.get_str("cidinfo").and_then(RawValue::as_table) {
+                lf.cidinfo = Some(CidInfo {
+                    version: raw_num_str(ct, "version", 0),
+                    supplement: raw_num_str(ct, "supplement", 0),
+                    registry: raw_str_field(ct, "registry").unwrap_or_else(|| b"Adobe".to_vec()),
+                    ordering: raw_str_field(ct, "ordering").unwrap_or_else(|| b"Identity".to_vec()),
+                });
+            }
+
+            let has_characters = raw.get_str("characters").and_then(RawValue::as_table).is_some();
+            Ok((lf, params, hyphen_char, skew_char, local_specs, has_characters))
+        })
+        .map_err(|e| format!("{e:?}"))??;
+
+    let local_fonts = match local_specs {
+        Some(specs) => {
+            let mut l_fonts = vec![0 as FontId; specs.len() + 1];
+            for (idx, spec) in specs.into_iter().enumerate() {
+                l_fonts[idx + 1] = match spec {
+                    LocalFontSpec::Id(id) => if id == 0 { f } else { id as FontId },
+                    LocalFontSpec::Name(lname, size) => {
+                        if lname == lf.name { f } else { eng.lua_find_font_id(&lname, size) }
+                    }
+                };
+            }
+            l_fonts
+        }
+        None if lf.ftype == FontType::Virtual => Vec::new(),
+        None => vec![0, f],
+    };
+
+    // Phase 2: characters (zero registry handles; falls back only for rare lua/node/image VF commands).
+    let mut warnings = Vec::new();
+    let name_str = String::from_utf8_lossy(&lf.name).into_owned();
+    if has_characters {
+        let mut ctx = ParseCtx {
+            font: f,
+            name: &name_str,
+            has_math: !lf.nomath,
+            local_fonts: &local_fonts,
+            atsize: lf.size,
+            warnings: &mut warnings,
+        };
+        let needs_rooted: Vec<RootedCmdTarget> = t
+            .with_raw(|raw| -> Result<Vec<RootedCmdTarget>, String> {
+                let mut rooted = Vec::new();
+                let Some(ct) = raw.get_str("characters").and_then(RawValue::as_table) else {
+                    ctx.warnings.push(format!("lua-loaded font '{f}' with name '{name_str}' has no character table"));
+                    return Ok(rooted);
+                };
+                let mut bc: i32 = -1;
+                let mut ec: i32 = 0;
+                let mut count: usize = 0;
+                let _ = ct.try_for_each::<()>(|k, v| {
+                    if let (Some(n), Some(_)) = (k.as_number(), v.as_table()) {
+                        let i = n as i64;
+                        if i >= 0 {
+                            let i = i as i32;
+                            count += 1;
+                            ec = ec.max(i);
+                            if bc < 0 || i < bc {
+                                bc = i;
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+                if count > 0 {
+                    lf.bc = bc;
+                    lf.ec = ec;
+                    lf.chars.reserve(count);
+                    let keys = CharKeys::resolve(ct);
+                    ct.try_for_each(|k, v| -> Result<(), String> {
+                        let Some(ctab) = v.as_table() else { return Ok(()) };
+                        if let Some(n) = k.as_number() {
+                            let i = n as i64;
+                            if i >= 0 {
+                                let (co, need_root) = char_from_raw(ctab, i as i32, &keys, &mut ctx)?;
+                                lf.chars.insert(i as u32, co);
+                                if need_root {
+                                    rooted.push(RootedCmdTarget::Char(i as u32));
+                                }
+                            }
+                        } else if let Some(s) = k.as_bytes() {
+                            match s {
+                                b"left_boundary" => {
+                                    let (co, need_root) = char_from_raw(ctab, LEFT_BOUNDARY, &keys, &mut ctx)?;
+                                    lf.left_boundary = Some(co);
+                                    if need_root {
+                                        rooted.push(RootedCmdTarget::LeftBoundary);
+                                    }
+                                }
+                                b"right_boundary" => {
+                                    let (co, need_root) = char_from_raw(ctab, RIGHT_BOUNDARY, &keys, &mut ctx)?;
+                                    lf.right_boundary = Some(co);
+                                    if need_root {
+                                        rooted.push(RootedCmdTarget::RightBoundary);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    // `kerns`/`ligatures` mentioning `right_boundary` create the
+                    // (empty) right boundary character.
+                    if lf.right_boundary.is_none()
+                        && lf.chars.values().any(|c| {
+                            c.kerns().is_some_and(|kerns| kerns.contains_key(&RIGHT_BOUNDARY))
+                                || c.ligatures().is_some_and(|ligatures| ligatures.contains_key(&RIGHT_BOUNDARY))
+                        })
+                    {
+                        lf.right_boundary = Some(LuaCharInfo::default());
+                    }
+                    // font expansion (handled last, like luatex)
+                    let mut step = raw_num_str(raw, "step", 0).clamp(0, 100);
+                    if step != 0 {
+                        let mut shrink = raw_num_str(raw, "shrink", 0).clamp(0, 500);
+                        shrink -= shrink % step;
+                        let mut stretch = raw_num_str(raw, "stretch", 0).clamp(0, 1000);
+                        stretch -= stretch % step;
+                        lf.step = step;
+                        lf.shrink = shrink.max(0);
+                        lf.stretch = stretch.max(0);
+                    } else {
+                        step = 0;
+                        lf.step = step;
+                    }
+                } else {
+                    ctx.warnings.push(format!("lua-loaded font '{f}' with name '{name_str}' has no characters"));
+                }
+                Ok(rooted)
+            })
+            .map_err(|e| format!("{e:?}"))??;
+        if !needs_rooted.is_empty() {
+            if let Some(ct) = field(t, "characters").and_then(|v| v.as_table()) {
+                fill_rooted_commands(&ct, &needs_rooted, &mut lf, &mut ctx)?;
+            }
         }
     } else {
         warnings.push(format!("lua-loaded font '{f}' with name '{name_str}' has no character table"));
@@ -882,7 +1494,8 @@ pub(crate) fn font_from_lua(eng: &mut Engine, f: FontId, t: &LuaTable) -> Result
 
 /// `cache = "no" | "renew"` keep luatex from remembering the table.
 pub(crate) fn cache_allowed(t: &LuaTable) -> bool {
-    !matches!(str_field(t, "cache").as_deref(), Some(b"no") | Some(b"renew"))
+    t.with_raw(|raw| !matches!(raw.get_str("cache").and_then(RawValue::as_bytes), Some(b"no") | Some(b"renew")))
+        .unwrap_or(true)
 }
 
 /// luatex `characters_from_lua` (`font.addcharacters`): add or replace
@@ -896,41 +1509,68 @@ pub(crate) fn characters_from_lua(eng: &mut Engine, f: FontId, t: &LuaTable) -> 
     };
     let mut lf = (**lua_font).clone();
     let mut warnings = Vec::new();
-    lf.nomath = bool_field(t, "nomath", false);
-    lf.ftype = match enum_field(t, "type", match lf.ftype {
-        FontType::Unknown => 0,
-        FontType::Virtual => 1,
-        FontType::Real => 2,
-    }, FONT_TYPE_STRINGS) {
-        1 => FontType::Virtual,
-        2 => FontType::Real,
-        _ => FontType::Unknown,
-    };
+    let (nomath, ftype) = t
+        .with_raw(|raw| {
+            let nomath = raw_bool_str(raw, "nomath", false);
+            let ftype = match raw_enum_val(
+                raw.get_str("type"),
+                match lf.ftype {
+                    FontType::Unknown => 0,
+                    FontType::Virtual => 1,
+                    FontType::Real => 2,
+                },
+                FONT_TYPE_STRINGS,
+            ) {
+                1 => FontType::Virtual,
+                2 => FontType::Real,
+                _ => FontType::Unknown,
+            };
+            (nomath, ftype)
+        })
+        .map_err(|e| format!("{e:?}"))?;
+    lf.nomath = nomath;
+    lf.ftype = ftype;
     let name = lf.name.clone();
     let local_fonts = local_fonts_of(eng, t, f, &name, false, lf.ftype == FontType::Virtual)?;
     let name_str = String::from_utf8_lossy(&name).into_owned();
-    if let Some(ct) = field(t, "characters").and_then(|v| v.as_table()) {
-        let pairs = ct.pairs::<Value, Value>().map_err(|e| format!("{e:?}"))?;
-        let mut ctx = ParseCtx {
-            font: f,
-            name: &name_str,
-            has_math: !lf.nomath,
-            local_fonts: &local_fonts,
-            atsize: lf.size,
-            warnings: &mut warnings,
-        };
-        for (k, v) in &pairs {
-            let (Some(n), Some(ctab)) = (k.as_number(), v.as_table()) else { continue };
-            let i = n as i64;
-            if i < 0 {
-                continue;
-            }
-            let co = char_from_lua(&ctab, i as i32, &mut ctx)?;
-            if lf.bc <= 0 && lf.chars.is_empty() || (i as i32) < lf.bc {
-                lf.bc = i as i32;
-            }
-            lf.ec = lf.ec.max(i as i32);
-            lf.chars.insert(i as u32, co);
+    let mut ctx = ParseCtx {
+        font: f,
+        name: &name_str,
+        has_math: !lf.nomath,
+        local_fonts: &local_fonts,
+        atsize: lf.size,
+        warnings: &mut warnings,
+    };
+    let needs_rooted: Vec<RootedCmdTarget> = t
+        .with_raw(|raw| -> Result<Vec<RootedCmdTarget>, String> {
+            let mut rooted = Vec::new();
+            let Some(ct) = raw.get_str("characters").and_then(RawValue::as_table) else {
+                return Ok(rooted);
+            };
+            let keys = CharKeys::resolve(ct);
+            ct.try_for_each(|k, v| -> Result<(), String> {
+                let (Some(n), Some(ctab)) = (k.as_number(), v.as_table()) else { return Ok(()) };
+                let i = n as i64;
+                if i < 0 {
+                    return Ok(());
+                }
+                let (co, need_root) = char_from_raw(ctab, i as i32, &keys, &mut ctx)?;
+                if lf.bc <= 0 && lf.chars.is_empty() || (i as i32) < lf.bc {
+                    lf.bc = i as i32;
+                }
+                lf.ec = lf.ec.max(i as i32);
+                lf.chars.insert(i as u32, co);
+                if need_root {
+                    rooted.push(RootedCmdTarget::Char(i as u32));
+                }
+                Ok(())
+            })?;
+            Ok(rooted)
+        })
+        .map_err(|e| format!("{e:?}"))??;
+    if !needs_rooted.is_empty() {
+        if let Some(ct) = field(t, "characters").and_then(|v| v.as_table()) {
+            fill_rooted_commands(&ct, &needs_rooted, &mut lf, &mut ctx)?;
         }
     }
     let new_font = std::rc::Rc::new(lf);

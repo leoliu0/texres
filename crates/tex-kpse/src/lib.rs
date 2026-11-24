@@ -421,11 +421,16 @@ fn decode_member_frames(first: usize, length: usize) -> Option<Vec<u8>> {
         free = tail;
         chunk_index += 1;
     }
-    fn decode((input, target): (&[u8], &mut [u8])) -> bool {
+    fn decode_lane(lane: Vec<(&[u8], &mut [u8])>) -> bool {
         let mut decoder = ruzstd::decoding::FrameDecoder::new();
         decoder.set_max_window_size(MAX_PACKAGE_CHUNK_BYTES as u64);
-        // Fails with `TargetTooSmall` when the frame holds more than indexed.
-        matches!(decoder.decode_all(input, target), Ok(n) if n == target.len())
+        for (input, target) in lane {
+            // Fails with `TargetTooSmall` when the frame holds more than indexed.
+            if !matches!(decoder.decode_all(input, target), Ok(n) if n == target.len()) {
+                return false;
+            }
+        }
+        true
     }
     #[cfg(not(target_arch = "wasm32"))]
     let threads = std::thread::available_parallelism()
@@ -435,7 +440,7 @@ fn decode_member_frames(first: usize, length: usize) -> Option<Vec<u8>> {
     #[cfg(target_arch = "wasm32")]
     let threads = 1;
     let ok = if threads <= 1 {
-        jobs.into_iter().all(decode)
+        decode_lane(jobs)
     } else {
         // Lane `k` takes frames k, k + threads, ...; this thread runs lane 0.
         let mut lanes: Vec<Vec<(&[u8], &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
@@ -446,9 +451,9 @@ fn decode_member_frames(first: usize, length: usize) -> Option<Vec<u8>> {
         let own = lanes.next().unwrap_or_default();
         std::thread::scope(|scope| {
             let workers: Vec<_> = lanes
-                .map(|lane| scope.spawn(move || lane.into_iter().all(decode)))
+                .map(|lane| scope.spawn(move || decode_lane(lane)))
                 .collect();
-            let mine = own.into_iter().all(decode);
+            let mine = decode_lane(own);
             workers
                 .into_iter()
                 .fold(mine, |ok, worker| worker.join().unwrap_or(false) && ok)

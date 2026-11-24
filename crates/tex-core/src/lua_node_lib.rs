@@ -5,7 +5,7 @@
 
 use std::rc::Rc;
 
-use tex_lua::{CallbackLua, Lua, LuaApi, LuaTable, LuaValueKind, Multi, UdValue, UserDataTrait, Value, Variadic};
+use tex_lua::{CallbackLua, Lua, LuaApi, LuaResult, LuaTable, LuaValueKind, UdValue, UserDataTrait, Value, Variadic};
 
 use crate::engine::Engine;
 use crate::lua_bridge::with_engine;
@@ -264,14 +264,101 @@ macro_rules! nat {
     };
 }
 
-type Ret = Result<Variadic<UdValue>, String>;
-
-fn ret(vals: Vec<UdValue>) -> Ret {
-    Ok(Variadic(vals))
+macro_rules! cnat {
+    ($lua:expr, $tbl:expr, $name:literal, $f:expr) => {
+        $tbl.set($name, $lua.create_c_callback($f).map_err(|e| format!("{}: {e:?}", $name))?)
+            .map_err(|e| format!("{}: {e:?}", $name))?
+    };
 }
 
-fn opt_node(h: u32) -> UdValue {
-    if h == 0 { UdValue::Nil } else { UdValue::Integer(i64::from(h)) }
+#[inline(always)]
+fn opt_int_arg(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<Option<i64>> {
+    if let Some(i) = cx.arg_integer(idx) {
+        return Ok(Some(i));
+    }
+    if cx.arg_is_nil(idx) {
+        return Ok(None);
+    }
+    cx.arg::<Option<i64>>(idx)
+}
+
+#[inline(always)]
+fn handle_arg(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<u32> {
+    Ok(opt_int_arg(cx, idx)?.unwrap_or(0) as u32)
+}
+
+#[inline(always)]
+fn opt_num_arg(cx: &mut CallbackLua<'_>, idx: usize) -> LuaResult<Option<f64>> {
+    if let Some(n) = cx.arg_number(idx) {
+        return Ok(Some(n));
+    }
+    if cx.arg_is_nil(idx) {
+        return Ok(None);
+    }
+    cx.arg::<Option<f64>>(idx)
+}
+
+#[inline(always)]
+fn arg_is_num(cx: &CallbackLua<'_>, idx: usize) -> bool {
+    cx.arg_number(idx).is_some()
+}
+
+#[inline(always)]
+fn arg_vint(cx: &CallbackLua<'_>, idx: usize) -> i64 {
+    if let Some(i) = cx.arg_integer(idx) {
+        i
+    } else if let Some(n) = cx.arg_number(idx) {
+        if n.fract() == 0.0 { n as i64 } else { 0 }
+    } else if let Some(i) = cx
+        .arg_bytes(idx, |b| std::str::from_utf8(b).ok().and_then(|s| s.trim().parse::<i64>().ok()))
+        .flatten()
+    {
+        i
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+fn arg_vnum(cx: &CallbackLua<'_>, idx: usize) -> f64 {
+    if let Some(n) = cx.arg_number(idx) {
+        n
+    } else if let Some(n) = cx
+        .arg_bytes(idx, |b| std::str::from_utf8(b).ok().and_then(|s| s.trim().parse::<f64>().ok()))
+        .flatten()
+    {
+        n
+    } else {
+        0.0
+    }
+}
+
+#[inline(always)]
+fn arg_vround(cx: &CallbackLua<'_>, idx: usize) -> i64 {
+    (arg_vnum(cx, idx) + 0.5).floor() as i64
+}
+
+#[inline(always)]
+fn push_opt_node(cx: &mut CallbackLua<'_>, h: u32) -> LuaResult<usize> {
+    if h == 0 { cx.push_nil() } else { cx.push_int(i64::from(h)) }
+}
+
+#[inline(always)]
+fn push_val(cx: &mut CallbackLua<'_>, v: Val, direct: bool) -> LuaResult<usize> {
+    match v {
+        Val::Nil | Val::Toks => cx.push_nil(),
+        Val::Int(i) => cx.push_int(i),
+        Val::Num(n) => cx.push_float(n),
+        Val::Node(h) => {
+            if direct {
+                cx.push_int(i64::from(h))
+            } else {
+                cx.push_userdata(NodeUd { h })
+            }
+        }
+        Val::Bytes(b) => cx.push_bytes(&b),
+        Val::Str(s) => cx.push_bytes(s.as_bytes()),
+    }
 }
 
 pub(crate) fn handle32(v: Option<i64>) -> u32 {
@@ -307,14 +394,6 @@ pub(crate) fn value_num(v: &Value) -> f64 {
     }
 }
 
-fn is_num(v: Option<&Value>) -> bool {
-    v.is_some_and(|v| v.as_integer().is_some() || v.as_number().is_some())
-}
-
-fn vround(v: &Value) -> i64 {
-    (value_num(v) + 0.5).floor() as i64
-}
-
 pub(crate) fn value_bytes(v: &Value) -> Option<Vec<u8>> {
     v.as_string_handle().map(|s| s.to_bytes())
 }
@@ -323,8 +402,9 @@ fn is_truthy(v: Option<&Value>) -> bool {
     v.is_some_and(|v| !v.is_nil() && v.as_boolean() != Some(false))
 }
 
-fn dir_string(d: i32) -> UdValue {
-    if (0..4).contains(&d) { UdValue::Str(DIR_NAMES[d as usize].to_string()) } else { UdValue::Nil }
+#[inline(always)]
+fn push_dir_string(cx: &mut CallbackLua<'_>, d: i32) -> LuaResult<usize> {
+    if (0..4).contains(&d) { cx.push_bytes(DIR_NAMES[d as usize].as_bytes()) } else { cx.push_nil() }
 }
 
 /// Register the natives; returns the table the Lua side consumes.
@@ -333,120 +413,123 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
     crate::lua_ud::install_tokens(lua, &n)?;
 
     // ---- identity, links ----
-    nat!(lua, n, "getid", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            e.lua_nodes.valid(h).then(|| i64::from(e.lua_nodes.id(h)))
-        })
+    cnat!(lua, n, "getid", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = with_engine(|e| e.lua_nodes.valid(h).then(|| i64::from(e.lua_nodes.id(h))))
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(v)
     });
-    nat!(lua, n, "getsubtype", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            e.lua_nodes.valid(h).then(|| i64::from(e.lua_nodes.subtype(h)))
-        })
+    cnat!(lua, n, "getsubtype", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = with_engine(|e| e.lua_nodes.valid(h).then(|| i64::from(e.lua_nodes.subtype(h))))
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(v)
     });
-    nat!(lua, n, "setsubtype", |h: Option<i64>, v: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "setsubtype", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_int_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if let (true, Some(v)) = (e.lua_nodes.valid(h), v) {
                 e.lua_nodes.node_mut(h).subtype = v as u16;
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getnext", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getnext", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let x = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.next(h) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, x)
+    });
+    cnat!(lua, n, "getprev", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let x = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.prev(h) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, x)
+    });
+    cnat!(lua, n, "getboth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let (p, x) = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return None;
+                return (0, 0);
             }
-            let x = e.lua_nodes.next(h);
-            (x != 0).then_some(i64::from(x))
+            (e.lua_nodes.prev(h), e.lua_nodes.next(h))
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, p)?;
+        push_opt_node(cx, x)?;
+        Ok(2)
     });
-    nat!(lua, n, "getprev", |h: Option<i64>| -> Result<Option<i64>, String> {
+    cnat!(lua, n, "setnext", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            let x = e.lua_nodes.prev(h);
-            (x != 0).then_some(i64::from(x))
-        })
-    });
-    nat!(lua, n, "getboth", |h: Option<i64>| -> Result<(Option<i64>, Option<i64>), String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return (None, None);
-            }
-            let (p, x) = (e.lua_nodes.prev(h), e.lua_nodes.next(h));
-            ((p != 0).then_some(i64::from(p)), (x != 0).then_some(i64::from(x)))
-        })
-    });
-    nat!(lua, n, "setnext", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
-        with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 e.lua_nodes.node_mut(h).next = v.map_or(0, |v| v as u32);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "setprev", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setprev", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 e.lua_nodes.node_mut(h).prev = v.map_or(0, |v| v as u32);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "setboth", |h: Option<i64>, p: Option<f64>, x: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setboth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let p = opt_num_arg(cx, 2)?;
+        let x = opt_num_arg(cx, 3)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 let nd = e.lua_nodes.node_mut(h);
                 nd.prev = p.map_or(0, |v| v as u32);
                 nd.next = x.map_or(0, |v| v as u32);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "setlink", |args: Variadic<Value>| -> Result<Option<i64>, String> {
-        let vals: Vec<Option<u32>> = args
-            .iter()
-            .map(|v| if is_num(Some(v)) { Some(value_int(v) as u32) } else { None })
-            .collect();
-        with_engine(|e| {
+    cnat!(lua, n, "setlink", |cx| {
+        let top = cx.arg_count();
+        let head = with_engine(|e| {
             let s = &mut e.lua_nodes;
             let (mut head, mut tail) = (0u32, 0u32);
-            for (i, v) in vals.iter().enumerate() {
-                match v {
-                    Some(c) => {
-                        let c = *c;
-                        if c != tail {
-                            if tail != 0 {
-                                s.node_mut(tail).next = c;
-                                s.node_mut(c).prev = tail;
-                            } else if i > 0 {
-                                s.node_mut(c).prev = 0;
-                            }
-                            tail = c;
-                            if head == 0 {
-                                head = tail;
-                            }
-                        }
-                    }
-                    None => {
+            for idx in 1..=top {
+                if arg_is_num(cx, idx) {
+                    let c = arg_vint(cx, idx) as u32;
+                    if c != tail {
                         if tail != 0 {
-                            s.node_mut(tail).next = 0;
+                            s.node_mut(tail).next = c;
+                            s.node_mut(c).prev = tail;
+                        } else if idx > 1 {
+                            s.node_mut(c).prev = 0;
+                        }
+                        tail = c;
+                        if head == 0 {
+                            head = tail;
                         }
                     }
+                } else if tail != 0 {
+                    s.node_mut(tail).next = 0;
                 }
             }
-            (head != 0).then_some(i64::from(head))
+            head
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, head)
     });
-    nat!(lua, n, "setsplit", |l: Option<i64>, r: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "setsplit", |cx| {
+        let l = handle_arg(cx, 1)?;
+        let r = handle_arg(cx, 2)?;
         with_engine(|e| {
-            let (l, r) = (handle32(l), handle32(r));
             if l == 0 || r == 0 {
                 return;
             }
@@ -464,179 +547,185 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
             s.node_mut(l).next = 0;
             s.node_mut(r).prev = 0;
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // ---- creation, release, copies ----
-    nat!(lua, n, "new", |id: Value, sub: Option<Value>| -> Result<i64, String> {
-        let idv: Result<u8, String> = if let Some(i) = id.as_integer() {
-            if type_info(i as u8).is_some() && (0..=255).contains(&i) {
-                Ok(i as u8)
+    cnat!(lua, n, "new", |cx| {
+        let idv: u8 = if let Some(i) = cx.arg_integer(1) {
+            if (0..=255).contains(&i) && type_info(i as u8).is_some() {
+                i as u8
             } else {
-                Err("invalid node id for creating new node".to_string())
+                return Err(cx.raw_error("invalid node id for creating new node"));
             }
-        } else if let Some(b) = value_bytes(&id) {
-            type_by_name(&b).map(|t| t.id).ok_or_else(|| "invalid node id for creating new node".to_string())
+        } else if let Some(Some(id)) = cx.arg_bytes(1, |b| type_by_name(b).map(|t| t.id)) {
+            id
         } else {
-            Err("invalid node id for creating new node".to_string())
+            return Err(cx.raw_error("invalid node id for creating new node"));
         };
-        let idv = idv?;
-        let subv: Result<u16, String> = if idv == WHATSIT {
-            let r = match &sub {
-                Some(s) => {
-                    if let Some(i) = s.as_integer() {
-                        whatsit_info(i as u16).filter(|_| (0..=255).contains(&i)).map(|w| u16::from(w.id))
-                    } else {
-                        value_bytes(s).and_then(|b| whatsit_by_name(&b))
-                    }
+        let subv: u16 = if idv == WHATSIT {
+            let r = if let Some(i) = cx.arg_integer(2) {
+                if (0..=255).contains(&i) {
+                    whatsit_info(i as u16).map(|w| u16::from(w.id))
+                } else {
+                    None
                 }
-                None => None,
+            } else {
+                cx.arg_bytes(2, whatsit_by_name).flatten()
             };
-            r.ok_or_else(|| "creating a whatsit requires the subtype number as a second argument".to_string())
-        } else {
-            match &sub {
-                Some(s) if s.as_integer().is_some() => Ok(value_int(s) as u16),
-                Some(s) => match value_bytes(s) {
-                    Some(b) => {
-                        let t = type_info(idv);
-                        Ok(t.and_then(|t| t.subtypes.iter().find(|(_, n)| n.as_bytes() == b.as_slice()).map(|(i, _)| *i)).unwrap_or(0))
-                    }
-                    None => Ok(0),
-                },
-                None => Ok(0),
+            match r {
+                Some(v) => v,
+                None => return Err(cx.raw_error("creating a whatsit requires the subtype number as a second argument")),
             }
+        } else if let Some(i) = cx.arg_integer(2) {
+            i as u16
+        } else if let Some(sub) = cx.arg_bytes(2, |b| {
+            type_info(idv)
+                .and_then(|t| t.subtypes.iter().find(|(_, n)| n.as_bytes() == b).map(|(i, _)| *i))
+                .unwrap_or(0)
+        }) {
+            sub
+        } else {
+            0
         };
-        let subv = subv?;
-        with_engine(|e| i64::from(e.lua_new_node(idv, subv)))
+        let h = with_engine(|e| i64::from(e.lua_new_node(idv, subv))).map_err(|msg| cx.raw_error(msg))?;
+        cx.push_int(h)
     });
-    nat!(lua, n, "free", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "free", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let nx = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return None;
+                return 0;
             }
             let nx = e.lua_nodes.next(h);
             e.lua_flush_node(h);
-            (nx != 0).then_some(i64::from(nx))
+            nx
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, nx)
     });
-    nat!(lua, n, "flush_node", |h: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "flush_node", |cx| {
+        let h = handle_arg(cx, 1)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 e.lua_flush_node(h);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "flush_list", |h: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "flush_list", |cx| {
+        let mut h = handle_arg(cx, 1)?;
         with_engine(|e| {
-            let mut h = handle32(h);
             while e.lua_nodes.valid(h) {
                 let nx = e.lua_nodes.next(h);
                 e.lua_flush_node(h);
                 h = nx;
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "copy", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            let c = e.lua_copy_node(h);
-            Some(i64::from(c))
-        })
+    cnat!(lua, n, "copy", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let c = with_engine(|e| if e.lua_nodes.valid(h) { Some(i64::from(e.lua_copy_node(h))) } else { None })
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(c)
     });
-    nat!(lua, n, "copy_list", |h: Option<i64>, stop: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let (h, stop) = (handle32(h), handle32(stop));
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            let c = e.lua_copy_range(h, stop);
-            (c != 0).then_some(i64::from(c))
-        })
+    cnat!(lua, n, "copy_list", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let stop = handle_arg(cx, 2)?;
+        let c = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_copy_range(h, stop) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, c)
     });
-    nat!(lua, n, "remove", |head: Option<i64>, cur: Option<i64>| -> Result<(Option<i64>, Option<i64>), String> {
-        with_engine(|e| {
-            let (head, cur) = (handle32(head), handle32(cur));
+    cnat!(lua, n, "remove", |cx| {
+        let head = handle_arg(cx, 1)?;
+        let cur = handle_arg(cx, 2)?;
+        let (h, c) = with_engine(|e| {
             if head != 0 && !e.lua_nodes.valid(head) {
-                return Ok((None, None));
+                return Ok((0, 0));
             }
-            let (h, c) = e.lua_nodes.remove(head, cur, true)?;
-            Ok(((h != 0).then_some(i64::from(h)), (c != 0).then_some(i64::from(c))))
-        })?
+            e.lua_nodes.remove(head, cur, true)
+        })
+        .and_then(|r| r)
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, h)?;
+        push_opt_node(cx, c)?;
+        Ok(2)
     });
-    nat!(lua, n, "insert_before", |head: Option<i64>, cur: Option<i64>, node: Option<i64>| -> Result<(Option<i64>, Option<i64>), String> {
-        with_engine(|e| {
-            let (head, cur, nn) = (handle32(head), handle32(cur), handle32(node));
+    cnat!(lua, n, "insert_before", |cx| {
+        let head = handle_arg(cx, 1)?;
+        let cur = handle_arg(cx, 2)?;
+        let nn = handle_arg(cx, 3)?;
+        let (h, n) = with_engine(|e| {
             if nn == 0 {
-                return Ok((Some(i64::from(head)).filter(|h| *h != 0), Some(i64::from(cur)).filter(|c| *c != 0)));
+                return Ok((head, cur));
             }
-            let (h, n) = e.lua_nodes.insert_before(head, cur, nn)?;
-            Ok((Some(i64::from(h)), Some(i64::from(n))))
-        })?
+            e.lua_nodes.insert_before(head, cur, nn)
+        })
+        .and_then(|r| r)
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, h)?;
+        push_opt_node(cx, n)?;
+        Ok(2)
     });
-    nat!(lua, n, "insert_after", |head: Option<i64>, cur: Option<i64>, node: Option<i64>| -> Result<(Option<i64>, Option<i64>), String> {
-        with_engine(|e| {
-            let (head, cur, nn) = (handle32(head), handle32(cur), handle32(node));
+    cnat!(lua, n, "insert_after", |cx| {
+        let head = handle_arg(cx, 1)?;
+        let cur = handle_arg(cx, 2)?;
+        let nn = handle_arg(cx, 3)?;
+        let (h, n) = with_engine(|e| {
             if nn == 0 {
-                return (Some(i64::from(head)).filter(|h| *h != 0), Some(i64::from(cur)).filter(|c| *c != 0));
+                return (head, cur);
             }
-            let (h, n) = e.lua_nodes.insert_after(head, cur, nn);
-            (Some(i64::from(h)), Some(i64::from(n)))
+            e.lua_nodes.insert_after(head, cur, nn)
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, h)?;
+        push_opt_node(cx, n)?;
+        Ok(2)
     });
-    nat!(lua, n, "slide", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            Some(i64::from(e.lua_nodes.slide(h)))
-        })
+    cnat!(lua, n, "slide", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let r = with_engine(|e| if e.lua_nodes.valid(h) { Some(i64::from(e.lua_nodes.slide(h))) } else { None })
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(r)
     });
-    nat!(lua, n, "tail", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            Some(i64::from(e.lua_nodes.tail_of(h)))
-        })
+    cnat!(lua, n, "tail", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let r = with_engine(|e| if e.lua_nodes.valid(h) { Some(i64::from(e.lua_nodes.tail_of(h))) } else { None })
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(r)
     });
-    nat!(lua, n, "end_of_math", |h: Option<i64>| -> Result<Multi<1>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return Multi::new();
-            }
-            let m = e.lua_nodes.end_of_math(h);
-            if m != 0 { Multi::from([UdValue::Integer(i64::from(m))]) } else { Multi::new() }
-        })
+    cnat!(lua, n, "end_of_math", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let m = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.end_of_math(h) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        if m != 0 { cx.push_int(i64::from(m)) } else { Ok(0) }
     });
-    nat!(lua, n, "length", |h: Option<i64>, stop: Option<i64>| -> Result<i64, String> {
-        with_engine(|e| {
-            let (h, stop) = (handle32(h), handle32(stop));
-            if !e.lua_nodes.valid(h) {
-                return 0;
-            }
-            e.lua_nodes.count(-1, h, stop)
-        })
+    cnat!(lua, n, "length", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let stop = handle_arg(cx, 2)?;
+        let c = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.count(-1, h, stop) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_int(c)
     });
-    nat!(lua, n, "count", |id: Option<i64>, h: Option<i64>, stop: Option<i64>| -> Result<i64, String> {
-        with_engine(|e| {
-            let (h, stop) = (handle32(h), handle32(stop));
-            if !e.lua_nodes.valid(h) {
-                return 0;
-            }
-            e.lua_nodes.count(id.unwrap_or(0), h, stop)
-        })
+    cnat!(lua, n, "count", |cx| {
+        let id = opt_int_arg(cx, 1)?.unwrap_or(0);
+        let h = handle_arg(cx, 2)?;
+        let stop = handle_arg(cx, 3)?;
+        let c = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.count(id, h, stop) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_int(c)
     });
 
     // ---- mark nodes: `mark` is a Lua table of {cmd, chr, cs} (lnodelib.c),
     // see `getfield` ----
-    nat!(lua, n, "is_mark", |h: Option<i64>| -> Result<bool, String> { Ok(is_mark(handle32(h))) });
+    cnat!(lua, n, "is_mark", |cx| {
+        let h = handle_arg(cx, 1)?;
+        cx.push_bool(is_mark(h))
+    });
     // `kinds` holds quadruples: (0, packed token, 0, 0), (1, cmd, chr, 0) for a
     // character token, (2, byte, 0, 0) for one byte of a string
     nat!(lua, n, "mark_set", |h: Option<i64>, quads: LuaTable| -> Result<(), String> {
@@ -665,55 +754,65 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
         })
     });
     // ---- fields ----
-    n.set("getfield", lua.create_callback(|cx| getfield(cx, true)).map_err(|e| format!("getfield: {e:?}"))?)
-        .map_err(|e| format!("getfield: {e:?}"))?;
-    n.set("getfield_ud", lua.create_callback(|cx| getfield(cx, false)).map_err(|e| format!("getfield_ud: {e:?}"))?)
-        .map_err(|e| format!("getfield_ud: {e:?}"))?;
-    nat!(lua, n, "setfield", |args: Variadic<Value>| -> Result<(), String> {
-        set_field_native(&args, true)
-    });
-    nat!(lua, n, "setfield_ud", |args: Variadic<Value>| -> Result<(), String> {
-        set_field_native(&args, false)
-    });
-    nat!(lua, n, "has_field", |h: Option<i64>, key: Option<String>| -> Result<bool, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return false;
-            }
-            let Some(k) = key else { return false };
-            let (id, sub) = (e.lua_nodes.id(h), e.lua_nodes.subtype(h));
-            match k.as_str() {
-                "next" | "id" => true,
-                "subtype" => id != ATTRIBUTE && id != GLUE_SPEC && id != ATTRIBUTE_LIST,
-                "attr" => has_attr_type(id, sub),
-                "prev" => id != ATTRIBUTE && id != GLUE_SPEC && id != ATTRIBUTE_LIST,
-                other => {
-                    let k = if other == "list" { "head" } else { other };
-                    fields_of(id, sub).iter().any(|(f, _)| *f == k)
+    cnat!(lua, n, "getfield", |cx| getfield(cx, true));
+    cnat!(lua, n, "getfield_ud", |cx| getfield(cx, false));
+    cnat!(lua, n, "setfield", |cx| set_field_cb(cx, true));
+    cnat!(lua, n, "setfield_ud", |cx| set_field_cb(cx, false));
+    cnat!(lua, n, "has_field", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let check = |k: &str| {
+            with_engine(|e| {
+                if !e.lua_nodes.valid(h) {
+                    return false;
                 }
+                let (id, sub) = (e.lua_nodes.id(h), e.lua_nodes.subtype(h));
+                match k {
+                    "next" | "id" => true,
+                    "subtype" => id != ATTRIBUTE && id != GLUE_SPEC && id != ATTRIBUTE_LIST,
+                    "attr" => has_attr_type(id, sub),
+                    "prev" => id != ATTRIBUTE && id != GLUE_SPEC && id != ATTRIBUTE_LIST,
+                    other => {
+                        let k = if other == "list" { "head" } else { other };
+                        fields_of(id, sub).iter().any(|(f, _)| *f == k)
+                    }
+                }
+            })
+        };
+        let res = if cx.arg_is_nil(2) {
+            false
+        } else if let Some(Some(r)) = cx.arg_bytes(2, |b| std::str::from_utf8(b).ok().map(check)) {
+            r.map_err(|msg| cx.raw_error(msg))?
+        } else {
+            match cx.arg::<Option<String>>(2)? {
+                Some(k) => check(&k).map_err(|msg| cx.raw_error(msg))?,
+                None => false,
             }
-        })
+        };
+        cx.push_bool(res)
     });
 
     // ---- attributes ----
-    nat!(lua, n, "has_attribute", |h: Option<i64>, id: Option<i64>, val: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "has_attribute", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let id = opt_int_arg(cx, 2)?.unwrap_or(0) as i32;
+        let val = opt_int_arg(cx, 3)?.map_or(UNUSED_ATTRIBUTE, |v| v as i32);
+        let v = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
-            let v = e.lua_nodes.has_attribute(h, id.unwrap_or(0) as i32, val.map_or(UNUSED_ATTRIBUTE, |v| v as i32));
+            let v = e.lua_nodes.has_attribute(h, id, val);
             (v > UNUSED_ATTRIBUTE).then_some(i64::from(v))
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(v)
     });
-    nat!(lua, n, "get_attribute", |h: Option<i64>, id: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "get_attribute", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let i = opt_int_arg(cx, 2)?.unwrap_or(0) as i32;
+        let v = with_engine(|e| {
             if !e.lua_nodes.valid(h) || !has_attr_type(e.lua_nodes.id(h), e.lua_nodes.subtype(h)) {
                 return None;
             }
-            let i = id.unwrap_or(0) as i32;
             let mut p = e.lua_nodes.attr_first(e.lua_nodes.node(h).attr);
             while p != 0 {
                 let a = e.lua_nodes.node(p);
@@ -726,11 +825,13 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
             }
             None
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(v)
     });
-    nat!(lua, n, "find_attribute", |h: Option<i64>, id: Option<i64>| -> Result<Multi<2>, String> {
-        with_engine(|e| {
-            let mut c = handle32(h);
-            let i = id.unwrap_or(0) as i32;
+    cnat!(lua, n, "find_attribute", |cx| {
+        let mut c = handle_arg(cx, 1)?;
+        let i = opt_int_arg(cx, 2)?.unwrap_or(0) as i32;
+        let found = with_engine(|e| {
             while e.lua_nodes.valid(c) {
                 if has_attr_type(e.lua_nodes.id(c), e.lua_nodes.subtype(c)) {
                     let mut p = e.lua_nodes.attr_first(e.lua_nodes.node(c).attr);
@@ -738,7 +839,7 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
                         let a = e.lua_nodes.node(p);
                         if a.f[0] == i {
                             if a.f[1] != UNUSED_ATTRIBUTE {
-                                return Multi::from([UdValue::Integer(i64::from(a.f[1])), UdValue::Integer(i64::from(c))]);
+                                return Some((i64::from(a.f[1]), i64::from(c)));
                             }
                             break;
                         } else if a.f[0] > i {
@@ -749,18 +850,28 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
                 }
                 c = e.lua_nodes.next(c);
             }
-            Multi::new()
+            None
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match found {
+            Some((v, node)) => {
+                cx.push_int(v)?;
+                cx.push_int(node)?;
+                Ok(2)
+            }
+            None => Ok(0),
+        }
     });
-    nat!(lua, n, "set_attribute", |args: Variadic<Value>| -> Result<(), String> {
-        let h = args.first().map_or(0, |v| value_int(v) as u32);
+    cnat!(lua, n, "set_attribute", |cx| {
+        let top = cx.arg_count();
+        let h = if top >= 1 { arg_vint(cx, 1) as u32 } else { 0 };
         if h == 0 {
-            return Ok(());
+            return Ok(0);
         }
-        if args.len() != 3 {
-            return Err("incorrect number of arguments".to_string());
+        if top != 3 {
+            return Err(cx.raw_error("incorrect number of arguments"));
         }
-        let (i, val) = (value_int(&args[1]) as i32, value_int(&args[2]) as i32);
+        let (i, val) = (arg_vint(cx, 2) as i32, arg_vint(cx, 3) as i32);
         with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return;
@@ -771,48 +882,56 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
                 e.lua_nodes.set_attribute(h, i, val);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "unset_attribute", |h: Option<i64>, id: f64, val: Option<f64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "unset_attribute", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let id = match cx.arg_number(2) {
+            Some(n) => n,
+            None => cx.arg::<f64>(2)?,
+        };
+        let val = opt_num_arg(cx, 3)?;
+        let r = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
             let r = e.lua_nodes.unset_attribute(h, id as i32, val.map_or(UNUSED_ATTRIBUTE, |v| v as i32));
             (r > UNUSED_ATTRIBUTE).then_some(i64::from(r))
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(r)
     });
-    nat!(lua, n, "current_attr", || -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let l = e.lua_current_attr_handle();
-            (l != 0).then_some(i64::from(l))
-        })
+    cnat!(lua, n, "current_attr", |cx| {
+        let l = with_engine(|e| e.lua_current_attr_handle()).map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, l)
     });
-    nat!(lua, n, "getattributelist", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getattributelist", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let a = with_engine(|e| {
             if !e.lua_nodes.valid(h) || !has_attr_type(e.lua_nodes.id(h), e.lua_nodes.subtype(h)) {
-                return None;
+                return 0;
             }
-            let a = e.lua_nodes.node(h).attr;
-            (a != 0).then_some(i64::from(a))
+            e.lua_nodes.node(h).attr
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, a)
     });
-    nat!(lua, n, "setattributelist", |h: Option<i64>, v: Option<Value>| -> Result<(), String> {
-        let kind = match &v {
-            Some(v) if v.as_integer().is_some() => Some(value_int(v) as u32),
-            Some(v) if v.as_boolean() == Some(true) => Some(u32::MAX),
-            _ => None,
+    cnat!(lua, n, "setattributelist", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let kind = if let Some(i) = cx.arg_integer(2) {
+            Some(i as u32)
+        } else if cx.arg_bool(2) == Some(true) {
+            Some(u32::MAX)
+        } else {
+            None
         };
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) || !has_attr_type(e.lua_nodes.id(h), e.lua_nodes.subtype(h)) {
                 return;
             }
             let new = match kind {
-                Some(u32::MAX) => {
-                    e.lua_current_attr_handle()
-                }
+                Some(u32::MAX) => e.lua_current_attr_handle(),
                 Some(a) if e.lua_nodes.valid(a) => {
                     if e.lua_nodes.id(a) == ATTRIBUTE_LIST {
                         a
@@ -826,6 +945,8 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
             };
             e.lua_nodes.reassign_attr(h, new);
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // ---- scalar accessors ----
@@ -838,47 +959,47 @@ pub(crate) fn install(lua: &mut Lua) -> Result<LuaTable, String> {
 /// `getfield(n, key)` of `node.direct` (`direct`) and `node`: a number key
 /// reads an attribute, a string key a field; a mark node's `mark` is a table
 /// of {cmd, chr, cs} triples.
-fn getfield(cx: &mut CallbackLua<'_>, direct: bool) -> tex_lua::LuaResult<usize> {
+fn getfield(cx: &mut CallbackLua<'_>, direct: bool) -> LuaResult<usize> {
     let h = if direct {
-        cx.arg::<tex_lua::ToInteger>(1)?.0 as u32
-    } else if cx.arg_kind(1) == Some(LuaValueKind::Userdata) {
-        cx.arg::<NodeUd>(1).map_or(0, |n| n.h)
+        cx.arg_tointeger(1).unwrap_or(0) as u32
     } else {
-        0
+        cx.arg_userdata_ref::<NodeUd, _>(1, |n| n.h).unwrap_or(0)
     };
-    let v = match cx.arg_kind(2) {
+    match cx.arg_kind(2) {
         Some(LuaValueKind::Integer | LuaValueKind::Float) => {
-            let i = cx.arg::<tex_lua::ToInteger>(2)?.0 as i32;
-            with_engine(|e| {
+            let i = cx.arg_tointeger(2).unwrap_or(0) as i32;
+            let v = with_engine(|e| {
                 let s = &e.lua_nodes;
                 if !s.valid(h) || !has_attr_type(s.id(h), s.subtype(h)) {
-                    return UdValue::Nil;
+                    return None;
                 }
                 let v = s.has_attribute(h, i, UNUSED_ATTRIBUTE);
-                if v > UNUSED_ATTRIBUTE { UdValue::Integer(i64::from(v)) } else { UdValue::Nil }
+                (v > UNUSED_ATTRIBUTE).then_some(i64::from(v))
             })
+            .map_err(|msg| cx.raw_error(msg))?;
+            cx.push_opt_int(v)
         }
         Some(LuaValueKind::String) => {
             let field = cx
                 .arg_bytes(2, |name| {
                     with_engine(|e| {
-                        let Ok(name) = std::str::from_utf8(name) else { return Ok(UdValue::Nil) };
+                        let Ok(name) = std::str::from_utf8(name) else { return Ok(Val::Nil) };
                         if name == "mark" && e.lua_nodes.valid(h) && e.lua_nodes.id(h) == MARK {
                             return Err(e.lua_mark_triples(h).unwrap_or_default());
                         }
                         // node 0 is the zero glue spec of LuaTeX's memory
                         if direct && h == 0 && name == "id" {
-                            return Ok(UdValue::Integer(i64::from(GLUE_SPEC)));
+                            return Ok(Val::Int(i64::from(GLUE_SPEC)));
                         }
                         if direct && name == "subtype" && e.lua_nodes.valid(h) && e.lua_nodes.id(h) == GLUE_SPEC {
-                            return Ok(UdValue::Integer(0));
+                            return Ok(Val::Int(0));
                         }
-                        Ok(to_ud(e.lua_node_field(h, name), direct))
+                        Ok(e.lua_node_field(h, name))
                     })
                 })
-                .unwrap_or(Ok(Ok(UdValue::Nil)));
+                .unwrap_or(Ok(Ok(Val::Nil)));
             match field {
-                Ok(Ok(v)) => Ok(v),
+                Ok(Ok(v)) => push_val(cx, v, direct),
                 Ok(Err(triples)) => {
                     let t = cx.create_table_with_capacity(triples.len(), 0)?;
                     for (i, triple) in triples.into_iter().enumerate() {
@@ -888,28 +1009,33 @@ fn getfield(cx: &mut CallbackLua<'_>, direct: bool) -> tex_lua::LuaResult<usize>
                         }
                         t.raw_seti(i as i64 + 1, entry)?;
                     }
-                    return cx.push(t);
+                    cx.push(t)
                 }
-                Err(msg) => Err(msg),
+                Err(msg) => Err(cx.raw_error(msg)),
             }
         }
-        _ => Ok(UdValue::Nil),
-    };
-    match v {
-        Ok(v) => cx.push(v),
-        Err(msg) => Err(cx.error(msg)),
+        _ => cx.push_nil(),
     }
 }
 
-fn set_field_native(args: &[Value], direct: bool) -> Result<(), String> {
-    let h = args.first().map_or(0, |v| if direct { value_int(v) as u32 } else { node_of(v) });
-    let Some(key) = args.get(1) else { return Ok(()) };
-    if let Some(i) = key.as_integer() {
-        if args.len() != 3 {
-            return Err("incorrect number of arguments".to_string());
+fn set_field_cb(cx: &mut CallbackLua<'_>, direct: bool) -> LuaResult<usize> {
+    let top = cx.arg_count();
+    let h = if top == 0 {
+        0
+    } else if direct {
+        arg_vint(cx, 1) as u32
+    } else {
+        cx.arg_userdata_ref::<NodeUd, _>(1, |u| u.h).unwrap_or(0)
+    };
+    if top < 2 {
+        return Ok(0);
+    }
+    if let Some(i) = cx.arg_integer(2) {
+        if top != 3 {
+            return Err(cx.raw_error("incorrect number of arguments"));
         }
-        let val = value_int(&args[2]) as i32;
-        return with_engine(|e| {
+        let val = arg_vint(cx, 3) as i32;
+        with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return;
             }
@@ -918,58 +1044,67 @@ fn set_field_native(args: &[Value], direct: bool) -> Result<(), String> {
             } else {
                 e.lua_nodes.set_attribute(h, i as i32, val);
             }
-        });
+        })
+        .map_err(|msg| cx.raw_error(msg))?;
+        return Ok(0);
     }
-    let Some(name) = key.as_string() else { return Ok(()) };
-    let v = match args.get(2) {
-        None => SetVal::Nil,
-        Some(v) => {
-            if let Some(i) = v.as_integer() {
-                SetVal::Int(i)
-            } else if let Some(n) = v.as_number() {
-                SetVal::Num(n)
-            } else if let Some(b) = value_bytes(v) {
-                SetVal::Bytes(b)
-            } else if v.is_nil() {
-                SetVal::Nil
-            } else if !direct && node_of(v) != 0 {
-                SetVal::Node(node_of(v))
-            } else {
-                SetVal::Other
-            }
+    if cx.arg_kind(2) != Some(LuaValueKind::String) {
+        return Ok(0);
+    }
+    let v = if top < 3 || cx.arg_is_nil(3) {
+        SetVal::Nil
+    } else if let Some(i) = cx.arg_integer(3) {
+        SetVal::Int(i)
+    } else if let Some(n) = cx.arg_number(3) {
+        SetVal::Num(n)
+    } else if let Some(b) = cx.arg_bytes(3, |b| b.to_vec()) {
+        SetVal::Bytes(b)
+    } else if !direct {
+        match cx.arg_userdata_ref::<NodeUd, _>(3, |u| u.h) {
+            Some(nh) if nh != 0 => SetVal::Node(nh),
+            _ => SetVal::Other,
         }
+    } else {
+        SetVal::Other
     };
-    with_engine(|e| e.lua_set_node_field(h, &name, v, direct))?
-}
-
-/// The handle of a userdata node value (0 otherwise).
-fn node_of(v: &Value) -> u32 {
-    v.as_userdata::<NodeUd>().and_then(|u| u.borrow().ok().map(|b| b.h)).unwrap_or(0)
+    let res = cx.arg_bytes(2, |b| {
+        std::str::from_utf8(b)
+            .ok()
+            .map(|name| with_engine(|e| e.lua_set_node_field(h, name, v, direct)).and_then(|r| r))
+    });
+    if let Some(Some(Err(msg))) = res {
+        return Err(cx.raw_error(msg));
+    }
+    Ok(0)
 }
 
 fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
     macro_rules! get_set {
         ($get:literal, $set:literal, |$s:ident, $h:ident| $getter:expr, |$s2:ident, $h2:ident, $v:ident| $setter:expr) => {
-            nat!(lua, n, $get, |h: Option<i64>| -> Result<Option<i64>, String> {
-                with_engine(|e| {
-                    let $h = handle32(h);
+            cnat!(lua, n, $get, |cx| {
+                let $h = handle_arg(cx, 1)?;
+                let res = with_engine(|e| {
                     let $s = &e.lua_nodes;
                     if !$s.valid($h) {
                         return None;
                     }
                     $getter
                 })
+                .map_err(|msg| cx.raw_error(msg))?;
+                cx.push_opt_int(res)
             });
-            nat!(lua, n, $set, |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+            cnat!(lua, n, $set, |cx| {
+                let $h2 = handle_arg(cx, 1)?;
+                let $v: Option<f64> = opt_num_arg(cx, 2)?;
                 with_engine(|e| {
-                    let $h2 = handle32(h);
                     let $s2 = &mut e.lua_nodes;
                     if !$s2.valid($h2) {
                         return;
                     }
-                    let $v: Option<f64> = v;
                     $setter
                 })
+                .map_err(|msg| cx.raw_error(msg))?;
+                Ok(0)
             });
         };
     }
@@ -1042,9 +1177,9 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
         |s, h, v| if s.id(h) == GLYPH { s.node_mut(h).f[6] = v.map_or(0, |v| v as i32) });
 
     // font and family
-    nat!(lua, n, "getfont", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getfont", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
@@ -1056,10 +1191,14 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(res)
     });
-    nat!(lua, n, "setfont", |h: Option<i64>, f: Option<i64>, c: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "setfont", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let f = opt_int_arg(cx, 2)?;
+        let c = opt_int_arg(cx, 3)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) && e.lua_nodes.id(h) == GLYPH {
                 let nd = e.lua_nodes.node_mut(h);
                 nd.f[1] = f.unwrap_or(0) as i32;
@@ -1068,10 +1207,12 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 }
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getfam", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getfam", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
@@ -1084,10 +1225,13 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(res)
     });
-    nat!(lua, n, "setfam", |h: Option<i64>, v: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "setfam", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_int_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             let Some(v) = v else { return };
             if !e.lua_nodes.valid(h) {
                 return;
@@ -1100,36 +1244,49 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // kern
-    nat!(lua, n, "getkern", |h: Option<i64>, exp: Option<Value>| -> Result<Multi<2>, String> {
+    cnat!(lua, n, "getkern", |cx| {
+        let h = handle_arg(cx, 1)?;
         // the C code tests `lua_toboolean(L, 2)` after pushing its result, so
-        // without a second argument it sees the pushed number: always true
-        let want_exp = exp.as_ref().map_or(true, |v| is_truthy(Some(v)));
-        with_engine(|e| {
-            let h = handle32(h);
+        // without a second argument (or nil) it sees the pushed number: always true
+        let want_exp = cx.arg_is_nil(2) || cx.arg_is_truthy(2);
+        enum KernRet {
+            Nil,
+            Int(i64),
+            Kern(f64, Option<i64>),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Multi::from([UdValue::Nil]);
+                return KernRet::Nil;
             }
             let node = e.lua_nodes.node(h);
             match node.id {
-                KERN => {
-                    let mut v = Multi::from([UdValue::Number(f64::from(node.f[0]))]);
-                    if want_exp {
-                        v.push(UdValue::Integer(i64::from(node.f[1])));
-                    }
-                    v
-                }
-                MARGIN_KERN => Multi::from([UdValue::Integer(i64::from(node.f[0]))]),
-                MATH => Multi::from([UdValue::Integer(i64::from(node.f[0]))]),
-                _ => Multi::from([UdValue::Nil]),
+                KERN => KernRet::Kern(f64::from(node.f[0]), want_exp.then(|| i64::from(node.f[1]))),
+                MARGIN_KERN | MATH => KernRet::Int(i64::from(node.f[0])),
+                _ => KernRet::Nil,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            KernRet::Nil => cx.push_nil(),
+            KernRet::Int(v) => cx.push_int(v),
+            KernRet::Kern(k, Some(e)) => {
+                cx.push_float(k)?;
+                cx.push_int(e)?;
+                Ok(2)
+            }
+            KernRet::Kern(k, None) => cx.push_float(k),
+        }
     });
-    nat!(lua, n, "setkern", |h: Option<i64>, v: Option<f64>, sub: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "setkern", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
+        let sub = opt_int_arg(cx, 3)?;
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
@@ -1145,115 +1302,138 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // width / height / depth
-    nat!(lua, n, "getwidth", |h: Option<i64>, exp: Option<Value>| -> Result<Multi<2>, String> {
-        let want_exp = exp.as_ref().map_or(true, |v| is_truthy(Some(v)));
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getwidth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let want_exp = cx.arg_is_nil(2) || cx.arg_is_truthy(2);
+        enum WidthRet {
+            Nil,
+            Int(i64),
+            IntExp(i64, i64),
+            Float(f64),
+            FloatExp(f64, i64),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Multi::from([UdValue::Nil]);
+                return WidthRet::Nil;
             }
             let node = e.lua_nodes.node(h);
-            let one = |v: i32| Multi::from([UdValue::Integer(i64::from(v))]);
             match node.id {
-                HLIST | VLIST | RULE | UNSET => one(node.f[0]),
+                HLIST | VLIST | RULE | UNSET | GLUE_SPEC | MARGIN_KERN => WidthRet::Int(i64::from(node.f[0])),
                 GLYPH => {
                     let (w, _, _) = glyph_dimensions(&e.eqtb.fonts, node.f[1], node.f[0]);
-                    let mut v = Multi::from([UdValue::Number(f64::from(w))]);
                     if want_exp {
-                        v.push(UdValue::Integer(i64::from(node.f[12])));
+                        WidthRet::FloatExp(f64::from(w), i64::from(node.f[12]))
+                    } else {
+                        WidthRet::Float(f64::from(w))
                     }
-                    v
                 }
-                GLUE => one(node.f[1]),
-                MATH => one(node.f[1]),
-                GLUE_SPEC => one(node.f[0]),
-                INS => one(node.f[INS_GLUE]),
+                GLUE | MATH => WidthRet::Int(i64::from(node.f[1])),
+                INS => WidthRet::Int(i64::from(node.f[INS_GLUE])),
                 KERN => {
-                    let mut v = one(node.f[0]);
                     if want_exp {
-                        v.push(UdValue::Integer(i64::from(node.f[1])));
+                        WidthRet::IntExp(i64::from(node.f[0]), i64::from(node.f[1]))
+                    } else {
+                        WidthRet::Int(i64::from(node.f[0]))
                     }
-                    v
                 }
-                MARGIN_KERN => one(node.f[0]),
-                _ => Multi::from([UdValue::Nil]),
+                _ => WidthRet::Nil,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            WidthRet::Nil => cx.push_nil(),
+            WidthRet::Int(w) => cx.push_int(w),
+            WidthRet::IntExp(w, e) => {
+                cx.push_int(w)?;
+                cx.push_int(e)?;
+                Ok(2)
+            }
+            WidthRet::Float(w) => cx.push_float(w),
+            WidthRet::FloatExp(w, e) => {
+                cx.push_float(w)?;
+                cx.push_int(e)?;
+                Ok(2)
+            }
+        }
     });
-    nat!(lua, n, "setwidth", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setwidth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
             let nd = e.lua_nodes.node_mut(h);
             let slot = match nd.id {
-                HLIST | VLIST | RULE | UNSET | GLUE_SPEC | MARGIN_KERN | FRACTION => 0,
+                HLIST | VLIST | RULE | UNSET | GLUE_SPEC | MARGIN_KERN | FRACTION | KERN => 0,
                 INS => INS_GLUE,
                 GLUE | MATH => 1,
-                KERN => 0,
                 RADICAL => 5,
                 _ => return,
             };
-            let slot = match nd.id {
-                FRACTION => 0,
-                _ => slot,
-            };
             nd.f[slot] = rnd(v) as i32;
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getheight", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getheight", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
             let node = e.lua_nodes.node(h);
             match node.id {
-                HLIST | VLIST | RULE | UNSET => Some(i64::from(node.f[2])),
-                INS => Some(i64::from(node.f[2])),
+                HLIST | VLIST | RULE | UNSET | INS | FENCE => Some(i64::from(node.f[2])),
                 GLYPH => Some(i64::from(glyph_dimensions(&e.eqtb.fonts, node.f[1], node.f[0]).1)),
-                FENCE => Some(i64::from(node.f[2])),
                 _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(res)
     });
-    nat!(lua, n, "setheight", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setheight", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
             let nd = e.lua_nodes.node_mut(h);
             match nd.id {
-                HLIST | VLIST | RULE | UNSET => nd.f[2] = rnd(v) as i32,
-                FENCE => nd.f[2] = rnd(v) as i32,
+                HLIST | VLIST | RULE | UNSET | FENCE => nd.f[2] = rnd(v) as i32,
                 _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getdepth", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getdepth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return None;
             }
             let node = e.lua_nodes.node(h);
             match node.id {
-                HLIST | VLIST | RULE | UNSET => Some(i64::from(node.f[1])),
-                INS => Some(i64::from(node.f[1])),
+                HLIST | VLIST | RULE | UNSET | INS => Some(i64::from(node.f[1])),
                 GLYPH => Some(i64::from(glyph_dimensions(&e.eqtb.fonts, node.f[1], node.f[0]).2)),
                 FENCE => Some(i64::from(node.f[3])),
                 _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(res)
     });
-    nat!(lua, n, "setdepth", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setdepth", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
@@ -1264,49 +1444,55 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getwhd", |h: Option<i64>, exp: Option<Value>| -> Result<Multi<4>, String> {
-        let want_exp = is_truthy(exp.as_ref());
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getwhd", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let want_exp = cx.arg_is_truthy(2);
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Multi::new();
+                return None;
             }
             let s = &e.lua_nodes;
             let t = s.node(h);
-            let whd = |w: i32, h: i32, d: i32| {
-                Multi::from([
-                    UdValue::Integer(i64::from(w)),
-                    UdValue::Integer(i64::from(h)),
-                    UdValue::Integer(i64::from(d)),
-                ])
-            };
             match t.id {
-                HLIST | VLIST | RULE | UNSET => whd(t.f[0], t.f[2], t.f[1]),
+                HLIST | VLIST | RULE | UNSET => Some((i64::from(t.f[0]), i64::from(t.f[2]), i64::from(t.f[1]), None)),
                 GLYPH => {
                     let (w, ht, d) = glyph_dimensions(&e.eqtb.fonts, t.f[1], t.f[0]);
-                    let mut v = whd(w, ht, d);
-                    if want_exp {
-                        v.push(UdValue::Integer(i64::from(t.f[12])));
-                    }
-                    v
+                    Some((i64::from(w), i64::from(ht), i64::from(d), want_exp.then(|| i64::from(t.f[12]))))
                 }
                 GLUE => {
                     let l = t.f[0] as u32;
                     if s.valid(l) && matches!(s.id(l), HLIST | VLIST | RULE) {
                         let x = s.node(l);
-                        whd(x.f[0], x.f[2], x.f[1])
+                        Some((i64::from(x.f[0]), i64::from(x.f[2]), i64::from(x.f[1]), None))
                     } else {
-                        Multi::new()
+                        None
                     }
                 }
-                _ => Multi::new(),
+                _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            Some((w, ht, d, exp)) => {
+                cx.push_int(w)?;
+                cx.push_int(ht)?;
+                cx.push_int(d)?;
+                if let Some(exp) = exp {
+                    cx.push_int(exp)?;
+                    Ok(4)
+                } else {
+                    Ok(3)
+                }
+            }
+            None => Ok(0),
+        }
     });
-    nat!(lua, n, "setwhd", |args: Variadic<Value>| -> Result<(), String> {
-        let h = args.first().map_or(0, |v| value_int(v) as u32);
-        let top = args.len();
+    cnat!(lua, n, "setwhd", |cx| {
+        let top = cx.arg_count();
+        let h = if top >= 1 { arg_vint(cx, 1) as u32 } else { 0 };
         with_engine(|e| {
             let s = &mut e.lua_nodes;
             if !s.valid(h) {
@@ -1322,172 +1508,243 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
             if !matches!(s.id(target), HLIST | VLIST | RULE | UNSET) {
                 return;
             }
-            for (i, slot) in [(1usize, 0usize), (2, 2), (3, 1)] {
-                if top > i && is_num(args.get(i)) {
-                    s.node_mut(target).f[slot] = vround(&args[i]) as i32;
+            for (idx, slot) in [(2usize, 0usize), (3, 2), (4, 1)] {
+                if top >= idx && arg_is_num(cx, idx) {
+                    s.node_mut(target).f[slot] = arg_vround(cx, idx) as i32;
                 }
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // glue
-    nat!(lua, n, "getglue", |h: Option<i64>| -> Result<Multi<5>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getglue", |cx| {
+        let h = handle_arg(cx, 1)?;
+        enum GlueRet {
+            Empty,
+            Five([i64; 5]),
+            Box(f64, i64, i64),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Multi::new();
+                return GlueRet::Empty;
             }
             let t = e.lua_nodes.node(h);
             let five = |first: usize| {
-                let mut v = Multi::new();
-                for i in first..first + 5 {
-                    v.push(UdValue::Integer(i64::from(t.f[i])));
-                }
-                v
+                GlueRet::Five([
+                    i64::from(t.f[first]),
+                    i64::from(t.f[first + 1]),
+                    i64::from(t.f[first + 2]),
+                    i64::from(t.f[first + 3]),
+                    i64::from(t.f[first + 4]),
+                ])
             };
             match t.id {
                 // an insert's glue fields are not backed by data (zeros)
                 INS => five(INS_GLUE),
                 GLUE | MATH => five(1),
                 GLUE_SPEC => five(0),
-                HLIST | VLIST => Multi::from([
-                    UdValue::Number(t.fl),
-                    UdValue::Integer(i64::from(t.f[5])),
-                    UdValue::Integer(i64::from(t.f[6])),
-                ]),
-                _ => Multi::new(),
+                HLIST | VLIST => GlueRet::Box(t.fl, i64::from(t.f[5]), i64::from(t.f[6])),
+                _ => GlueRet::Empty,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            GlueRet::Empty => Ok(0),
+            GlueRet::Five(a) => {
+                for v in a {
+                    cx.push_int(v)?;
+                }
+                Ok(5)
+            }
+            GlueRet::Box(fl, o, s) => {
+                cx.push_float(fl)?;
+                cx.push_int(o)?;
+                cx.push_int(s)?;
+                Ok(3)
+            }
+        }
     });
-    nat!(lua, n, "setglue", |args: Variadic<Value>| -> Result<Variadic<UdValue>, String> {
-        let h = args.first().map_or(0, |v| value_int(v) as u32);
-        let top = args.len();
+    cnat!(lua, n, "setglue", |cx| {
+        let top = cx.arg_count();
+        let h = if top >= 1 { arg_vint(cx, 1) as u32 } else { 0 };
         with_engine(|e| {
             let s = &mut e.lua_nodes;
             if !s.valid(h) {
-                return Variadic(vec![]);
+                return;
             }
             let t = s.id(h);
-            let num = |i: usize| top > i && is_num(args.get(i));
+            let num = |idx: usize| top >= idx && arg_is_num(cx, idx);
             match t {
                 GLUE | GLUE_SPEC | MATH => {
                     let base = if t == GLUE_SPEC { 0 } else { 1 };
                     let nd = s.node_mut(h);
-                    nd.f[base] = if num(1) { vround(&args[1]) as i32 } else { 0 };
-                    nd.f[base + 1] = if num(2) { vround(&args[2]) as i32 } else { 0 };
-                    nd.f[base + 2] = if num(3) { vround(&args[3]) as i32 } else { 0 };
-                    nd.f[base + 3] = if num(4) { value_int(&args[4]) as i32 } else { 0 };
-                    nd.f[base + 4] = if num(5) { value_int(&args[5]) as i32 } else { 0 };
-                    Variadic(vec![])
+                    nd.f[base] = if num(2) { arg_vround(cx, 2) as i32 } else { 0 };
+                    nd.f[base + 1] = if num(3) { arg_vround(cx, 3) as i32 } else { 0 };
+                    nd.f[base + 2] = if num(4) { arg_vround(cx, 4) as i32 } else { 0 };
+                    nd.f[base + 3] = if num(5) { arg_vint(cx, 5) as i32 } else { 0 };
+                    nd.f[base + 4] = if num(6) { arg_vint(cx, 6) as i32 } else { 0 };
                 }
                 HLIST | VLIST => {
                     let nd = s.node_mut(h);
-                    nd.fl = if num(1) { value_num(&args[1]) } else { 0.0 };
-                    nd.f[5] = if num(2) { value_int(&args[2]) as i32 } else { 0 };
-                    nd.f[6] = if num(3) { value_int(&args[3]) as i32 } else { 0 };
-                    Variadic(vec![])
+                    nd.fl = if num(2) { arg_vnum(cx, 2) } else { 0.0 };
+                    nd.f[5] = if num(3) { arg_vint(cx, 3) as i32 } else { 0 };
+                    nd.f[6] = if num(4) { arg_vint(cx, 4) as i32 } else { 0 };
                 }
-                _ => Variadic(vec![]),
+                _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "is_zero_glue", |h: Option<i64>| -> Result<Variadic<UdValue>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "is_zero_glue", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Variadic(vec![]);
+                return None;
             }
             let t = e.lua_nodes.node(h);
             match t.id {
-                GLUE | MATH => Variadic(vec![UdValue::Boolean(t.f[1] == 0 && t.f[2] == 0 && t.f[3] == 0)]),
-                GLUE_SPEC => Variadic(vec![UdValue::Boolean(t.f[0] == 0 && t.f[1] == 0 && t.f[2] == 0)]),
-                INS => Variadic(vec![UdValue::Boolean(t.f[INS_GLUE] == 0 && t.f[INS_GLUE + 1] == 0 && t.f[INS_GLUE + 2] == 0)]),
-                HLIST | VLIST => Variadic(vec![UdValue::Boolean(t.fl == 0.0 && t.f[5] == 0 && t.f[6] == 0)]),
-                _ => Variadic(vec![]),
+                GLUE | MATH => Some(t.f[1] == 0 && t.f[2] == 0 && t.f[3] == 0),
+                GLUE_SPEC => Some(t.f[0] == 0 && t.f[1] == 0 && t.f[2] == 0),
+                INS => Some(t.f[INS_GLUE] == 0 && t.f[INS_GLUE + 1] == 0 && t.f[INS_GLUE + 2] == 0),
+                HLIST | VLIST => Some(t.fl == 0.0 && t.f[5] == 0 && t.f[6] == 0),
+                _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            Some(b) => cx.push_bool(b),
+            None => Ok(0),
+        }
     });
-    nat!(lua, n, "effective_glue", |glue: Option<i64>, parent: Option<i64>, round: Option<Value>| -> Result<Option<UdValue>, String> {
-        let round = is_truthy(round.as_ref());
-        with_engine(|e| {
-            let (g, p) = (handle32(glue), handle32(parent));
+    cnat!(lua, n, "effective_glue", |cx| {
+        let g = handle_arg(cx, 1)?;
+        let p = handle_arg(cx, 2)?;
+        let round = cx.arg_is_truthy(3);
+        enum EffRet {
+            Nil,
+            Int(i64),
+            Float(f64),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(g) || e.lua_nodes.id(g) != GLUE {
-                return None;
+                return EffRet::Nil;
             }
             let pv = e.lua_nodes.valid(p) && matches!(e.lua_nodes.id(p), HLIST | VLIST);
             if !pv {
-                return Some(UdValue::Integer(i64::from(e.lua_nodes.node(g).f[1])));
+                return EffRet::Int(i64::from(e.lua_nodes.node(g).f[1]));
             }
-            let w = e.lua_nodes.effective_glue(g, p)?;
-            Some(if round { UdValue::Integer(w.round() as i64) } else { UdValue::Number(w) })
+            match e.lua_nodes.effective_glue(g, p) {
+                Some(w) if round => EffRet::Int(w.round() as i64),
+                Some(w) => EffRet::Float(w),
+                None => EffRet::Nil,
+            }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            EffRet::Nil => cx.push_nil(),
+            EffRet::Int(v) => cx.push_int(v),
+            EffRet::Float(v) => cx.push_float(v),
+        }
     });
 
     // dir
-    nat!(lua, n, "getdir", |h: Option<i64>| -> Result<UdValue, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getdir", |cx| {
+        let h = handle_arg(cx, 1)?;
+        enum DirRet {
+            Nil,
+            Dir(i32),
+            Signed(u16, i32),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return UdValue::Nil;
+                return DirRet::Nil;
             }
             let t = e.lua_nodes.node(h);
             match t.id {
-                DIR => {
-                    if (0..4).contains(&t.f[0]) {
-                        UdValue::Str(format!("{}{}", if t.subtype == 1 { '-' } else { '+' }, DIR_NAMES[t.f[0] as usize]))
-                    } else {
-                        UdValue::Nil
-                    }
+                DIR => DirRet::Signed(t.subtype, t.f[0]),
+                HLIST | VLIST | RULE => DirRet::Dir(t.f[3]),
+                LOCAL_PAR => DirRet::Dir(t.f[2]),
+                _ => DirRet::Nil,
+            }
+        })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            DirRet::Nil => cx.push_nil(),
+            DirRet::Dir(d) => push_dir_string(cx, d),
+            DirRet::Signed(sub, d) => {
+                if (0..4).contains(&d) {
+                    let name = DIR_NAMES[d as usize].as_bytes();
+                    let buf = [if sub == 1 { b'-' } else { b'+' }, name[0], name[1], name[2]];
+                    cx.push_bytes(&buf)
+                } else {
+                    cx.push_nil()
                 }
-                HLIST | VLIST | RULE => dir_string(t.f[3]),
-                LOCAL_PAR => dir_string(t.f[2]),
-                _ => UdValue::Nil,
             }
-        })
+        }
     });
-    nat!(lua, n, "getdirection", |h: Option<i64>| -> Result<Variadic<UdValue>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getdirection", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Variadic(vec![UdValue::Nil]);
+                return (None, None);
             }
             let t = e.lua_nodes.node(h);
-            let d = |x: i32| if x < 0 { UdValue::Nil } else { UdValue::Integer(i64::from(x)) };
+            let d = |x: i32| (x >= 0).then(|| i64::from(x));
             match t.id {
-                DIR => Variadic(vec![d(t.f[0]), UdValue::Boolean(t.subtype != 0)]),
-                HLIST | VLIST | RULE => Variadic(vec![d(t.f[3])]),
-                LOCAL_PAR => Variadic(vec![d(t.f[2])]),
-                _ => Variadic(vec![UdValue::Nil]),
+                DIR => (d(t.f[0]), Some(t.subtype != 0)),
+                HLIST | VLIST | RULE => (d(t.f[3]), None),
+                LOCAL_PAR => (d(t.f[2]), None),
+                _ => (None, None),
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_opt_int(res.0)?;
+        if let Some(cancel) = res.1 {
+            cx.push_bool(cancel)?;
+            Ok(2)
+        } else {
+            Ok(1)
+        }
     });
-    nat!(lua, n, "setdir", |h: Option<i64>, v: Option<String>| -> Result<(), String> {
+    cnat!(lua, n, "setdir", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v: Option<Vec<u8>> = if cx.arg_is_nil(2) {
+            None
+        } else if let Some(Some(bytes)) = cx.arg_bytes(2, |b| std::str::from_utf8(b).ok().map(|s| s.as_bytes().to_vec())) {
+            Some(bytes)
+        } else {
+            cx.arg::<Option<String>>(2)?.map(String::into_bytes)
+        };
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return Ok(());
             }
             let id = e.lua_nodes.id(h);
             let Some(v) = v else { return Err("Direction specifiers have to be strings".to_string()) };
             match id {
-                DIR => e.lua_nodes.set_field(h, "dir", SetVal::Bytes(v.into_bytes())),
-                HLIST | VLIST | RULE => e.lua_nodes.set_field(h, "dir", SetVal::Bytes(v.into_bytes())),
-                LOCAL_PAR => e.lua_nodes.set_field(h, "dir", SetVal::Bytes(v.into_bytes())),
+                DIR | HLIST | VLIST | RULE | LOCAL_PAR => e.lua_nodes.set_field(h, "dir", SetVal::Bytes(v)),
                 _ => Ok(()),
             }
-        })?
+        })
+        .and_then(|r| r)
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "setdirection", |h: Option<i64>, v: Option<Value>, cancel: Option<Value>| -> Result<(), String> {
-        let cancel = cancel.as_ref().and_then(|c| c.as_boolean());
+    cnat!(lua, n, "setdirection", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = cx.arg_integer(2);
+        let cancel = cx.arg_bool(3);
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return Ok(());
             }
             if !matches!(e.lua_nodes.id(h), DIR | HLIST | VLIST | RULE | LOCAL_PAR) {
                 return Ok(());
             }
-            let Some(v) = v.as_ref().and_then(|v| v.as_integer()) else {
+            let Some(v) = v else {
                 return Err("Direction specifiers have to be numbers".to_string());
             };
             if !(0..4).contains(&v) {
@@ -1506,26 +1763,39 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => {}
             }
             Ok(())
-        })?
+        })
+        .and_then(|r| r)
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // offsets
-    nat!(lua, n, "getoffsets", |h: Option<i64>| -> Result<Variadic<UdValue>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getoffsets", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Variadic(vec![]);
+                return None;
             }
             let t = e.lua_nodes.node(h);
             match t.id {
-                GLYPH => Variadic(vec![UdValue::Integer(i64::from(t.f[7])), UdValue::Integer(i64::from(t.f[8]))]),
-                RULE => Variadic(vec![UdValue::Integer(i64::from(t.f[5])), UdValue::Integer(i64::from(t.f[6]))]),
-                _ => Variadic(vec![]),
+                GLYPH => Some((i64::from(t.f[7]), i64::from(t.f[8]))),
+                RULE => Some((i64::from(t.f[5]), i64::from(t.f[6]))),
+                _ => None,
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            Some((x, y)) => {
+                cx.push_int(x)?;
+                cx.push_int(y)?;
+                Ok(2)
+            }
+            None => Ok(0),
+        }
     });
-    nat!(lua, n, "setoffsets", |args: Variadic<Value>| -> Result<(), String> {
-        let h = args.first().map_or(0, |v| value_int(v) as u32);
+    cnat!(lua, n, "setoffsets", |cx| {
+        let top = cx.arg_count();
+        let h = if top >= 1 { arg_vint(cx, 1) as u32 } else { 0 };
         with_engine(|e| {
             let s = &mut e.lua_nodes;
             if !s.valid(h) {
@@ -1537,47 +1807,62 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => return,
             };
             for i in 0..2 {
-                if is_num(args.get(1 + i)) {
-                    s.node_mut(h).f[base + i] = vround(&args[1 + i]) as i32;
+                if arg_is_num(cx, 2 + i) {
+                    s.node_mut(h).f[base + i] = arg_vround(cx, 2 + i) as i32;
                 }
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
 
     // data
-    nat!(lua, n, "getdata", |h: Option<i64>| -> Result<Variadic<UdValue>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getdata", |cx| {
+        let h = handle_arg(cx, 1)?;
+        enum DataRet {
+            Val(Val),
+            Literal(Vec<u8>, i64),
+        }
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return Variadic(vec![UdValue::Nil]);
+                return DataRet::Val(Val::Nil);
             }
             let t = e.lua_nodes.node(h);
             match t.id {
-                GLYPH => Variadic(vec![UdValue::Integer(i64::from(t.f[13]))]),
-                BOUNDARY => Variadic(vec![UdValue::Integer(i64::from(t.f[0]))]),
+                GLYPH => DataRet::Val(Val::Int(i64::from(t.f[13]))),
+                BOUNDARY => DataRet::Val(Val::Int(i64::from(t.f[0]))),
                 WHATSIT => match t.subtype {
-                    ws::USER_DEFINED => Variadic(vec![to_ud(e.lua_nodes.get_field(h, "value", &|_, _| (0, 0, 0)), true)]),
-                    ws::PDF_LITERAL | ws::PDF_LATE_LITERAL => Variadic(vec![
-                        UdValue::Bytes(e.lua_nodes.ext_str(h, "data")),
-                        UdValue::Integer(i64::from(t.f[0])),
-                    ]),
-                    ws::LATE_LUA | ws::PDF_SETMATRIX | ws::SPECIAL | ws::LATE_SPECIAL => {
-                        Variadic(vec![UdValue::Bytes(e.lua_nodes.ext_str(h, "data"))])
+                    ws::USER_DEFINED => DataRet::Val(e.lua_nodes.get_field(h, "value", &|_, _| (0, 0, 0))),
+                    ws::PDF_LITERAL | ws::PDF_LATE_LITERAL => {
+                        DataRet::Literal(e.lua_nodes.ext_str(h, "data"), i64::from(t.f[0]))
                     }
-                    ws::WRITE => Variadic(vec![UdValue::Bytes(e.lua_node_tokens(h))]),
-                    _ => Variadic(vec![UdValue::Nil]),
+                    ws::LATE_LUA | ws::PDF_SETMATRIX | ws::SPECIAL | ws::LATE_SPECIAL => {
+                        DataRet::Val(Val::Bytes(e.lua_nodes.ext_str(h, "data")))
+                    }
+                    ws::WRITE => DataRet::Val(Val::Bytes(e.lua_node_tokens(h))),
+                    _ => DataRet::Val(Val::Nil),
                 },
-                _ => Variadic(vec![UdValue::Nil]),
+                _ => DataRet::Val(Val::Nil),
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            DataRet::Val(v) => push_val(cx, v, true),
+            DataRet::Literal(b, mode) => {
+                cx.push_bytes(&b)?;
+                cx.push_int(mode)?;
+                Ok(2)
+            }
+        }
     });
-    nat!(lua, n, "setdata", |h: Option<i64>, v: Option<Value>| -> Result<(), String> {
-        let (iv, bv) = match &v {
-            Some(v) => (vround(v), value_bytes(v)),
-            None => (0, None),
+    cnat!(lua, n, "setdata", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let (iv, bv) = if cx.arg_is_nil(2) {
+            (0, None)
+        } else {
+            (arg_vround(cx, 2), cx.arg_bytes(2, |b| b.to_vec()))
         };
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
@@ -1601,6 +1886,8 @@ fn install_accessors(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 _ => {}
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
     Ok(())
 }
@@ -1642,29 +1929,31 @@ impl Engine {
 
 fn install_lists(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
     // lists and discretionaries
-    nat!(lua, n, "getlist", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "getlist", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let head = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
-                return None;
+                return 0;
             }
             let slot = match e.lua_nodes.id(h) {
                 HLIST | VLIST => sl::B_HEAD,
                 SUB_BOX | SUB_MLIST | ADJUST => 0,
                 INS => sl::I_HEAD,
-                _ => return None,
+                _ => return 0,
             };
             let head = e.lua_nodes.node(h).f[slot] as u32;
-            if head == 0 {
-                return None;
+            if head != 0 {
+                e.lua_nodes.node_mut(head).prev = 0;
             }
-            e.lua_nodes.node_mut(head).prev = 0;
-            Some(i64::from(head))
+            head
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, head)
     });
-    nat!(lua, n, "setlist", |h: Option<i64>, v: Option<f64>| -> Result<(), String> {
+    cnat!(lua, n, "setlist", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let v = opt_num_arg(cx, 2)?;
         with_engine(|e| {
-            let h = handle32(h);
             if !e.lua_nodes.valid(h) {
                 return;
             }
@@ -1676,142 +1965,187 @@ fn install_lists(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
             };
             e.lua_nodes.node_mut(h).f[slot] = v.map_or(0, |v| v as i32);
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "getdisc", |h: Option<i64>, tails: Option<Value>| -> Result<Multi<6>, String> {
+    cnat!(lua, n, "getdisc", |cx| {
+        let h = handle_arg(cx, 1)?;
         // lua_isboolean(L, 2) && lua_toboolean(L, 2)
-        let tails = tails.as_ref().and_then(Value::as_boolean) == Some(true);
-        with_engine(|e| {
-            let h = handle32(h);
+        let tails = cx.arg_bool(2) == Some(true);
+        let res = with_engine(|e| {
             let s = &mut e.lua_nodes;
             if !s.valid(h) || s.id(h) != DISC {
-                return Multi::new();
+                return None;
             }
             let f = s.node(h).f;
-            let mut out = Multi::new();
-            for slot in 0..3 {
-                let head = f[slot] as u32;
+            let heads = [f[0] as u32, f[1] as u32, f[2] as u32];
+            for &head in &heads {
                 if head != 0 {
                     s.node_mut(head).prev = 0;
                 }
-                out.push(opt_node(head));
             }
-            if tails {
-                for slot in 0..3 {
-                    let head = f[slot] as u32;
-                    out.push(opt_node(s.tail_of(head)));
+            let tail_arr = if tails {
+                Some([s.tail_of(heads[0]), s.tail_of(heads[1]), s.tail_of(heads[2])])
+            } else {
+                None
+            };
+            Some((heads, tail_arr))
+        })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            Some((heads, tail_arr)) => {
+                for head in heads {
+                    push_opt_node(cx, head)?;
+                }
+                if let Some(tail_arr) = tail_arr {
+                    for tail in tail_arr {
+                        push_opt_node(cx, tail)?;
+                    }
+                    Ok(6)
+                } else {
+                    Ok(3)
                 }
             }
-            out
-        })
+            None => Ok(0),
+        }
     });
-    nat!(lua, n, "setdisc", |args: Variadic<Value>| -> Result<(), String> {
-        let h = args.first().map_or(0, |v| value_int(v) as u32);
-        let top = args.len();
+    cnat!(lua, n, "setdisc", |cx| {
+        let top = cx.arg_count();
+        let h = if top >= 1 { arg_vint(cx, 1) as u32 } else { 0 };
         with_engine(|e| {
             let s = &mut e.lua_nodes;
             if !s.valid(h) || s.id(h) != DISC {
                 return;
             }
-            let get = |i: usize| args.get(i).map_or(0, |v| value_int(v) as i32);
+            let get = |idx: usize| if top >= idx { arg_vint(cx, idx) as i32 } else { 0 };
             let nd = s.node_mut(h);
             // LuaTeX clears missing list arguments; subtype and penalty
             // below change only when those optional arguments are present.
-            for (i, slot) in [(1, 0), (2, 1), (3, 2)] {
-                nd.f[slot] = get(i);
+            nd.f[0] = get(2);
+            nd.f[1] = get(3);
+            nd.f[2] = get(4);
+            if top >= 5 {
+                nd.subtype = arg_vint(cx, 5) as u16;
             }
-            if top > 4 {
-                nd.subtype = value_int(&args[4]) as u16;
-            }
-            if top > 5 {
-                nd.f[3] = value_int(&args[5]) as i32;
+            if top >= 6 {
+                nd.f[3] = arg_vint(cx, 6) as i32;
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "flatten_discretionaries", |h: Option<i64>| -> Result<(Option<i64>, i64), String> {
-        with_engine(|e| {
-            let h = handle32(h);
+    cnat!(lua, n, "flatten_discretionaries", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let (head, c) = with_engine(|e| {
+            if !e.lua_nodes.valid(h) {
+                return (0, 0);
+            }
+            e.lua_nodes.flatten_discretionaries(h)
+        })
+        .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, head)?;
+        cx.push_int(c)?;
+        Ok(2)
+    });
+    cnat!(lua, n, "first_glyph", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let t = handle_arg(cx, 2)?;
+        let g = with_engine(|e| if e.lua_nodes.valid(h) { e.lua_nodes.first_glyph(h, t) } else { 0 })
+            .map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, g)
+    });
+    cnat!(lua, n, "has_glyph", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let g = with_engine(|e| e.lua_nodes.has_glyph(h)).map_err(|msg| cx.raw_error(msg))?;
+        push_opt_node(cx, g)
+    });
+    cnat!(lua, n, "is_char", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let font_arg = if arg_is_num(cx, 2) { Some(arg_vint(cx, 2)) } else { None };
+        enum IsCharRet {
+            NotGlyph(i64),
+            False,
+            Char(i64),
+        }
+        let res = with_engine(|e| {
+            if !e.lua_nodes.valid(h) {
+                return IsCharRet::NotGlyph(0);
+            }
+            let t = e.lua_nodes.node(h);
+            if t.id != GLYPH {
+                return IsCharRet::NotGlyph(i64::from(t.id));
+            }
+            if t.subtype & 0xFF00 != 0 {
+                return IsCharRet::False;
+            }
+            match font_arg {
+                Some(f) if f == 0 || f != i64::from(t.f[1]) => IsCharRet::False,
+                _ => IsCharRet::Char(i64::from(t.f[0])),
+            }
+        })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            IsCharRet::NotGlyph(id) => {
+                cx.push_nil()?;
+                cx.push_int(id)?;
+                Ok(2)
+            }
+            IsCharRet::False => cx.push_bool(false),
+            IsCharRet::Char(c) => cx.push_int(c),
+        }
+    });
+    cnat!(lua, n, "is_glyph", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| {
             if !e.lua_nodes.valid(h) {
                 return (None, 0);
             }
-            let (head, c) = e.lua_nodes.flatten_discretionaries(h);
-            ((head != 0).then_some(i64::from(head)), c)
-        })
-    });
-    nat!(lua, n, "first_glyph", |h: Option<i64>, t: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let (h, t) = (handle32(h), handle32(t));
-            if !e.lua_nodes.valid(h) {
-                return None;
-            }
-            let g = e.lua_nodes.first_glyph(h, t);
-            (g != 0).then_some(i64::from(g))
-        })
-    });
-    nat!(lua, n, "has_glyph", |h: Option<i64>| -> Result<Option<i64>, String> {
-        with_engine(|e| {
-            let g = e.lua_nodes.has_glyph(handle32(h));
-            (g != 0).then_some(i64::from(g))
-        })
-    });
-    nat!(lua, n, "is_char", |h: Option<i64>, font: Option<Value>| -> Result<Multi<2>, String> {
-        let font_arg = font.as_ref().filter(|v| is_num(Some(v))).map(value_int);
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return Multi::from([UdValue::Nil, UdValue::Integer(0)]);
-            }
             let t = e.lua_nodes.node(h);
             if t.id != GLYPH {
-                return Multi::from([UdValue::Nil, UdValue::Integer(i64::from(t.id))]);
-            }
-            if t.subtype & 0xFF00 != 0 {
-                return Multi::from([UdValue::Boolean(false)]);
-            }
-            match font_arg {
-                Some(f) if f == 0 || f != i64::from(t.f[1]) => Multi::from([UdValue::Boolean(false)]),
-                _ => Multi::from([UdValue::Integer(i64::from(t.f[0]))]),
-            }
-        })
-    });
-    nat!(lua, n, "is_glyph", |h: Option<i64>| -> Result<(UdValue, i64), String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            if !e.lua_nodes.valid(h) {
-                return (UdValue::Boolean(false), 0);
-            }
-            let t = e.lua_nodes.node(h);
-            if t.id != GLYPH {
-                (UdValue::Boolean(false), i64::from(t.id))
+                (None, i64::from(t.id))
             } else {
-                (UdValue::Integer(i64::from(t.f[0])), i64::from(t.f[1]))
+                (Some(i64::from(t.f[0])), i64::from(t.f[1]))
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        match res.0 {
+            Some(c) => cx.push_int(c)?,
+            None => cx.push_bool(false)?,
+        };
+        cx.push_int(res.1)?;
+        Ok(2)
     });
-    nat!(lua, n, "uses_font", |h: Option<i64>, f: Option<i64>| -> Result<bool, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            e.lua_nodes.valid(h) && e.lua_nodes.uses_font(h, f.unwrap_or(0))
-        })
+    cnat!(lua, n, "uses_font", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let f = opt_int_arg(cx, 2)?.unwrap_or(0);
+        let b = with_engine(|e| e.lua_nodes.valid(h) && e.lua_nodes.uses_font(h, f))
+            .map_err(|msg| cx.raw_error(msg))?;
+        cx.push_bool(b)
     });
-    nat!(lua, n, "protect_glyph", |h: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "protect_glyph", |cx| {
+        let h = handle_arg(cx, 1)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 e.lua_nodes.protect(h, true);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "unprotect_glyph", |h: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "unprotect_glyph", |cx| {
+        let h = handle_arg(cx, 1)?;
         with_engine(|e| {
-            let h = handle32(h);
             if e.lua_nodes.valid(h) {
                 e.lua_nodes.protect(h, false);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "protect_glyphs", |h: Option<i64>, t: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "protect_glyphs", |cx| {
+        let mut head = handle_arg(cx, 1)?;
+        let tail = handle_arg(cx, 2)?;
         with_engine(|e| {
-            let (mut head, tail) = (handle32(h), handle32(t));
             while e.lua_nodes.valid(head) {
                 e.lua_nodes.protect(head, true);
                 if head == tail {
@@ -1820,10 +2154,13 @@ fn install_lists(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 head = e.lua_nodes.next(head);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "unprotect_glyphs", |h: Option<i64>, t: Option<i64>| -> Result<(), String> {
+    cnat!(lua, n, "unprotect_glyphs", |cx| {
+        let mut head = handle_arg(cx, 1)?;
+        let tail = handle_arg(cx, 2)?;
         with_engine(|e| {
-            let (mut head, tail) = (handle32(h), handle32(t));
             while e.lua_nodes.valid(head) {
                 e.lua_nodes.protect(head, false);
                 if head == tail {
@@ -1832,15 +2169,26 @@ fn install_lists(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
                 head = e.lua_nodes.next(head);
             }
         })
+        .map_err(|msg| cx.raw_error(msg))?;
+        Ok(0)
     });
-    nat!(lua, n, "protrusion_skippable", |h: Option<i64>| -> Result<Option<bool>, String> {
-        with_engine(|e| {
-            let h = handle32(h);
-            e.lua_nodes.valid(h).then(|| e.lua_nodes.cp_skippable(h))
-        })
+    cnat!(lua, n, "protrusion_skippable", |cx| {
+        let h = handle_arg(cx, 1)?;
+        let res = with_engine(|e| e.lua_nodes.valid(h).then(|| e.lua_nodes.cp_skippable(h)))
+            .map_err(|msg| cx.raw_error(msg))?;
+        match res {
+            Some(b) => cx.push_bool(b),
+            None => cx.push_nil(),
+        }
     });
-    nat!(lua, n, "check_discretionary", |_h: Option<i64>| -> Result<(), String> { Ok(()) });
-    nat!(lua, n, "check_discretionaries", |_h: Option<i64>| -> Result<(), String> { Ok(()) });
+    cnat!(lua, n, "check_discretionary", |cx| {
+        let _ = opt_int_arg(cx, 1)?;
+        Ok(0)
+    });
+    cnat!(lua, n, "check_discretionaries", |cx| {
+        let _ = opt_int_arg(cx, 1)?;
+        Ok(0)
+    });
     nat!(lua, n, "usedlist", || -> Result<i64, String> {
         with_engine(|e| {
             // copies of all nodes in use, chained (texnodes.c list_node_mem_usage)
@@ -1871,20 +2219,21 @@ fn install_lists(lua: &mut Lua, n: &LuaTable) -> Result<(), String> {
             (e.lua_nodes.valid(h)).then(|| e.lua_nodes_tostring(h, "node"))
         })
     });
-    nat!(lua, n, "todirect_ud", |v: Option<Value>| -> Result<Option<i64>, String> {
-        Ok(v.and_then(|v| {
-            let h = node_of(&v);
-            (h != 0).then_some(i64::from(h))
-        }))
+    cnat!(lua, n, "todirect_ud", |cx| {
+        let h = cx.arg_userdata_ref::<NodeUd, _>(1, |u| u.h).unwrap_or(0);
+        push_opt_node(cx, h)
     });
-    nat!(lua, n, "is_node_ud", |v: Option<Value>| -> Result<Option<i64>, String> {
-        Ok(v.and_then(|v| {
-            let h = node_of(&v);
-            (h != 0).then_some(i64::from(h))
-        }))
+    cnat!(lua, n, "is_node_ud", |cx| {
+        let h = cx.arg_userdata_ref::<NodeUd, _>(1, |u| u.h).unwrap_or(0);
+        push_opt_node(cx, h)
     });
-    nat!(lua, n, "tointeger", |v: tex_lua::ToInteger| -> Result<i64, String> { Ok(v.0) });
-    nat!(lua, n, "tonode", |h: Option<i64>| -> Result<UdValue, String> { Ok(node_ud(handle32(h))) });
+    cnat!(lua, n, "tointeger", |cx| {
+        cx.push_int(cx.arg_tointeger(1).unwrap_or(0))
+    });
+    cnat!(lua, n, "tonode", |cx| {
+        let h = handle_arg(cx, 1)?;
+        if h == 0 { cx.push_nil() } else { cx.push_userdata(NodeUd { h }) }
+    });
     nat!(lua, n, "fix_node_lists", |v: Option<Value>| -> Result<(), String> {
         let b = v.as_ref().and_then(|v| v.as_boolean()).or_else(|| v.as_ref().and_then(|v| v.as_integer()).map(|i| i != 0));
         with_engine(|e| {

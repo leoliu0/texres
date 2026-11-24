@@ -243,6 +243,36 @@ pub fn has_subtype_type(id: u8) -> bool {
     !matches!(id, LOCAL_PAR | GLUE_SPEC) && id <= TEMP
 }
 
+/// Static child-node slot indices (fields of kind `K::N`) for each node type.
+/// Avoids heap-allocating a `Vec<usize>` on every `copy_node` / `flush_node` / `fingerprint`.
+#[inline]
+pub const fn child_slots_of(id: u8, subtype: u16) -> &'static [usize] {
+    match id {
+        HLIST | VLIST => &[8],
+        INS => &[3, 4],
+        ADJUST | GLUE | FENCE | SUB_BOX | SUB_MLIST => &[0],
+        DISC | NOAD => &[0, 1, 2],
+        WHATSIT => {
+            if subtype == ws::PDF_START_LINK {
+                &[5]
+            } else {
+                &[]
+            }
+        }
+        LOCAL_PAR => &[3, 5],
+        UNSET => &[9],
+        CHOICE => &[0, 1, 2, 3],
+        RADICAL => &[0, 1, 2, 3, 4],
+        FRACTION => &[1, 2, 3, 4, 5],
+        ACCENT => &[0, 1, 2, 3, 4, 5, 6],
+        MARGIN_KERN => &[1],
+        GLYPH => &[6],
+        PAGE_INSERT => &[1, 2],
+        SPLIT_INSERT => &[1, 2, 3, 4],
+        _ => &[],
+    }
+}
+
 /// The fields of a node of type `id`/`subtype`, in `node.fields` order
 /// (without id, subtype and attr).
 pub fn fields_of(id: u8, subtype: u16) -> &'static [(&'static str, K)] {
@@ -717,16 +747,6 @@ impl NodeStore {
 
     // ------------------------------------------------------ copy and release
 
-    /// Handles of the child lists / nodes owned by `n` (slots of kind `N`).
-    fn child_slots(&self, n: u32) -> impl Iterator<Item = usize> + '_ {
-        let node = &self.nodes[n as usize];
-        fields_of(node.id, node.subtype)
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, k))| *k == K::N)
-            .map(|(i, _)| i)
-    }
-
     /// `copy_node`: a copy of `n` alone (links cleared), with deep copies of
     /// its sub lists.
     pub fn copy_node(&mut self, n: u32) -> u32 {
@@ -736,18 +756,13 @@ impl NodeStore {
         copy.next = 0;
         copy.prev = 0;
         let attr = copy.attr;
-        let slots: Vec<usize> = fields_of(copy.id, copy.subtype)
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, k))| *k == K::N)
-            .map(|(i, _)| i)
-            .collect();
+        let slots = child_slots_of(copy.id, copy.subtype);
         self.nodes[r as usize] = copy;
         if attr != 0 {
             self.nodes[attr as usize].f[0] += 1;
         }
         // user defined whatsits with node values copy them as well
-        for i in slots {
+        for &i in slots {
             let child = self.nodes[r as usize].f[i] as u32;
             if child != 0 {
                 let c = self.copy_list(child);
@@ -806,16 +821,19 @@ impl NodeStore {
         if !self.valid(n) {
             return;
         }
-        let slots: Vec<usize> = self.child_slots(n).collect();
-        let attr = self.nodes[n as usize].attr;
-        for i in slots {
+        let (id, subtype, attr) = {
+            let node = &self.nodes[n as usize];
+            (node.id, node.subtype, node.attr)
+        };
+        let slots = child_slots_of(id, subtype);
+        for &i in slots {
             let child = self.nodes[n as usize].f[i] as u32;
             if child != 0 {
                 self.flush_list(child);
             }
         }
-        if self.nodes[n as usize].id == WHATSIT
-            && self.nodes[n as usize].subtype == ws::USER_DEFINED
+        if id == WHATSIT
+            && subtype == ws::USER_DEFINED
             && self.nodes[n as usize].f[1] == i32::from(b'n')
         {
             let v = self.nodes[n as usize].f[2] as u32;
@@ -823,7 +841,7 @@ impl NodeStore {
                 self.flush_list(v);
             }
         }
-        if attr != 0 && has_attr_type(self.nodes[n as usize].id, self.nodes[n as usize].subtype) {
+        if attr != 0 && has_attr_type(id, subtype) {
             self.delete_attr_ref(attr);
         }
         self.release(n);
@@ -842,27 +860,51 @@ impl NodeStore {
     /// strings and sub lists; the following nodes when `chain`): equal
     /// hashes mean Lua changed nothing.
     pub fn fingerprint(&self, n: u32, chain: bool) -> u64 {
-        use std::hash::Hasher;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = FpHasher(0);
         self.fingerprint_into(n, chain, &mut h);
         h.finish()
     }
 
-    fn fingerprint_into(&self, mut n: u32, chain: bool, h: &mut std::collections::hash_map::DefaultHasher) {
-        use std::hash::Hash;
+    fn fingerprint_into(&self, mut n: u32, chain: bool, h: &mut FpHasher) {
         while self.valid(n) {
             let node = &self.nodes[n as usize];
-            (node.id, node.subtype, node.f, node.fl.to_bits()).hash(h);
+            h.mix((u64::from(node.id) << 16) | u64::from(node.subtype));
+            let f = &node.f;
+            h.mix((f[0] as u32 as u64) | ((f[1] as u32 as u64) << 32));
+            h.mix((f[2] as u32 as u64) | ((f[3] as u32 as u64) << 32));
+            h.mix((f[4] as u32 as u64) | ((f[5] as u32 as u64) << 32));
+            h.mix((f[6] as u32 as u64) | ((f[7] as u32 as u64) << 32));
+            h.mix((f[8] as u32 as u64) | ((f[9] as u32 as u64) << 32));
+            h.mix((f[10] as u32 as u64) | ((f[11] as u32 as u64) << 32));
+            h.mix((f[12] as u32 as u64) | ((f[13] as u32 as u64) << 32));
+            h.mix(node.fl.to_bits());
             if node.attr != 0 {
-                self.attr_pairs(node.attr).hash(h);
+                let mut p = self.attr_first(node.attr);
+                let mut count = 0u64;
+                while p != 0 {
+                    let a = &self.nodes[p as usize];
+                    h.mix((a.f[0] as u32 as u64) | ((a.f[1] as u32 as u64) << 32));
+                    count += 1;
+                    p = a.next;
+                }
+                h.mix(count);
             }
             if let Some(e) = &node.ext {
-                e.strs.hash(h);
-                e.toks.iter().map(|t| t.0).collect::<Vec<_>>().hash(h);
-                e.opaque.is_some().hash(h);
+                h.mix(e.strs.len() as u64);
+                for s in &e.strs {
+                    h.mix_bytes(s);
+                }
+                h.mix(e.toks.len() as u64);
+                for t in &e.toks {
+                    h.mix(u64::from(t.0));
+                }
+                h.mix(u64::from(e.opaque.is_some()));
             }
-            for slot in self.child_slots(n).collect::<Vec<_>>() {
-                self.fingerprint_into(node.f[slot] as u32, true, h);
+            for &slot in child_slots_of(node.id, node.subtype) {
+                let child = node.f[slot] as u32;
+                if child != 0 {
+                    self.fingerprint_into(child, true, h);
+                }
             }
             if !chain {
                 break;
@@ -1204,6 +1246,42 @@ impl NodeStore {
     }
 }
 
+#[derive(Default)]
+struct FpHasher(u64);
+
+impl FpHasher {
+    #[inline(always)]
+    fn mix(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline(always)]
+    fn mix_bytes(&mut self, bytes: &[u8]) {
+        self.mix(bytes.len() as u64);
+        let mut chunks = bytes.chunks_exact(8);
+        for c in chunks.by_ref() {
+            self.mix(u64::from_ne_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut tail = 0u64;
+            for (i, &b) in rem.iter().enumerate() {
+                tail |= u64::from(b) << (i * 8);
+            }
+            self.mix(tail);
+        }
+    }
+
+    #[inline(always)]
+    fn finish(self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x
+    }
+}
+
 #[inline]
 fn node_val(h: u32) -> Val {
     if h == 0 { Val::Nil } else { Val::Node(h) }
@@ -1265,5 +1343,44 @@ fn is_dim_field(id: u8, name: &str) -> bool {
         // `rule_transform`, also a user value of a user rule
         "transform" => id == RULE,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_slots_of_matches_fields_of_for_all_node_types_and_whatsits() {
+        for id in 0..=50u8 {
+            if id == WHATSIT {
+                for w in WHATSITS {
+                    let sub = u16::from(w.id);
+                    let expected: Vec<usize> = fields_of(WHATSIT, sub)
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (_, k))| (*k == K::N).then_some(i))
+                        .collect();
+                    assert_eq!(
+                        child_slots_of(WHATSIT, sub),
+                        expected.as_slice(),
+                        "whatsit subtype {sub} ({}) child slots mismatch",
+                        w.name
+                    );
+                }
+                assert!(child_slots_of(WHATSIT, 999).is_empty());
+            } else {
+                let expected: Vec<usize> = fields_of(id, 0)
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, k))| (*k == K::N).then_some(i))
+                    .collect();
+                assert_eq!(
+                    child_slots_of(id, 0),
+                    expected.as_slice(),
+                    "node id {id} child slots mismatch"
+                );
+            }
+        }
     }
 }
