@@ -55,11 +55,17 @@ def _detect_tl_bin() -> Path:
     env_dir = os.environ.get("TEXLIVE_BIN_DIR")
     if env_dir and (Path(env_dir) / "pdflatex").exists():
         return Path(env_dir).resolve()
-    which_ltx = shutil.which("latexmk") or shutil.which("pdflatex")
-    if which_ltx:
-        cand = Path(which_ltx).resolve().parent
-        if (cand / "pdflatex").exists():
-            return cand
+    for require_latexmk in (True, False):
+        for tool in ("latexmk", "pdflatex"):
+            found = shutil.which(tool)
+            if found:
+                # Keep the bin directory rather than resolving script symlinks
+                # (e.g. latexmk -> ../../texmf-dist/scripts/latexmk/latexmk.pl).
+                cand = Path(found).parent.resolve()
+                if (cand / "pdflatex").exists() and (
+                    not require_latexmk or (cand / "latexmk").exists()
+                ):
+                    return cand
     return Path("/usr/bin")
 
 
@@ -366,11 +372,12 @@ def first_line(cmd):
 
 def environment(texres: Path):
     cpuinfo = Path("/proc/cpuinfo").read_text()
-    model = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M).group(1)
+    model_m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
     lscpu = sh(["lscpu"]).stdout
     def lf(k):
         m = re.search(rf"^{k}:\s+(.+)$", lscpu, re.M)
         return m.group(1).strip() if m else "?"
+    model = model_m.group(1) if model_m else lf("Model name")
     mem_kb = int(re.search(r"MemTotal:\s+(\d+)", Path("/proc/meminfo").read_text()).group(1))
     osr = dict(
         l.split("=", 1) for l in Path("/etc/os-release").read_text().splitlines() if "=" in l
