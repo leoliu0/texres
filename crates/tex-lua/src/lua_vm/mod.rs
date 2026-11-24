@@ -355,6 +355,9 @@ impl GlobalState {
     /// Create an isolated state with an explicit source and library dialect.
     pub fn new_with_language(option: SafeOption, version: LuaLanguageLevel) -> Pin<Box<Self>> {
         let mut gc = GC::new(option.clone());
+        if version == LuaLanguageLevel::Lua53 {
+            gc.set_default_pause(crate::lua_vm::lua_limits::DEFAULT_GC_PAUSE_53);
+        }
         gc.set_temporary_memory_limit(isize::MAX / 2);
         let mut object_allocator = ObjectAllocator::new();
         #[cfg(feature = "shared-proto")]

@@ -374,6 +374,11 @@ impl GC {
         gc
     }
 
+    /// Override the initial GC pause parameter before running user code.
+    pub(crate) fn set_default_pause(&mut self, pause: i32) {
+        self.gc_params[PAUSE] = code_param(pause.max(0) as u32);
+    }
+
     /// Reclaim burst-sized owner and marking buffers after a complete cycle.
     pub(crate) fn trim_after_full_gc(&mut self) {
         for list in [
@@ -1091,11 +1096,16 @@ impl GC {
     /// ```
     fn inc_step(&mut self, l: &mut LuaState) {
         // l_mem stepsize = applygcparam(g, STEPSIZE, 100);
-        let stepsize = self.apply_param(STEPSIZE, 100);
+        let stepsize = self.apply_param(STEPSIZE, 100).max(1);
+        // Pay for allocations accumulated past the trigger threshold (e.g.,
+        // large pre-sized tables or strings allocated in a single native call)
+        // rather than forgiving negative gc_debt when resetting to `stepsize`.
+        let overdue = self.gc_debt.saturating_neg().max(0);
+        let bytes_to_pay = stepsize.saturating_add(overdue);
 
-        // l_mem work2do = applygcparam(g, STEPMUL, stepsize / cast_int(sizeof(void*)));
+        // l_mem work2do = applygcparam(g, STEPMUL, bytes_to_pay / cast_int(sizeof(void*)));
         let ptr_size = std::mem::size_of::<*const ()>() as isize;
-        let mut work2do = self.apply_param(STEPMUL, stepsize / ptr_size);
+        let mut work2do = self.apply_param(STEPMUL, bytes_to_pay / ptr_size);
         // int fast = (work2do == 0);
         let fast = work2do == 0;
 

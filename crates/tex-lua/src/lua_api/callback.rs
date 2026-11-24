@@ -270,4 +270,51 @@ mod tests {
         let rejected: bool = lua.load("return not pcall(f)").eval().unwrap();
         assert!(rejected);
     }
+
+    #[test]
+    fn lua53_uses_standard_pause_and_bounds_large_one_shot_allocations() {
+        let mut lua53 = lua();
+        let pause53: i64 = lua53
+            .load("return collectgarbage('setpause', 200)")
+            .eval()
+            .unwrap();
+        assert_eq!(pause53, 200);
+
+        let mut lua55 = Lua::new(SafeOption::default());
+        lua55.open_stdlib(Stdlib::All).unwrap();
+        let pause55: i64 = lua55
+            .load("return collectgarbage('setpause', 250)")
+            .eval()
+            .unwrap();
+        assert_eq!(pause55, 250);
+
+        let make_arr = lua53
+            .create_callback(|cx| cx.push_int_array((0..100_000i32).map(i64::from)))
+            .unwrap();
+        lua53.set_global("make_arr", make_arr).unwrap();
+
+        // Repeated ~1.7 MiB array allocations and 1 MiB strings must trigger
+        // complete GC cycles instead of letting garbage accumulate unboundedly.
+        let peak_kb: f64 = lua53
+            .load(
+                r#"
+                local peak = 0
+                local big = string.rep("x", 1024)
+                for i = 1, 40 do
+                    local _t = make_arr()
+                    local _s = string.rep(big, 1024)
+                    local cur = collectgarbage("count")
+                    if cur > peak then peak = cur end
+                end
+                return peak
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // Without paying overdue GC debt, 40 iterations allocate ~110 MiB before sweeping.
+        assert!(
+            peak_kb < 32_768.0,
+            "expected GC to bound peak memory below 32 MiB, got {peak_kb:.1} KiB"
+        );
+    }
 }

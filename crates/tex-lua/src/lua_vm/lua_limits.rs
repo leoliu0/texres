@@ -103,9 +103,12 @@ pub const MAX_STRING_SIZE: i64 = 1 << 30;
 
 // ===== GC Defaults =====
 
-/// Default GC pause (percentage). Controls how long GC waits before starting
-/// a new cycle. 250 = wait until memory is 2.5x the size after last collection.
+/// Default GC pause (percentage) for Lua 5.5. Controls how long GC waits before
+/// starting a new cycle. 250 = wait until memory is 2.5x the size after last collection.
 pub const DEFAULT_GC_PAUSE: i32 = 250;
+
+/// Default GC pause (percentage) for Lua 5.3 (`LUAI_GCPAUSE = 200` in luaconf.h).
+pub const DEFAULT_GC_PAUSE_53: i32 = 200;
 
 /// Default GC step multiplier (percentage). Controls how much work GC does
 /// per step relative to memory allocation. 200 = collect 2x the allocated speed.
