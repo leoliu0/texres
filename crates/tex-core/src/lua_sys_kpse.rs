@@ -966,6 +966,16 @@ fn run_shell(command: &mut std::process::Command, allow: i32, output_dir: Option
         .env("SELFAUTODIR", &dir)
         .env("SELFAUTOPARENT", &parent)
         .env("SELFAUTOGRANDPARENT", &grandparent);
+    for key in [
+        "TEX_RS_SKIP_UNCONVERGED_PDF",
+        "TEXMK_INTERNAL_MODE",
+        "TEX_SUITE_PROGRAM_NAME",
+        "TEX_RS_CACHE_HIT_MARKER",
+        "TEX_RS_TEXMK_PUBLISHED_OUTPUT",
+        "TEX_RS_TEXMK_WATCH_DEPENDENCIES",
+    ] {
+        command.env_remove(key);
+    }
     if let Some(dir) = output_dir {
         let dir = if dir.is_absolute() { dir.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(dir) };
         command.env("TEXMF_OUTPUT_DIRECTORY", dir);

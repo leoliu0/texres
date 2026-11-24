@@ -2866,9 +2866,6 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             .unwrap_or_else(|| "texput".to_string())
     });
     let aux_start = snapshot_aux_state(&job, &aux_dir);
-    let extra_pass_aux_start = (std::env::var_os(TEXMK_SKIP_UNCONVERGED_PDF_ENV).as_deref()
-        == Some(std::ffi::OsStr::new("1")))
-    .then(|| snapshot_extra_pass_aux_state(&job, &aux_dir));
     let cache_root = requested_cache_dir.unwrap_or_else(platform_cache_dir);
     tex_core::set_cache_dir(absolute_path(&cache_root));
     // The build driver shares one font database between its jobs.
@@ -2876,6 +2873,13 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
         tex_core::set_font_cache_dir(absolute_path(std::path::Path::new(&dir)));
     }
     let published_outputs = texmk_published_outputs(&cache_root, synctex_mode.extension());
+    let extra_pass_aux_start = (published_outputs.is_some()
+        && std::env::var_os(TEXMK_SKIP_UNCONVERGED_PDF_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("1")))
+    .then(|| snapshot_extra_pass_aux_state(&job, &aux_dir));
+    // Never propagate texmk's one-pass PDF skip flag into child engines spawned
+    // via \write18, Lua os.execute, or io.popen.
+    std::env::remove_var(TEXMK_SKIP_UNCONVERGED_PDF_ENV);
     let private_cache = depcache_path(
         &cache_root,
         &file,

@@ -4591,7 +4591,21 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
             eprintln!("texmk: {target_engine} pass {passes}/{MAX_PASSES}");
         }
         let _ = std::fs::remove_file(&cache_hit_marker);
+        let passthrough_overrides_dirs = opt.passthrough.iter().any(|arg| {
+            let flag = arg
+                .strip_prefix("--")
+                .or_else(|| arg.strip_prefix('-'))
+                .unwrap_or("");
+            matches!(
+                flag,
+                "aux-directory" | "auxdir" | "output-directory" | "outdir"
+            ) || flag.starts_with("aux-directory=")
+                || flag.starts_with("auxdir=")
+                || flag.starts_with("output-directory=")
+                || flag.starts_with("outdir=")
+        });
         let can_skip_pdf = using_embedded_engine
+            && !passthrough_overrides_dirs
             && passes < MAX_PASSES
             && (started_from_trivial_aux || passes > 1);
         let mut pass_env = engine_env.clone();

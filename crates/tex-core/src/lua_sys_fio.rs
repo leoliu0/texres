@@ -297,12 +297,12 @@ fn register_int_reader(
                     "bad argument #1 to '{name}' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, name)? - 1;
+            let pos = check_sio_integer(cb, 2, name)?;
             let val = run_sio_bytes(cb, name, |s| {
-                if p < 0 {
+                if pos < 1 {
                     return None;
                 }
-                let start = p as usize;
+                let start = (pos - 1) as usize;
                 let end = start.checked_add(width)?;
                 if end > s.len() {
                     return None;
@@ -423,14 +423,14 @@ fn register_table_reader(
                     "bad argument #1 to '{fname}' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, fname)? - 1;
+            let pos = check_sio_integer(cb, 2, fname)?;
             let n = opt_integer(cb, 3);
             let b = opt_integer(cb, 4);
-            if p < 0 || n <= 0 || !(1..=4).contains(&b) {
+            if pos < 1 || n <= 0 || !(1..=4).contains(&b) {
                 return cb.push_int_array(std::iter::empty());
             }
             let width = b as usize;
-            let start = p as usize;
+            let start = (pos - 1) as usize;
             let vals = run_sio_bytes(cb, fname, |s| {
                 if start >= s.len() {
                     return Vec::new();
@@ -492,13 +492,13 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
                     "bad argument #1 to 'readfixed2' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, "readfixed2")? - 1;
+            let pos = check_sio_integer(cb, 2, "readfixed2")?;
             // Match LuaTeX's `p + 3 >= #s` check in liolibext.c.
             let val = run_sio_bytes(cb, "readfixed2", |s| {
-                if p < 0 {
+                if pos < 1 {
                     return None;
                 }
-                let start = p as usize;
+                let start = (pos - 1) as usize;
                 if start.checked_add(3)? >= s.len() {
                     return None;
                 }
@@ -534,12 +534,12 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
                     "bad argument #1 to 'readfixed4' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, "readfixed4")? - 1;
+            let pos = check_sio_integer(cb, 2, "readfixed4")?;
             let val = run_sio_bytes(cb, "readfixed4", |s| {
-                if p < 0 {
+                if pos < 1 {
                     return None;
                 }
-                let start = p as usize;
+                let start = (pos - 1) as usize;
                 if start.checked_add(3)? >= s.len() {
                     return None;
                 }
@@ -573,12 +573,12 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
                     "bad argument #1 to 'read2dot14' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, "read2dot14")? - 1;
+            let pos = check_sio_integer(cb, 2, "read2dot14")?;
             let val = run_sio_bytes(cb, "read2dot14", |s| {
-                if p < 0 {
+                if pos < 1 {
                     return None;
                 }
-                let start = p as usize;
+                let start = (pos - 1) as usize;
                 if start.checked_add(1)? >= s.len() {
                     return None;
                 }
@@ -754,12 +754,12 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
                     "bad argument #1 to 'readbytes' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, "readbytes")? - 1;
+            let pos = check_sio_integer(cb, 2, "readbytes")?;
             let n = opt_integer(cb, 3);
-            if p < 0 || n <= 0 {
+            if pos < 1 || n <= 0 {
                 return Ok(0);
             }
-            let start = p as usize;
+            let start = (pos - 1) as usize;
             let bytes = run_sio_bytes(cb, "readbytes", |s| {
                 if start >= s.len() {
                     return Vec::new();
@@ -811,12 +811,12 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
                     "bad argument #1 to 'readbytetable' (string expected, got {got})"
                 )));
             }
-            let p = check_sio_integer(cb, 2, "readbytetable")? - 1;
+            let pos = check_sio_integer(cb, 2, "readbytetable")?;
             let n = opt_integer(cb, 3);
-            if p < 0 {
+            if pos < 1 {
                 return cb.push_nil();
             }
-            let start = p as usize;
+            let start = (pos - 1) as usize;
             let maybe = run_sio_bytes(cb, "readbytetable", |s| {
                 if start >= s.len() {
                     return None;
@@ -928,4 +928,40 @@ pub(crate) fn register(lua: &mut Lua, s: &LuaTable) -> Result<(), String> {
     s.set("fio", fio).map_err(|e| format!("{e:?}"))?;
     s.set("sio", sio).map_err(|e| format!("{e:?}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register;
+    use tex_lua::{Lua, LuaApi, SafeOption, Stdlib};
+
+    #[test]
+    fn sio_mininteger_position_does_not_underflow() {
+        let mut lua = Lua::new_lua53(SafeOption::default());
+        lua.open_stdlib(Stdlib::All).unwrap();
+        let sys = lua.create_table().unwrap();
+        register(&mut lua, &sys).unwrap();
+        lua.set_global("sys", sys).unwrap();
+        let ok: bool = lua
+            .load(
+                r##"
+                local sio = sys.sio
+                local m = math.mininteger
+                local s = "abcdefgh"
+                assert(sio.readcardinal1(s, m) == nil)
+                assert(sio.readinteger2(s, m) == nil)
+                assert(#sio.readcardinaltable(s, m, 2, 1) == 0)
+                assert(#sio.readintegertable(s, m, 2, 1) == 0)
+                assert(sio.readfixed2(s, m) == nil)
+                assert(sio.readfixed4(s, m) == nil)
+                assert(sio.read2dot14(s, m) == nil)
+                assert(select("#", sio.readbytes(s, m, 2)) == 0)
+                assert(sio.readbytetable(s, m, 2) == nil)
+                return true
+                "##,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
 }

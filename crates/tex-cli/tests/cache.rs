@@ -1891,3 +1891,28 @@ fn canonical_working_directory_is_part_of_the_cache_identity() {
         "cache sentinel"
     );
 }
+
+#[test]
+fn skip_unconverged_pdf_env_is_ignored_without_texmk_ownership() {
+    let job = Job::new();
+    std::fs::write(
+        job.0.join("main.tex"),
+        "\\documentclass{article}\\begin{document}Hello\\label{a} \\ref{a}.\\end{document}\n",
+    )
+    .unwrap();
+    // Even on a first pass where main.aux changes, a standalone pdflatex run
+    // with TEX_RS_SKIP_UNCONVERGED_PDF=1 inherited in the environment must
+    // still produce main.pdf because it lacks texmk ownership proof.
+    let output = job
+        .pdflatex()
+        .arg("main.tex")
+        .current_dir(&job.0)
+        .env("TEX_RS_SKIP_UNCONVERGED_PDF", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        job.0.join("main.pdf").is_file(),
+        "standalone pdflatex must not skip writing PDF when TEX_RS_SKIP_UNCONVERGED_PDF=1 is inherited"
+    );
+}

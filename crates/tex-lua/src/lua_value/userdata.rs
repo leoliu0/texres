@@ -44,7 +44,7 @@ impl LuaUserdata {
 
     #[cold]
     #[inline(never)]
-    fn borrowed_by_host(&self) -> ! {
+    pub(crate) fn borrowed_by_host(&self) -> ! {
         panic!(
             "userdata {} is {} by the host",
             if self.host_borrow.get() < 0 { "<mutably borrowed>" } else { self.data.type_name() },

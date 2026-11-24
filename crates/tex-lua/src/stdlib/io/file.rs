@@ -231,7 +231,9 @@ pub(crate) fn valid_open_mode(mode: &[u8]) -> bool {
 
 impl LuaFile {
     fn with_stream(stream: Stream, readable: bool, writable: bool, mode: BufMode) -> Self {
-        let rbuf_end_pos = (!writable && matches!(stream, Stream::File(_))).then_some(0);
+        let is_regular_file =
+            matches!(&stream, Stream::File(file) if file.metadata().is_ok_and(|m| m.is_file()));
+        let rbuf_end_pos = (!writable && is_regular_file).then_some(0);
         LuaFile {
             stream: Some(stream),
             readable,
@@ -381,6 +383,16 @@ impl LuaFile {
             cmd.arg("-c").arg(command);
             cmd
         };
+        for key in [
+            "TEX_RS_SKIP_UNCONVERGED_PDF",
+            "TEXMK_INTERNAL_MODE",
+            "TEX_SUITE_PROGRAM_NAME",
+            "TEX_RS_CACHE_HIT_MARKER",
+            "TEX_RS_TEXMK_PUBLISHED_OUTPUT",
+            "TEX_RS_TEXMK_WATCH_DEPENDENCIES",
+        ] {
+            cmd.env_remove(key);
+        }
         if write {
             let mut child = cmd.stdin(Stdio::piped()).spawn()?;
             let stdin = child.stdin.take().expect("piped stdin");
@@ -637,6 +649,8 @@ impl LuaFile {
                         return Err(ebadf());
                     }
                     self.flush_write_buffer()?;
+                    self.rbuf.clear();
+                    self.rpos = 0;
                     let start = out.len();
                     out.resize(start + remaining.min(1 << 20), 0);
                     let result = self.raw_read(&mut out[start..]);
@@ -881,5 +895,83 @@ mod tests {
         assert_eq!(decode(&[b"a\r", b"\nb"]), b"a\nb");
         assert_eq!(decode(&[b"a\r", b"b\r"]), b"a\rb\r");
         assert_eq!(decode(&[b"\r\r\n"]), b"\r\n");
+    }
+
+    #[test]
+    fn seek_after_large_read_chars_does_not_return_stale_buffer() {
+        use std::io::SeekFrom;
+        let path = std::env::temp_dir().join(format!(
+            "tex_lua_file_seek_test_{}_{}",
+            std::process::id(),
+            crate::platform_time::unix_nanos()
+        ));
+        let mut data = vec![0u8; 192 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i / 1024) ^ (i & 0xff)) as u8;
+        }
+        std::fs::write(&path, &data).unwrap();
+        let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+        let mut file = super::LuaFile::open_unobserved(&path_bytes, b"rb").unwrap();
+
+        let mut out = Vec::new();
+        file.read_chars(&mut out, 1).unwrap();
+        file.read_chars(&mut out, 65535).unwrap();
+        assert_eq!(&out[..], &data[..65536]);
+
+        // Large read (>= 64 KiB) bypasses rbuf; rbuf must be cleared so seek
+        // into [65536..131072] does not hit stale bytes from [0..65536].
+        let mut large = Vec::new();
+        file.read_chars(&mut large, 65536).unwrap();
+        assert_eq!(&large[..], &data[65536..131072]);
+
+        let pos = file.seek(SeekFrom::Start(70000)).unwrap();
+        assert_eq!(pos, 70000);
+        let mut back = Vec::new();
+        file.read_chars(&mut back, 64).unwrap();
+        assert_eq!(&back[..], &data[70000..70064]);
+
+        let pos2 = file.seek(SeekFrom::Current(-32)).unwrap();
+        assert_eq!(pos2, 70032);
+        let mut back2 = Vec::new();
+        file.read_chars(&mut back2, 32).unwrap();
+        assert_eq!(&back2[..], &data[70032..70064]);
+
+        let _ = file.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_read_only_file_is_not_seekable() {
+        use std::ffi::CString;
+        use std::io::{SeekFrom, Write};
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!(
+            "tex_lua_fifo_test_{}_{}",
+            std::process::id(),
+            crate::platform_time::unix_nanos()
+        ));
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            f.write_all(b"hello world").unwrap();
+        });
+
+        let mut file = super::LuaFile::open_unobserved(path.as_os_str().as_bytes(), b"rb").unwrap();
+        let mut buf = Vec::new();
+        file.read_chars(&mut buf, 5).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        let err_cur = file.seek(SeekFrom::Current(0)).unwrap_err();
+        assert_eq!(err_cur.raw_os_error(), Some(libc::ESPIPE));
+        let err_set = file.seek(SeekFrom::Start(0)).unwrap_err();
+        assert_eq!(err_set.raw_os_error(), Some(libc::ESPIPE));
+
+        let _ = file.close();
+        writer.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

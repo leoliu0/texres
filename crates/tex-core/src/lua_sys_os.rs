@@ -92,9 +92,25 @@ fn spawn_error_code(error: &std::io::Error) -> i64 {
     }
 }
 
+const INTERNAL_TEXMK_ENV_VARS: &[&str] = &[
+    "TEX_RS_SKIP_UNCONVERGED_PDF",
+    "TEXMK_INTERNAL_MODE",
+    "TEX_SUITE_PROGRAM_NAME",
+    "TEX_RS_CACHE_HIT_MARKER",
+    "TEX_RS_TEXMK_PUBLISHED_OUTPUT",
+    "TEX_RS_TEXMK_WATCH_DEPENDENCIES",
+];
+
+fn strip_internal_texmk_env(command: &mut Command) {
+    for key in INTERNAL_TEXMK_ENV_VARS {
+        command.env_remove(key);
+    }
+}
+
 fn command_for(program: &[u8], args: &[Vec<u8>]) -> Command {
     let _ = crate::lua_bridge::with_engine(|e| e.lua_untracked("os.spawn"));
     let mut command = Command::new(os_str(program));
+    strip_internal_texmk_env(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -279,7 +295,10 @@ pub(crate) fn register(lua: &mut Lua, s: &tex_lua::LuaTable) -> Result<(), Strin
             // A wait status: the exit code in the second byte.
             return (Some(i64::from(code & 0xff) << 8), None);
         }
-        let status = Command::new("/bin/sh").arg("-c").arg(os_str(run.as_bytes())).status();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(os_str(run.as_bytes()));
+        strip_internal_texmk_env(&mut command);
+        let status = command.status();
         match status {
             Ok(status) => {
                 #[cfg(unix)]

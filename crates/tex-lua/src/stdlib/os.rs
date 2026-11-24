@@ -448,9 +448,28 @@ fn os_execute(l: &mut LuaState) -> LuaResult<usize> {
         let command = String::from_utf8_lossy(&command).into_owned();
         let _ = std::io::stdout().flush();
         #[cfg(windows)]
-        let status = std::process::Command::new("cmd").args(["/C", &command]).status();
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", &command]);
+            cmd
+        };
         #[cfg(not(windows))]
-        let status = std::process::Command::new("/bin/sh").arg("-c").arg(&command).status();
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&command);
+            cmd
+        };
+        for key in [
+            "TEX_RS_SKIP_UNCONVERGED_PDF",
+            "TEXMK_INTERNAL_MODE",
+            "TEX_SUITE_PROGRAM_NAME",
+            "TEX_RS_CACHE_HIT_MARKER",
+            "TEX_RS_TEXMK_PUBLISHED_OUTPUT",
+            "TEX_RS_TEXMK_WATCH_DEPENDENCIES",
+        ] {
+            cmd.env_remove(key);
+        }
+        let status = cmd.status();
         match status {
             Ok(status) => push_exec_result(l, status),
             Err(error) => push_os_error(l, &error, None),
