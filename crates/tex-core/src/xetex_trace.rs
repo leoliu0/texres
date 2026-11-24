@@ -31,9 +31,11 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .filter(|(i, s)| match s {
-                    Source::TokList { name: "<endoutput>", .. } => false,
-                    Source::TokList { name: "<write>", toks, pos, .. } => {
-                        *i + 1 == stack.len() || *pos + 2 < toks.len()
+                    Source::TokRc { name: "<endoutput>", .. }
+                    | Source::TokVec { name: "<endoutput>", .. } => false,
+                    Source::TokRc { name: "<write>", pos, end, .. }
+                    | Source::TokVec { name: "<write>", pos, end, .. } => {
+                        *i + 1 == stack.len() || (*pos as usize) + 2 < (*end as usize)
                     }
                     _ => true,
                 })

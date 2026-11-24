@@ -497,8 +497,8 @@ impl Engine {
             if_depth: self.if_stack.len(),
             scan_tokens: false,
         };
-        if let Some(Source::File { tracked, .. }) = self.input.stack.last_mut() {
-            *tracked = true;
+        if let Some(Source::File { inner, .. }) = self.input.stack.last_mut() {
+            inner.tracked = true;
             self.file_nests.push(record);
         }
     }

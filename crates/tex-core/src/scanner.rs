@@ -23,7 +23,7 @@ impl Engine {
             }
             let si = self.input.stack.len() - 1;
             match self.input.stack[si] {
-                Source::TokList { .. } | Source::MacroFrame(_) => {
+                Source::TokRc { .. } | Source::TokVec { .. } | Source::MacroFrame(_) => {
                     if let Some(t) = self.toklist_next(si) {
                         return t;
                     }
@@ -47,15 +47,16 @@ impl Engine {
 
     pub(crate) fn toklist_next(&mut self, si: usize) -> Option<Token> {
         let trace_depth = match &self.input.stack[si] {
-            Source::TokList { trace_depth, .. } => *trace_depth,
+            Source::TokRc { trace_depth, .. } | Source::TokVec { trace_depth, .. } => *trace_depth,
             Source::MacroFrame(frame) => frame.trace_depth,
             _ => unreachable!(),
         };
         self.unwind_macro_trace(trace_depth);
         match &mut self.input.stack[si] {
-            Source::TokList { toks, pos, .. } => {
-                if *pos < toks.len() {
-                    let t = toks[*pos];
+            Source::TokRc { seg, pos, end, .. } | Source::TokVec { seg, pos, end, .. } => {
+                if *pos < *end {
+                    // SAFETY: `pos < end <= toks.len()` and `seg == toks.as_ptr()`.
+                    let t = unsafe { *seg.add(*pos as usize) };
                     *pos += 1;
                     // Keep the exhausted list until the next fetch. The token
                     // currently being processed still belongs to this source;
@@ -87,22 +88,16 @@ impl Engine {
     fn file_next_token(&mut self, si: usize) -> Option<Token> {
         loop {
             let Source::File {
-                done,
-                ending,
-                line_buf,
-                line_pos,
-                state,
-                cat_regime,
-                lua_lines,
-                lua_reader,
                 name,
+                lua_lines,
+                inner,
+                lua_reader,
                 announced,
-                ..
             } = &self.input.stack[si]
             else {
                 unreachable!()
             };
-            if *done {
+            if inner.done {
                 // e-TeX semantics: \everyeof fires every time scanning
                 // reaches EOF of an input file or pseudo-file (expl3 \file_get
                 // and \tl_set_rescan rely on this to supply closing delimiters).
@@ -111,10 +106,8 @@ impl Engine {
                 let reader = *lua_reader;
                 let real_file = !name.starts_with('<') || name.starts_with("<embedded:");
                 let announced = *announced;
-                if matches!(
-                    self.input.stack.get(si),
-                    Some(Source::File { tracked: true, .. })
-                ) {
+                let tracked = inner.tracked;
+                if tracked {
                     self.finish_tracked_file();
                 }
                 self.input.finish_file(si);
@@ -144,8 +137,8 @@ impl Engine {
                 }
                 return None;
             }
-            let Some(buf) = line_buf else {
-                let ending = *ending;
+            let Some(buf) = &inner.line_buf else {
+                let ending = inner.ending;
                 // luatex next_line: a printed token object is read next
                 // (it is backed up and the pseudo file is resumed after it).
                 if !ending {
@@ -159,9 +152,9 @@ impl Engine {
                 }
                 continue;
             };
-            let start = *line_pos;
-            let state = *state;
-            let regime = *cat_regime;
+            let start = inner.line_pos;
+            let state = inner.state;
+            let regime = inner.cat_regime;
             let Some((mut character, mut width)) = self.decode_scalar(buf, start) else {
                 // tex.web §360: an exhausted line moves to the next one in
                 // state new_line.
@@ -190,8 +183,8 @@ impl Engine {
     }
 
     fn set_file_done(&mut self, si: usize) {
-        if let Source::File { done, .. } = &mut self.input.stack[si] {
-            *done = true;
+        if let Source::File { inner, .. } = &mut self.input.stack[si] {
+            inner.done = true;
         }
     }
 
@@ -204,8 +197,8 @@ impl Engine {
     }
 
     fn set_file_state(&mut self, si: usize, value: u8) {
-        if let Source::File { state, .. } = &mut self.input.stack[si] {
-            *state = value;
+        if let Source::File { inner, .. } = &mut self.input.stack[si] {
+            inner.state = value;
         }
     }
 
@@ -215,35 +208,32 @@ impl Engine {
     }
 
     fn file_line_advance_by(&mut self, si: usize, width: usize) {
-        if let Some(Source::File { line_pos, .. }) = self.input.stack.get_mut(si) {
-            *line_pos += width;
+        if let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) {
+            inner.line_pos += width;
         }
     }
 
     /// Discard the rest of the current line (`loc:=limit+1`). The buffer is
     /// kept for reuse by the next line.
     fn file_line_clear(&mut self, si: usize) {
-        if let Some(Source::File {
-            line_buf, line_pos, ..
-        }) = self.input.stack.get_mut(si)
-        {
-            if let Some(buf) = line_buf.take() {
+        if let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) {
+            if let Some(buf) = inner.line_buf.take() {
                 self.spare_line_buf = buf;
             }
-            *line_pos = 0;
+            inner.line_pos = 0;
         }
     }
 
     fn file_line_is_none(&self, si: usize) -> bool {
         match self.input.stack.get(si) {
-            Some(Source::File { line_buf, .. }) => line_buf.is_none(),
+            Some(Source::File { inner, .. }) => inner.line_buf.is_none(),
             _ => true,
         }
     }
 
     fn file_line_pos(&self, si: usize) -> usize {
         match self.input.stack.get(si) {
-            Some(Source::File { line_pos, .. }) => *line_pos,
+            Some(Source::File { inner, .. }) => inner.line_pos,
             _ => 0,
         }
     }
@@ -278,19 +268,18 @@ impl Engine {
         if self.engine_kind == EngineKind::XeTeX {
             return self.file_load_line_xetex(si, buf, end_line_char);
         }
-        let Source::File {
+        let Source::File { name, inner, .. } = &mut self.input.stack[si] else {
+            return false;
+        };
+        let crate::input::FileBody {
             data,
             pos,
             line_no,
             line_start,
             state,
-            name,
             pseudo_breaks,
             ..
-        } = &mut self.input.stack[si]
-        else {
-            return false;
-        };
+        } = &mut **inner;
         if *pos >= data.len() {
             self.spare_line_buf = buf;
             return false;
@@ -328,18 +317,12 @@ impl Engine {
                 buf.push(character);
             }
         }
-        let Source::File {
-            line_buf,
-            line_end_len,
-            line_pos,
-            ..
-        } = &mut self.input.stack[si]
-        else {
+        let Source::File { inner, .. } = &mut self.input.stack[si] else {
             return false;
         };
-        *line_end_len = (buf.len() - before) as u8;
-        *line_buf = Some(buf);
-        *line_pos = 0;
+        inner.line_end_len = (buf.len() - before) as u8;
+        inner.line_buf = Some(buf);
+        inner.line_pos = 0;
         true
     }
 
@@ -359,14 +342,14 @@ impl Engine {
                 buf.push(character);
             }
         }
-        let Some(Source::File { line_buf, line_end_len, line_pos, line_no, state, .. }) = self.input.stack.get_mut(si) else {
+        let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) else {
             return false;
         };
-        *line_end_len = (buf.len() - before) as u8;
-        *line_buf = Some(buf);
-        *line_pos = 0;
-        *line_no += 1;
-        *state = 0;
+        inner.line_end_len = (buf.len() - before) as u8;
+        inner.line_buf = Some(buf);
+        inner.line_pos = 0;
+        inner.line_no += 1;
+        inner.state = 0;
         true
     }
 
@@ -401,26 +384,17 @@ impl Engine {
                 }
             }
         }
-        let Source::File {
-            line_buf,
-            line_end_len,
-            line_pos,
-            line_no,
-            state,
-            cat_regime,
-            ..
-        } = &mut self.input.stack[si]
-        else {
+        let Source::File { inner, .. } = &mut self.input.stack[si] else {
             return false;
         };
-        *line_end_len = (buf.len() - before) as u8;
-        *line_buf = Some(buf);
-        *line_pos = 0;
-        *line_no += 1;
+        inner.line_end_len = (buf.len() - before) as u8;
+        inner.line_buf = Some(buf);
+        inner.line_pos = 0;
+        inner.line_no += 1;
         if !line.partial {
-            *state = 0;
+            inner.state = 0;
         }
-        *cat_regime = line.cattable;
+        inner.cat_regime = line.cattable;
         true
     }
 
@@ -501,17 +475,14 @@ impl Engine {
     /// `^^` codes inside the name are reduced in the buffer first.
     fn scan_control_sequence(&mut self, si: usize) -> Token {
         loop {
-            let Source::File {
-                line_buf: Some(buf),
-                line_pos,
-                cat_regime,
-                ..
-            } = &self.input.stack[si]
-            else {
+            let Source::File { inner, .. } = &self.input.stack[si] else {
                 unreachable!()
             };
-            let regime = *cat_regime;
-            let loc = *line_pos;
+            let Some(buf) = &inner.line_buf else {
+                unreachable!()
+            };
+            let regime = inner.cat_regime;
+            let loc = inner.line_pos;
             let Some((first, first_width)) = self.decode_scalar(buf, loc) else {
                 // The escape character ended the buffer: the null control
                 // sequence (the state is irrelevant; the line is finished).
@@ -545,20 +516,14 @@ impl Engine {
             } else {
                 1
             };
-            if let Source::File {
-                line_pos,
-                state: file_state,
-                ..
-            } = &mut self.input.stack[si]
-            {
-                *line_pos = end;
-                *file_state = state;
+            if let Source::File { inner, .. } = &mut self.input.stack[si] {
+                inner.line_pos = end;
+                inner.state = state;
             }
-            let Source::File {
-                line_buf: Some(buf),
-                ..
-            } = &self.input.stack[si]
-            else {
+            let Source::File { inner, .. } = &self.input.stack[si] else {
+                unreachable!()
+            };
+            let Some(buf) = &inner.line_buf else {
                 unreachable!()
             };
             let id = if self.engine_kind == EngineKind::PdfTeX {
@@ -591,11 +556,10 @@ impl Engine {
         if self.engine_kind != EngineKind::PdfTeX {
             return self.reduce_unicode_expanded_code(si, k, sup);
         }
-        let Some(Source::File {
-            line_buf: Some(buf),
-            ..
-        }) = self.input.stack.get_mut(si)
-        else {
+        let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) else {
+            return false;
+        };
+        let Some(buf) = &mut inner.line_buf else {
             return false;
         };
         let Some((value, width)) = sup_notation(buf, k, sup) else {
@@ -612,11 +576,10 @@ impl Engine {
     #[inline(never)]
     fn reduce_unicode_expanded_code(&mut self, si: usize, k: usize, sup: u32) -> bool {
         let kind = self.engine_kind;
-        let Some(Source::File {
-            line_buf: Some(buf),
-            ..
-        }) = self.input.stack.get_mut(si)
-        else {
+        let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) else {
+            return false;
+        };
+        let Some(buf) = &mut inner.line_buf else {
             return false;
         };
         let (notation, error) = unicode_sup_notation(buf, k, sup, kind);
@@ -639,38 +602,34 @@ impl Engine {
         if self.engine_kind != EngineKind::PdfTeX {
             return self.expand_unicode_sup(si, sup);
         }
-        let Some(Source::File {
-            line_buf: Some(buf),
-            line_pos,
-            ..
-        }) = self.input.stack.get_mut(si)
-        else {
+        let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) else {
             return None;
         };
-        let (value, width) = sup_notation(buf, *line_pos, sup)?;
-        *line_pos += width;
+        let Some(buf) = &inner.line_buf else {
+            return None;
+        };
+        let (value, width) = sup_notation(buf, inner.line_pos, sup)?;
+        inner.line_pos += width;
         Some(u32::from(value))
     }
 
     /// `expand_sup` of the Unicode engines (longer forms included).
     #[inline(never)]
     fn expand_unicode_sup(&mut self, si: usize, sup: u32) -> Option<u32> {
-        let Some(Source::File {
-            line_buf: Some(buf),
-            line_pos,
-            ..
-        }) = self.input.stack.get(si)
-        else {
+        let Some(Source::File { inner, .. }) = self.input.stack.get(si) else {
             return None;
         };
-        let (notation, error) = unicode_sup_notation(buf, *line_pos, sup, self.engine_kind);
+        let Some(buf) = &inner.line_buf else {
+            return None;
+        };
+        let (notation, error) = unicode_sup_notation(buf, inner.line_pos, sup, self.engine_kind);
         // luatex reports a malformed long form before reading the rest
         if let Some(message) = error {
             self.error(message);
         }
         let (value, width) = notation?;
-        if let Some(Source::File { line_pos, .. }) = self.input.stack.get_mut(si) {
-            *line_pos += width;
+        if let Some(Source::File { inner, .. }) = self.input.stack.get_mut(si) {
+            inner.line_pos += width;
         }
         Some(value)
     }

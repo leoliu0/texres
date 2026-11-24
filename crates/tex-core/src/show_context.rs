@@ -242,7 +242,9 @@ impl Engine {
     /// Whether `source` is a token list with nothing left to read.
     fn list_finished(&self, source: &Source) -> bool {
         match source {
-            Source::TokList { toks, pos, name, .. } => *pos >= toks.len() && *name != "<align-cell>",
+            Source::TokRc { pos, end, name, .. } | Source::TokVec { pos, end, name, .. } => {
+                *pos >= *end && *name != "<align-cell>"
+            }
             Source::MacroFrame(frame) => {
                 let (body, body_loc, arg) = frame.context_view();
                 body_loc >= body.len() && arg.is_none_or(|(toks, loc)| loc >= toks.len())
@@ -277,76 +279,90 @@ impl Engine {
                         end_template: false,
                     });
                 }
-                levels.push(Level::Macro { cs: frame.owner, body, loc: body_loc });
+                levels.push(Level::Macro { cs: frame.owner_opt(), body, loc: body_loc });
             }
-            Source::TokList { toks, pos, name, owner, .. } => {
+            Source::TokRc { toks, pos, name, owner, .. } => {
+                let pos = *pos as usize;
+                let cs = (*owner != crate::input::NO_OWNER).then_some(*owner);
                 if *name == "<macro>" {
-                    let cs = *owner;
-                    match toks {
-                        crate::input::TokTokens::Rc(body) => {
-                            levels.push(Level::Macro { cs, body, loc: *pos });
-                        }
-                        // a macro that only passes on one parameter: the
-                        // list holds that parameter, the body is `#n`
-                        crate::input::TokTokens::Vec(args) => {
-                            levels.push(Level::List {
-                                ty: ListType::Parameter,
-                                toks: Cow::Borrowed(args),
-                                loc: *pos,
-                                end_template: false,
-                            });
-                            if let Some(Equiv::Macro(m)) = cs.and_then(|id| self.eqtb.get(id)) {
-                                levels.push(Level::Macro { cs, body: &m.body, loc: m.body.len() });
-                            }
-                        }
-                    }
+                    levels.push(Level::Macro { cs, body: toks, loc: pos });
                     return;
                 }
-                if *name == "<write>" {
-                    // `{`, the text, `}` and the frozen `\endwrite` are one list here
-                    let text = toks.len().saturating_sub(3);
-                    let read = *pos;
-                    if read > text + 1 {
-                        levels.push(Level::List {
-                            ty: ListType::Inserted,
-                            toks: Cow::Borrowed(&toks[1 + text..]),
-                            loc: read - (1 + text),
-                            end_template: false,
-                        });
-                    } else {
-                        levels.push(Level::List {
-                            ty: ListType::Write,
-                            toks: Cow::Borrowed(&toks[1..1 + text]),
-                            loc: read.saturating_sub(1),
-                            end_template: false,
-                        });
-                        levels.push(Level::List {
-                            ty: ListType::Inserted,
-                            toks: Cow::Borrowed(&toks[1 + text..]),
-                            loc: 0,
-                            end_template: false,
-                        });
-                    }
-                    return;
-                }
-                if *name == "<output>" {
-                    // the output routine's text, braces included
-                    let mut braced = Vec::with_capacity(toks.len() + 2);
-                    braced.push(Token::char(1, u32::from(b'{')));
-                    braced.extend_from_slice(toks);
-                    braced.push(Token::char(2, u32::from(b'}')));
-                    levels.push(Level::List { ty: ListType::Output, toks: Cow::Owned(braced), loc: *pos + 1, end_template: false });
-                    return;
-                }
-                if let Some(ty) = ListType::of_name(name) {
-                    levels.push(Level::List {
-                        ty,
-                        toks: Cow::Borrowed(toks),
-                        loc: *pos,
-                        end_template: *name == "<align-cell>",
-                    });
-                }
+                self.push_tok_slice_levels(toks, pos, name, levels);
             }
+            Source::TokVec { toks, pos, name, owner, .. } => {
+                let pos = *pos as usize;
+                let toks = toks.as_slice();
+                let cs = (*owner != crate::input::NO_OWNER).then_some(*owner);
+                if *name == "<macro>" {
+                    // a macro that only passes on one parameter: the
+                    // list holds that parameter, the body is `#n`
+                    levels.push(Level::List {
+                        ty: ListType::Parameter,
+                        toks: Cow::Borrowed(toks),
+                        loc: pos,
+                        end_template: false,
+                    });
+                    if let Some(Equiv::Macro(m)) = cs.and_then(|id| self.eqtb.get(id)) {
+                        levels.push(Level::Macro { cs, body: &m.body, loc: m.body.len() });
+                    }
+                    return;
+                }
+                self.push_tok_slice_levels(toks, pos, name, levels);
+            }
+        }
+    }
+
+    fn push_tok_slice_levels<'a>(
+        &'a self,
+        toks: &'a [Token],
+        pos: usize,
+        name: &'static str,
+        levels: &mut Vec<Level<'a>>,
+    ) {
+        if name == "<write>" {
+            // `{`, the text, `}` and the frozen `\endwrite` are one list here
+            let text = toks.len().saturating_sub(3);
+            let read = pos;
+            if read > text + 1 {
+                levels.push(Level::List {
+                    ty: ListType::Inserted,
+                    toks: Cow::Borrowed(&toks[1 + text..]),
+                    loc: read - (1 + text),
+                    end_template: false,
+                });
+            } else {
+                levels.push(Level::List {
+                    ty: ListType::Write,
+                    toks: Cow::Borrowed(&toks[1..1 + text]),
+                    loc: read.saturating_sub(1),
+                    end_template: false,
+                });
+                levels.push(Level::List {
+                    ty: ListType::Inserted,
+                    toks: Cow::Borrowed(&toks[1 + text..]),
+                    loc: 0,
+                    end_template: false,
+                });
+            }
+            return;
+        }
+        if name == "<output>" {
+            // the output routine's text, braces included
+            let mut braced = Vec::with_capacity(toks.len() + 2);
+            braced.push(Token::char(1, u32::from(b'{')));
+            braced.extend_from_slice(toks);
+            braced.push(Token::char(2, u32::from(b'}')));
+            levels.push(Level::List { ty: ListType::Output, toks: Cow::Owned(braced), loc: pos + 1, end_template: false });
+            return;
+        }
+        if let Some(ty) = ListType::of_name(name) {
+            levels.push(Level::List {
+                ty,
+                toks: Cow::Borrowed(toks),
+                loc: pos,
+                end_template: name == "<align-cell>",
+            });
         }
     }
 
@@ -440,9 +456,18 @@ impl Engine {
     }
 
     fn render_file(&self, source: &Source) -> Rendered {
-        let Source::File { line_no, data, line_start, line_buf, line_pos, line_end_len, .. } = source else {
+        let Source::File { inner, .. } = source else {
             unreachable!("render_file takes a file level")
         };
+        let crate::input::FileBody {
+            line_no,
+            data,
+            line_start,
+            line_buf,
+            line_pos,
+            line_end_len,
+            ..
+        } = &**inner;
         let end_line_char = self.eqtb.int_params[IntParam::EndLineChar.idx() as usize];
         let (text, loc): (Vec<u8>, usize) = match line_buf {
             Some(buf) => {

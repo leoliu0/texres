@@ -467,7 +467,10 @@ impl Engine {
         self.pushed_read != tok
             && matches!(
                 self.input.stack.last(),
-                Some(crate::input::Source::TokList { toks, pos, name: BACKED_UP_CHAR, .. }) if *pos >= toks.len()
+                Some(
+                    crate::input::Source::TokVec { pos, end, name: BACKED_UP_CHAR, .. }
+                    | crate::input::Source::TokRc { pos, end, name: BACKED_UP_CHAR, .. }
+                ) if *pos >= *end
             )
     }
 

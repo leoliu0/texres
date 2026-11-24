@@ -904,10 +904,12 @@ impl Engine {
                 .stack
                 .iter()
                 .filter_map(|source| match source {
-                    Source::TokList {
-                        owner: Some(owner), ..
-                    } => Some(*owner),
-                    Source::MacroFrame(frame) => frame.owner,
+                    Source::TokRc { owner, .. } | Source::TokVec { owner, .. }
+                        if *owner != crate::input::NO_OWNER =>
+                    {
+                        Some(*owner)
+                    }
+                    Source::MacroFrame(frame) => frame.owner_opt(),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

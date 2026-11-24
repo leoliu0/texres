@@ -1380,7 +1380,7 @@ impl Engine {
                 self.pushed.clear();
                 while matches!(
                     self.input.stack.last(),
-                    Some(crate::input::Source::TokList { .. })
+                    Some(crate::input::Source::TokRc { .. } | crate::input::Source::TokVec { .. })
                 ) {
                     self.input.stack.pop();
                 }

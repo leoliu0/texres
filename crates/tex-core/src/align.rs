@@ -899,7 +899,7 @@ impl Engine {
     fn align_discard_u_part(&mut self) {
         let is_u = matches!(
             self.input.stack.last(),
-            Some(crate::input::Source::TokList { name, .. }) if *name == U_PART_SRC
+            Some(crate::input::Source::TokVec { name, .. } | crate::input::Source::TokRc { name, .. }) if *name == U_PART_SRC
         );
         if is_u {
             self.input.stack.pop();

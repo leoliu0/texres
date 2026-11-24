@@ -178,12 +178,20 @@ impl Engine {
         debug_assert_eq!(self.engine_kind, EngineKind::XeTeX);
         let normalization = self.eqtb.int_params[IntParam::XeTeXInputNormalization.idx() as usize];
         let default = self.xetex_default_encoding;
-        let Source::File { name, data, pos, line_no, line_start, state, xetex_enc, pseudo_breaks, .. } =
-            &mut self.input.stack[si]
-        else {
+        let Source::File { name, inner, .. } = &mut self.input.stack[si] else {
             self.spare_line_buf = buf;
             return false;
         };
+        let crate::input::FileBody {
+            data,
+            pos,
+            line_no,
+            line_start,
+            state,
+            xetex_enc,
+            pseudo_breaks,
+            ..
+        } = &mut **inner;
         if *xetex_enc == Enc::Default {
             let real = !name.starts_with('<') || name.starts_with("<embedded:");
             *xetex_enc = if !real {
@@ -251,12 +259,12 @@ impl Engine {
             let mut encoded = [0u8; 4];
             buf.extend_from_slice(char::from(character).encode_utf8(&mut encoded).as_bytes());
         }
-        let Source::File { line_buf, line_end_len, line_pos, .. } = &mut self.input.stack[si] else {
+        let Source::File { inner, .. } = &mut self.input.stack[si] else {
             return false;
         };
-        *line_end_len = (buf.len() - before) as u8;
-        *line_buf = Some(buf);
-        *line_pos = 0;
+        inner.line_end_len = (buf.len() - before) as u8;
+        inner.line_buf = Some(buf);
+        inner.line_pos = 0;
         if invalid {
             // xetex.web `bad_utf8_warning`
             let message = format!("Invalid UTF-8 byte or sequence at line {line} replaced by U+FFFD.");
@@ -288,14 +296,14 @@ impl Engine {
                 self.error("Encoding mode `auto' is not valid for \\XeTeXinputencoding");
             }
             EncSpec::Mode(mode) => {
-                if let Some(Source::File { xetex_enc, .. }) = self
+                if let Some(Source::File { inner, .. }) = self
                     .input
                     .stack
                     .iter_mut()
                     .rev()
                     .find(|source| matches!(source, Source::File { .. }))
                 {
-                    *xetex_enc = mode;
+                    inner.xetex_enc = mode;
                 }
             }
         }

@@ -840,8 +840,8 @@ impl Engine {
     pub fn do_endinput(&mut self) {
         // end the current file after the current line
         for s in self.input.stack.iter_mut().rev() {
-            if let crate::input::Source::File { ending, .. } = s {
-                *ending = true;
+            if let crate::input::Source::File { inner, .. } = s {
+                inner.ending = true;
                 return;
             }
         }
@@ -1890,8 +1890,8 @@ impl Engine {
             && token.chr() == u32::from(b' ')
             && matches!(
                 self.input.stack.last(),
-                Some(crate::input::Source::File { line_buf, line_pos, .. })
-                    if line_buf.as_ref().is_none_or(|line| *line_pos >= line.len())
+                Some(crate::input::Source::File { inner, .. })
+                    if inner.line_buf.as_ref().is_none_or(|line| inner.line_pos >= line.len())
             )
     }
 
