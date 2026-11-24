@@ -393,12 +393,19 @@ pub struct MacroArgs {
 }
 
 impl MacroArgs {
-    /// Start collecting into a (cleared) recycled buffer.
+    /// Start collecting into a (cleared) recycled buffer with at least
+    /// `min_capacity` slots (at least `ARG_HEADER_LEN`).
     #[inline(always)]
-    pub(crate) fn with_buffer(mut toks: Vec<Token>) -> Self {
+    pub(crate) fn with_buffer(toks: Vec<Token>) -> Self {
+        Self::with_buffer_cap(toks, ARG_HEADER_LEN)
+    }
+
+    #[inline(always)]
+    pub(crate) fn with_buffer_cap(mut toks: Vec<Token>, min_capacity: usize) -> Self {
         toks.clear();
-        if toks.capacity() < ARG_HEADER_LEN {
-            toks.reserve(ARG_HEADER_LEN);
+        let needed = min_capacity.max(ARG_HEADER_LEN);
+        if toks.capacity() < needed {
+            toks.reserve(needed);
         }
         // SAFETY: `toks.capacity() >= ARG_HEADER_LEN` and `Token` is a POD `u32`
         // wrapper, so zero-initializing the 9-slot header leaves all elements
@@ -408,6 +415,12 @@ impl MacroArgs {
             toks.set_len(ARG_HEADER_LEN);
         }
         MacroArgs { toks, count: 0 }
+    }
+
+    /// Total number of tokens stored across all collected arguments.
+    #[inline(always)]
+    pub(crate) fn total_arg_tokens(&self) -> usize {
+        self.toks.len() - ARG_HEADER_LEN
     }
 
     #[inline(always)]

@@ -88,20 +88,28 @@ fn balanced_prefix_scalar_impl<const LONG: bool>(
     partoken: Token,
     mut depth: i32,
 ) -> (usize, i32) {
-    for (index, &t) in tokens.iter().enumerate() {
+    let start = tokens.as_ptr();
+    let mut ptr = start;
+    // SAFETY: `end` is one-past-the-end of `tokens`.
+    let end = unsafe { start.add(tokens.len()) };
+    while ptr != end {
+        // SAFETY: `ptr < end`.
+        let t = unsafe { *ptr };
         if !LONG && t == partoken {
-            return (index, depth);
+            return (unsafe { ptr.offset_from(start) as usize }, depth);
         }
         let cls = BALANCED_TOP_CLASS[(t.0 >> 24) as usize];
+        // SAFETY: advancing within `start..=end`.
+        ptr = unsafe { ptr.add(1) };
         if cls == 0 {
             continue;
         }
         if cls < -1 {
-            return (index, depth);
+            return (unsafe { ptr.offset_from(start) as usize - 1 }, depth);
         }
         depth += i32::from(cls);
         if depth == 0 {
-            return (index + 1, 0);
+            return (unsafe { ptr.offset_from(start) as usize }, 0);
         }
     }
     (tokens.len(), depth)
@@ -414,18 +422,51 @@ impl Engine {
 
     /// fetch next raw token honoring pushback
     ///
-    /// Out of line so that its many callers share one copy. Both plain and
-    /// alignment token fetches take `raw_token_fast` directly without a second
-    /// stack frame; segment transitions, finished token lists, and slow-path
-    /// tokens tail-call `raw_token_slow`.
+    /// Out of line so that its many callers share one copy. The common idle
+    /// case (`!diagnostic_sources_live && align_state == PH_IDLE`) runs as a
+    /// leaf function with zero callee-saved spills and no `align_brace_depth`
+    /// bookkeeping (dead while `align_state == PH_IDLE`); segment transitions,
+    /// finished token lists, and alignment/diagnostic cases tail-call out.
     #[inline(never)]
     pub fn raw_token(&mut self) -> Token {
+        if !self.diagnostic_sources_live && self.align_state == crate::align::PH_IDLE {
+            if self.pushed.is_empty() {
+                if let Some(cursor) = self
+                    .input
+                    .stack
+                    .last_mut()
+                    .and_then(crate::input::Source::cursor_mut)
+                {
+                    if cursor.pos < cursor.end {
+                        // SAFETY: `pos < end <=` backing buffer length.
+                        let t = unsafe { *cursor.seg.add(cursor.pos as usize) };
+                        if RAW_TOP_DELTA[(t.0 >> 24) as usize] != i8::MIN {
+                            cursor.pos += 1;
+                            let depth = cursor.trace_depth;
+                            self.unwind_macro_trace(depth);
+                            return t;
+                        }
+                    }
+                }
+            } else if let Some(&t) = self.pushed.last() {
+                if RAW_TOP_DELTA[(t.0 >> 24) as usize] != i8::MIN
+                    && self.scanner_status != ScannerStatus::Aligning
+                    && self.lua_cb[crate::lua_callbacks::Cb::ShowErrorHook as usize] <= 0
+                {
+                    self.pushed.pop();
+                    self.pushed_read = t;
+                    return t;
+                }
+            }
+            return self.raw_token_slow();
+        }
+        self.raw_token_non_idle()
+    }
+
+    #[inline(never)]
+    fn raw_token_non_idle(&mut self) -> Token {
         if !self.diagnostic_sources_live {
-            let filter = if self.align_state == crate::align::PH_IDLE {
-                AlignFilter::None
-            } else {
-                self.align_raw_filter()
-            };
+            let filter = self.align_raw_filter();
             if let Some(t) = self.raw_token_fast(filter) {
                 return t;
             }
@@ -830,55 +871,59 @@ impl Engine {
 
     /// Expansion step for an already-fetched raw token (the alignment
     /// interrow peek pre-filters PAR_END/\\par before expansion).
-    pub fn get_x_raw_from(&mut self, first: Token) -> Token {
-        let mut first = first;
+    pub fn get_x_raw_from(&mut self, mut first: Token) -> Token {
         loop {
-            if first.0 >= UNEXPANDED_CS_FLAG && first.0 < 0xFFFF_0000 {
-                let tok = self.unfreeze_unexpanded_token(first);
-                if tok.is_cs() {
-                    self.set_cur_cs(tok);
-                } else {
-                    self.set_cur_char(tok);
-                }
-                return tok;
-            }
-            if first.0 >= UNEXPANDED_PARAMETER_FLAG && first.0 < 0x2000_0000 {
-                self.unexpanded_parameter = true;
-                return first.unfreeze();
-            }
-            if first.0 >= NOEXP_FLAG && first.0 < UNEXPANDED_CS_FLAG {
-                // tex.web §358: a \noexpand-marked token means \relax.
-                let tok = Token::from_cs(first.0 & 0x3FFF_FFFF);
-                self.no_expand_tok = Some(tok);
-                self.cur_tok = tok;
-                self.cur_cs = Some(tok.cs_id());
-                self.cur_prim = Some(Prim::Relax);
-                return tok;
-            }
-            if first.0 >= crate::page::WRITE_END_TOKEN.0 && first != PAR_END {
-                self.cur_prim = None;
+            // Fast paths for ordinary non-active characters and plain CS tokens.
+            let mut id = if first.0 < UNEXPANDED_PARAMETER_FLAG && first.cc() != 13 {
+                self.set_cur_char(first);
                 return first;
-            }
-            // The PAR_END sentinel (0xFFFF_FFFE) sits in the cs-token encoding
-            // space; without conversion get_x_raw treats it as an unnameable cs
-            // (blank-line \par between alignment rows -> garbage "cs" starts a
-            // phantom row). Convert exactly like get_token_inner does.
-            let t = if first == PAR_END {
-                Token::from_cs(self.partoken_id())
-            } else {
-                first
-            };
-            let mut id = if t.is_cs() {
-                self.diagnostic_source_cs = Some(t.cs_id());
-                t.cs_id()
-            } else if t.is_char() && t.cc() == 13 {
-                let id = self.active_cs_id(t.chr());
+            } else if first.0 >= 0x8000_0000 && first.0 < NOEXP_FLAG {
+                let id = first.cs_id();
                 self.diagnostic_source_cs = Some(id);
                 id
             } else {
-                self.diagnostic_source_cs = None;
-                self.set_cur_char(t);
-                return t;
+                if first.0 >= UNEXPANDED_CS_FLAG && first.0 < 0xFFFF_0000 {
+                    let tok = self.unfreeze_unexpanded_token(first);
+                    if tok.is_cs() {
+                        self.set_cur_cs(tok);
+                    } else {
+                        self.set_cur_char(tok);
+                    }
+                    return tok;
+                }
+                if first.0 >= UNEXPANDED_PARAMETER_FLAG && first.0 < 0x2000_0000 {
+                    self.unexpanded_parameter = true;
+                    return first.unfreeze();
+                }
+                if first.0 >= NOEXP_FLAG && first.0 < UNEXPANDED_CS_FLAG {
+                    // tex.web §358: a \noexpand-marked token means \relax.
+                    let tok = Token::from_cs(first.0 & 0x3FFF_FFFF);
+                    self.no_expand_tok = Some(tok);
+                    self.cur_tok = tok;
+                    self.cur_cs = Some(tok.cs_id());
+                    self.cur_prim = Some(Prim::Relax);
+                    return tok;
+                }
+                if first.0 >= crate::page::WRITE_END_TOKEN.0 && first != PAR_END {
+                    self.cur_prim = None;
+                    return first;
+                }
+                let t = if first == PAR_END {
+                    Token::from_cs(self.partoken_id())
+                } else {
+                    first
+                };
+                if t.is_cs() {
+                    self.diagnostic_source_cs = Some(t.cs_id());
+                    t.cs_id()
+                } else if t.is_char() && t.cc() == 13 {
+                    let id = self.active_cs_id(t.chr());
+                    self.diagnostic_source_cs = Some(id);
+                    id
+                } else {
+                    self.set_cur_char(t);
+                    return t;
+                }
             };
             let t = Token::from_cs(id);
 
@@ -890,127 +935,132 @@ impl Engine {
                 id = next;
                 equiv = self.eqtb.get(id);
             }
-            match equiv {
-                Some(Equiv::Macro(m)) => {
-                    let m = std::rc::Rc::clone(m);
-                    if m.outer
-                        && self.outer_scan.is_some()
-                        && self.eqtb.int_params
-                            [crate::prim::IntParam::SuppressOuterError.idx() as usize]
-                            == 0
-                    {
-                        return self.forbidden_outer(t);
-                    }
-                    // edef/write/expanded list. Nested \\romannumeral (f-expansion)
-                    // clears in_expanded_scan and must expand \\exp_end_continue_f:w.
-                    if m.protected && self.in_expanded_scan && self.csname_depth == 0 {
-                        self.set_cur_cs_known(Token::from_cs(id), None);
-                        return Token::from_cs(id);
-                    }
-                    if self.freeze_gts_in_edef(id) {
-                        self.set_cur_cs(Token::from_cs(id));
-                        return Token::from_cs(id);
-                    }
-                    if self.is_self_quark(id, &m) {
-                        self.set_cur_cs(Token::from_cs(id));
-                        return Token::from_cs(id);
-                    }
-                    self.expand_macro(id, &m, t.cs_id());
-                    first = self.raw_token();
-                    continue;
+            if let Some(Equiv::Macro(m)) = equiv {
+                let m = std::rc::Rc::clone(m);
+                if m.outer
+                    && self.outer_scan.is_some()
+                    && self.eqtb.int_params
+                        [crate::prim::IntParam::SuppressOuterError.idx() as usize]
+                        == 0
+                {
+                    return self.forbidden_outer(t);
                 }
-
-                Some(&Equiv::CharTok(v)) => {
-                    let tok = Token(v);
-                    if tok.is_space() {
-                        self.cur_tok = tok;
-                        self.cur_cs = None;
-                        self.cur_prim = None;
-                        return tok;
-                    } else {
-                        self.set_cur_cs_known(t, None);
-                        return t;
-                    }
+                // edef/write/expanded list. Nested \\romannumeral (f-expansion)
+                // clears in_expanded_scan and must expand \\exp_end_continue_f:w.
+                if m.protected && self.in_expanded_scan && self.csname_depth == 0 {
+                    self.set_cur_cs_known(Token::from_cs(id), None);
+                    return Token::from_cs(id);
                 }
-                Some(&Equiv::Prim(p)) => {
-                    if !self.is_expandable(p) && p != Prim::PdfPrimitiveExec {
-                        self.set_cur_cs_known(t, Some(p));
-                        return t;
-                    }
-                    // While scanning a conditional's numeric operand, expansion
-                    // may run nested conditionals. The delimiter belonging to
-                    // the pending outer test must terminate the number instead
-                    // of executing against its not-yet-initialized frame.
-                    if matches!(
-                        p,
-                        Prim::Else | Prim::Or | Prim::Fi | Prim::ElIf | Prim::ElIfX
-                    ) && self
-                        .pending_if_depth
-                        .is_some_and(|depth| self.if_stack.len() <= depth)
-                    {
-                        self.show_operand_ending_delimiter(p);
-                        self.set_cur_cs(t);
-                        return t;
-                    }
-                    if self.is_expandable(p) {
-                        match self.expand_prim(p, id) {
-                            Some(tok) => {
-                                if tok.0 >= UNEXPANDED_CS_FLAG && tok.0 < 0xFFFF_0000 {
-                                    let tok = self.unfreeze_unexpanded_token(tok);
-                                    if tok.is_cs() {
-                                        self.set_cur_cs(tok);
-                                    } else {
-                                        self.set_cur_char(tok);
-                                    }
-                                    return tok;
-                                }
-                                if tok.0 >= NOEXP_FLAG && tok.0 < UNEXPANDED_CS_FLAG {
-                                    // tex.web §358: the marked token means \relax.
-                                    let tok = Token::from_cs(tok.0 & 0x3FFF_FFFF);
+                if self.freeze_gts_in_edef(id) {
+                    self.set_cur_cs(Token::from_cs(id));
+                    return Token::from_cs(id);
+                }
+                if self.is_self_quark(id, &m) {
+                    self.set_cur_cs(Token::from_cs(id));
+                    return Token::from_cs(id);
+                }
+                self.expand_macro(id, &m, t.cs_id());
+                first = self.raw_token();
+                continue;
+            } else if let Some(&Equiv::Prim(p)) = equiv {
+                if !self.is_expandable(p) && p != Prim::PdfPrimitiveExec {
+                    self.set_cur_cs_known(t, Some(p));
+                    return t;
+                }
+                // While scanning a conditional's numeric operand, expansion
+                // may run nested conditionals. The delimiter belonging to
+                // the pending outer test must terminate the number instead
+                // of executing against its not-yet-initialized frame.
+                if matches!(
+                    p,
+                    Prim::Else | Prim::Or | Prim::Fi | Prim::ElIf | Prim::ElIfX
+                ) && self
+                    .pending_if_depth
+                    .is_some_and(|depth| self.if_stack.len() <= depth)
+                {
+                    self.show_operand_ending_delimiter(p);
+                    self.set_cur_cs(t);
+                    return t;
+                }
+                if self.is_expandable(p) {
+                    match self.expand_prim(p, id) {
+                        Some(tok) => {
+                            if tok.0 >= UNEXPANDED_CS_FLAG && tok.0 < 0xFFFF_0000 {
+                                let tok = self.unfreeze_unexpanded_token(tok);
+                                if tok.is_cs() {
                                     self.set_cur_cs(tok);
-                                    self.no_expand_tok = Some(tok);
-                                    self.cur_prim = Some(Prim::Relax);
-                                    return tok;
+                                } else {
+                                    self.set_cur_char(tok);
                                 }
-                                if !tok.is_cs() {
-                                    if tok.is_char() {
-                                        self.set_cur_char(tok);
-                                    }
-                                    return tok;
+                                return tok;
+                            }
+                            if tok.0 >= NOEXP_FLAG && tok.0 < UNEXPANDED_CS_FLAG {
+                                // tex.web §358: the marked token means \relax.
+                                let tok = Token::from_cs(tok.0 & 0x3FFF_FFFF);
+                                self.set_cur_cs(tok);
+                                self.no_expand_tok = Some(tok);
+                                self.cur_prim = Some(Prim::Relax);
+                                return tok;
+                            }
+                            if !tok.is_cs() {
+                                if tok.is_char() {
+                                    self.set_cur_char(tok);
                                 }
-                                self.push_token(tok);
-                                first = self.raw_token();
-                                continue;
+                                return tok;
                             }
-                            None => {
-                                first = self.raw_token();
-                                continue;
-                            }
+                            self.push_token(tok);
+                            first = self.raw_token();
+                            continue;
                         }
-                    } else if p == Prim::PdfPrimitiveExec && !self.in_expanded_scan {
-                        first = self.pdf_primitive_target();
-                        continue;
-                    } else {
-                        self.set_cur_cs_known(t, Some(p));
-                        return t;
+                        None => {
+                            first = self.raw_token();
+                            continue;
+                        }
                     }
-                }
-                Some(&Equiv::LuaCall {
-                    slot,
-                    protected: false,
-                }) => {
-                    self.call_lua_function(slot as i32);
-                    first = self.raw_token();
+                } else if p == Prim::PdfPrimitiveExec && !self.in_expanded_scan {
+                    first = self.pdf_primitive_target();
                     continue;
+                } else {
+                    self.set_cur_cs_known(t, Some(p));
+                    return t;
                 }
-                None => {
-                    self.undefined_cs_error(t);
-                    first = self.raw_token();
-                }
-                _ => {
+            } else if let Some(&Equiv::CharTok(v)) = equiv {
+                let tok = Token(v);
+                if tok.is_space() {
+                    self.cur_tok = tok;
+                    self.cur_cs = None;
+                    self.cur_prim = None;
+                    return tok;
+                } else {
                     self.set_cur_cs_known(t, None);
                     return t;
                 }
+            } else if let Some(tok) = self.get_x_raw_rare_equiv(t, id) {
+                return tok;
+            } else {
+                first = self.raw_token();
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_x_raw_rare_equiv(&mut self, t: Token, id: CsId) -> Option<Token> {
+        match self.eqtb.get(id) {
+            Some(&Equiv::LuaCall {
+                slot,
+                protected: false,
+            }) => {
+                self.call_lua_function(slot as i32);
+                None
+            }
+            None => {
+                self.undefined_cs_error(t);
+                None
+            }
+            _ => {
+                self.set_cur_cs_known(t, None);
+                Some(t)
             }
         }
     }
@@ -1092,31 +1142,33 @@ impl Engine {
     /// pushback is older than the new source, so it moves into its own list
     /// underneath (also used for Lua's pseudo-file output).
     pub(crate) fn prepare_token_list_push(&mut self, len: usize) -> bool {
-        if !self.ensure_token_list_room(len) {
+        if len > 0 && !self.ensure_token_list_room(len) {
             return false;
         }
         self.pop_exhausted_token_lists();
         // a skipped macro level is a finished list, popped with the others
         self.skipped_level = None;
+        if self.pushed.is_empty() {
+            return self.ensure_input_stack_room(1);
+        }
         let cut = if self.scanner_status == ScannerStatus::Aligning {
             self.align_pushed_base.min(self.pushed.len())
         } else {
             0
         };
         let pending = self.pushed.len() - cut;
-        if !self.ensure_token_list_room(pending)
-            || !self.ensure_input_stack_room(1 + usize::from(pending > 0))
-        {
+        if pending == 0 {
+            return self.ensure_input_stack_room(1);
+        }
+        if !self.ensure_token_list_room(pending) || !self.ensure_input_stack_room(2) {
             return false;
         }
-        if pending > 0 {
-            let mut rest = self.token_vec_pool.pop().unwrap_or_default();
-            rest.extend(self.pushed[cut..].iter().rev());
-            self.pushed.truncate(cut);
-            let maybe_active_cs = rest.iter().any(|t| t.is_cs() && self.cs.is_active(t.cs_id()));
-            self.input
-                .push_toks_vec(rest, "<pushback>", None, 0, maybe_active_cs);
-        }
+        let mut rest = self.token_vec_pool.pop().unwrap_or_default();
+        rest.extend(self.pushed[cut..].iter().rev());
+        self.pushed.truncate(cut);
+        let maybe_active_cs = rest.iter().any(|t| t.is_cs() && self.cs.is_active(t.cs_id()));
+        self.input
+            .push_toks_vec(rest, "<pushback>", None, 0, maybe_active_cs);
         true
     }
 
@@ -1302,14 +1354,16 @@ impl Engine {
     fn get_token_inner(&mut self, mut t: Token) -> Token {
         'resolve: loop {
             'expand: {
-                // The common tokens first: an ordinary character, and a
-                // plain control sequence, which none of the tests below
-                // concern.
-                if t.0 < UNEXPANDED_PARAMETER_FLAG && t.cc() != 13 {
+                // The two common cases first: an ordinary character, and a
+                // plain control sequence (skipping all sentinel/active checks).
+                let mut id = if t.0 < UNEXPANDED_PARAMETER_FLAG && t.cc() != 13 {
                     self.set_cur_char(t);
                     return t;
-                }
-                if !(0x8000_0000..NOEXP_FLAG).contains(&t.0) {
+                } else if t.0 >= 0x8000_0000 && t.0 < NOEXP_FLAG {
+                    let id = t.cs_id();
+                    self.diagnostic_source_cs = Some(id);
+                    id
+                } else {
                     if t.0 >= UNEXPANDED_CS_FLAG && t.0 < 0xFFFF_0000 {
                         t = self.unfreeze_unexpanded_token(t);
                         if t.is_cs() {
@@ -1345,242 +1399,245 @@ impl Engine {
                             self.end_occurred = true;
                             return EOF_MARKER;
                         }
-                        if t == crate::page::OUT_END_TOKEN {
-                            return t;
-                        }
-                        if t == crate::page::WRITE_END_TOKEN {
+                        if t == crate::page::OUT_END_TOKEN || t == crate::page::WRITE_END_TOKEN {
                             return t;
                         }
                         if t == PAR_END {
                             t = Token::from_cs(self.partoken_id());
                         }
                     }
-                }
-
-                t = if t.is_char() && t.cc() == 13 {
-                    let id = self.active_cs_id(t.chr());
-                    self.diagnostic_source_cs = Some(id);
-                    Token::from_cs(id)
-                } else {
-                    self.diagnostic_source_cs = t.is_cs().then(|| t.cs_id());
-                    t
+                    if t.is_char() && t.cc() == 13 {
+                        let id = self.active_cs_id(t.chr());
+                        self.diagnostic_source_cs = Some(id);
+                        t = Token::from_cs(id);
+                        id
+                    } else if t.is_cs() {
+                        let id = t.cs_id();
+                        self.diagnostic_source_cs = Some(id);
+                        id
+                    } else {
+                        self.set_cur_char(t);
+                        return t;
+                    }
                 };
 
-                if t.is_cs() {
-                    let mut id = t.cs_id();
-                    let mut equiv = self.eqtb.get(id);
-                    if let Some(Equiv::Alias(mut next)) = equiv {
-                        while let Some(Equiv::Alias(n)) = self.eqtb.get(next) {
-                            next = *n;
-                        }
-                        id = next;
-                        equiv = self.eqtb.get(id);
+                let mut equiv = self.eqtb.get(id);
+                if let Some(Equiv::Alias(mut next)) = equiv {
+                    while let Some(Equiv::Alias(n)) = self.eqtb.get(next) {
+                        next = *n;
                     }
-                    match equiv {
-                        Some(Equiv::Macro(m)) => {
-                            if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
-                                return self.expansion_limit_exceeded(t, id);
-                            }
-                            if m.outer
-                                && self.outer_scan.is_some()
-                                && self.eqtb.int_params
-                                    [crate::prim::IntParam::SuppressOuterError.idx() as usize]
-                                    == 0
+                    id = next;
+                    equiv = self.eqtb.get(id);
+                }
+                // Ordered checks avoid an unpredictable indirect jump table
+                // across all 16 `Equiv` variants; Macro and Prim cover >95%.
+                if let Some(Equiv::Macro(m)) = equiv {
+                    if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
+                        return self.expansion_limit_exceeded(t, id);
+                    }
+                    if m.outer
+                        && self.outer_scan.is_some()
+                        && self.eqtb.int_params
+                            [crate::prim::IntParam::SuppressOuterError.idx() as usize]
+                            == 0
+                    {
+                        return self.forbidden_outer(t);
+                    }
+                    if m.protected && self.in_expanded_scan && self.csname_depth == 0 {
+                        self.set_cur_cs_known(t, None);
+                        return t;
+                    }
+                    if self.freeze_gts_in_edef(id) {
+                        self.set_cur_cs(t);
+                        return t;
+                    }
+                    if m.num_params == 0 && m.prefix.is_empty() && !self.xetex_macro_trace() {
+                        // What the body amounts to, decided before the
+                        // diagnostic bookkeeping ends the borrow of
+                        // the meaning; only a body that is read as a
+                        // token list costs a reference count.
+                        enum Body {
+                            Empty,
+                            SelfReference,
+                            ControlSequence(Token),
+                            Character(Token),
+                            List(std::rc::Rc<[Token]>, bool),
+                        }
+                        let body = match *m.body {
+                            [] => Body::Empty,
+                            [only] if only == Token::from_cs(id) => Body::SelfReference,
+                            [only]
+                                if (0x8000_0000..NOEXP_FLAG).contains(&only.0)
+                                    && !self.align_macro_arg =>
                             {
-                                return self.forbidden_outer(t);
+                                Body::ControlSequence(only)
                             }
-                            if m.protected && self.in_expanded_scan && self.csname_depth == 0 {
-                                self.set_cur_cs_known(t, None);
-                                return t;
+                            [only]
+                                if only.0 < 0x8000_0000
+                                    && only.cc() != 13
+                                    && !matches!(only.cc(), 1 | 2 | 4) =>
+                            {
+                                Body::Character(only)
                             }
-                            if self.freeze_gts_in_edef(id) {
+                            _ => Body::List(
+                                std::rc::Rc::clone(&m.body),
+                                m.has_active_cs(&self.cs),
+                            ),
+                        };
+                        self.enter_macro_diagnostic(id, t.cs_id());
+                        if matches!(body, Body::ControlSequence(_) | Body::Character(_)) {
+                            // the macro's level, finished once its
+                            // token is read, stays for error context
+                            self.skipped_level = Some((
+                                crate::show_context::SkippedLevel::Body(id),
+                                self.input.signature(),
+                            ));
+                        }
+                        match body {
+                            Body::Empty => break 'expand,
+                            Body::SelfReference => {
                                 self.set_cur_cs(t);
                                 return t;
                             }
-                            if m.num_params == 0 && m.prefix.is_empty() && !self.xetex_macro_trace()
-                            {
-                                // What the body amounts to, decided before the
-                                // diagnostic bookkeeping ends the borrow of
-                                // the meaning; only a body that is read as a
-                                // token list costs a reference count.
-                                enum Body {
-                                    Empty,
-                                    SelfReference,
-                                    ControlSequence(Token),
-                                    Character(Token),
-                                    List(std::rc::Rc<[Token]>, bool),
-                                }
-                                let body = match *m.body {
-                                    [] => Body::Empty,
-                                    [only] if only == Token::from_cs(id) => Body::SelfReference,
-                                    [only]
-                                        if (0x8000_0000..NOEXP_FLAG).contains(&only.0)
-                                            && !self.align_macro_arg =>
-                                    {
-                                        Body::ControlSequence(only)
-                                    }
-                                    [only]
-                                        if only.0 < 0x8000_0000
-                                            && only.cc() != 13
-                                            && !matches!(only.cc(), 1 | 2 | 4) =>
-                                    {
-                                        Body::Character(only)
-                                    }
-                                    _ => Body::List(
-                                        std::rc::Rc::clone(&m.body),
-                                        m.has_active_cs(&self.cs),
-                                    ),
-                                };
-                                self.enter_macro_diagnostic(id, t.cs_id());
-                                if matches!(body, Body::ControlSequence(_) | Body::Character(_)) {
-                                    // the macro's level, finished once its
-                                    // token is read, stays for error context
-                                    self.skipped_level = Some((
-                                        crate::show_context::SkippedLevel::Body(id),
-                                        self.input.signature(),
-                                    ));
-                                }
-                                match body {
-                                    Body::Empty => break 'expand,
-                                    Body::SelfReference => {
-                                        self.set_cur_cs(t);
-                                        return t;
-                                    }
-                                    Body::ControlSequence(only) => {
-                                        t = only;
-                                        continue 'resolve;
-                                    }
-                                    Body::Character(only) => {
-                                        self.cur_tok = only;
-                                        self.cur_cs = None;
-                                        self.cur_prim = None;
-                                        return only;
-                                    }
-                                    Body::List(body, maybe_active_cs) => {
-                                        if !self.try_push_tokens_rc(body, id, maybe_active_cs) {
-                                            return EOF_MARKER;
-                                        }
-                                        break 'expand;
-                                    }
-                                }
-                            }
-                            let m = m.clone();
-                            self.expand_macro(id, &m, t.cs_id());
-                            break 'expand;
-                        }
-                        Some(Equiv::CharTok(v)) => {
-                            // tex.web scan_toks: a CS \let-equal to `}` is not
-                            // expandable and is stored as the CS. Substituting
-                            // the char would close \expanded/\edef early
-                            // (\c_group_end_token inside \cs_new_protected:Npe).
-                            if self.in_expanded_scan {
-                                self.set_cur_cs_known(t, None);
-                                return t;
-                            }
-                            let tok = Token(*v);
-                            if self.align_state != crate::align::PH_IDLE
-                                && tok.is_char()
-                                && tok.cc() == 4
-                                && self.align_intercept_raw_token(tok)
-                            {
-                                t = self.raw_token();
+                            Body::ControlSequence(only) => {
+                                t = only;
                                 continue 'resolve;
                             }
-                            self.cur_tok = tok;
-                            self.cur_cs = None;
-                            self.cur_prim = None;
-                            return tok;
-                        }
-                        Some(Equiv::Prim(p_ref)) => {
-                            let p = *p_ref;
-                            if !self.is_expandable(p) {
-                                if p == Prim::PdfPrimitiveExec && !self.in_expanded_scan {
-                                    t = self.pdf_primitive_target();
-                                    continue 'resolve;
+                            Body::Character(only) => {
+                                self.cur_tok = only;
+                                self.cur_cs = None;
+                                self.cur_prim = None;
+                                return only;
+                            }
+                            Body::List(body, maybe_active_cs) => {
+                                if !self.try_push_tokens_rc(body, id, maybe_active_cs) {
+                                    return EOF_MARKER;
                                 }
-                                self.set_cur_cs_known(t, Some(p));
-                                return t;
+                                break 'expand;
                             }
-                            if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
-                                return self.expansion_limit_exceeded(t, id);
-                            }
-                            // NOTE: no early-return for UnExpanded inside
-                            // e-scans. Returning the bare token leaked an
-                            // unexpanded-marker into \expanded results, which
-                            // then re-froze the NEXT token singly and broke the
-                            // \unexpanded\expanded{{...}} callback idiom
-                            // (keyval_parse / l3keys). The normal arm below
-                            // (scan group + push exp_not) is correct in every
-                            // context, csname included.
-                            if matches!(
-                                p,
-                                Prim::Else | Prim::Or | Prim::Fi | Prim::ElIf | Prim::ElIfX
-                            ) && self
-                                .pending_if_depth
-                                .is_some_and(|depth| self.if_stack.len() <= depth)
-                            {
-                                self.show_operand_ending_delimiter(p);
-                                let tok = Token::from_cs(id);
-                                self.set_cur_cs(tok);
-                                return tok;
-                            }
-                            match self.expand_prim(p, id) {
-                                Some(tok) => {
-                                    if tok.0 >= UNEXPANDED_CS_FLAG && tok.0 < 0xFFFF_0000 {
-                                        let tok = self.unfreeze_unexpanded_token(tok);
-                                        self.no_expand_tok = tok.is_cs().then_some(tok);
-                                        if tok.is_cs() {
-                                            self.set_cur_cs(tok);
-                                            self.cur_prim = Some(Prim::Relax);
-                                        } else {
-                                            self.set_cur_char(tok);
-                                        }
-                                        return tok;
-                                    }
-                                    if tok.0 >= NOEXP_FLAG && tok.0 < UNEXPANDED_CS_FLAG {
-                                        let cs = tok.0 & 0x3FFF_FFFF;
-                                        let tok = Token::from_cs(cs);
-                                        self.no_expand_tok = Some(tok);
-                                        self.cur_tok = tok;
-                                        self.cur_cs = Some(cs);
-                                        self.cur_prim = Some(Prim::Relax);
-                                        return tok;
-                                    }
-                                    if !tok.is_cs() {
-                                        self.set_cur_char(tok);
-                                        return tok;
-                                    }
-                                    self.push_token(tok);
-                                    break 'expand;
-                                }
-                                None => break 'expand,
-                            }
-                        }
-                        Some(&Equiv::LuaCall {
-                            slot,
-                            protected: false,
-                        }) => {
-                            if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
-                                return self.expansion_limit_exceeded(t, id);
-                            }
-                            self.call_lua_function(slot as i32);
-                            break 'expand;
-                        }
-                        None => {
-                            self.undefined_cs_error(t);
-                            break 'expand;
-                        }
-                        _ => {
-                            self.set_cur_cs_known(t, None);
-                            return t;
                         }
                     }
+                    let m = m.clone();
+                    self.expand_macro(id, &m, t.cs_id());
+                    break 'expand;
+                } else if let Some(Equiv::Prim(p_ref)) = equiv {
+                    let p = *p_ref;
+                    if !self.is_expandable(p) {
+                        if p == Prim::PdfPrimitiveExec && !self.in_expanded_scan {
+                            t = self.pdf_primitive_target();
+                            continue 'resolve;
+                        }
+                        self.set_cur_cs_known(t, Some(p));
+                        return t;
+                    }
+                    if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
+                        return self.expansion_limit_exceeded(t, id);
+                    }
+                    // NOTE: no early-return for UnExpanded inside
+                    // e-scans. Returning the bare token leaked an
+                    // unexpanded-marker into \expanded results, which
+                    // then re-froze the NEXT token singly and broke the
+                    // \unexpanded\expanded{{...}} callback idiom
+                    // (keyval_parse / l3keys). The normal arm below
+                    // (scan group + push exp_not) is correct in every
+                    // context, csname included.
+                    if matches!(
+                        p,
+                        Prim::Else | Prim::Or | Prim::Fi | Prim::ElIf | Prim::ElIfX
+                    ) && self
+                        .pending_if_depth
+                        .is_some_and(|depth| self.if_stack.len() <= depth)
+                    {
+                        self.show_operand_ending_delimiter(p);
+                        let tok = Token::from_cs(id);
+                        self.set_cur_cs(tok);
+                        return tok;
+                    }
+                    match self.expand_prim(p, id) {
+                        Some(tok) => {
+                            if tok.0 >= UNEXPANDED_CS_FLAG && tok.0 < 0xFFFF_0000 {
+                                let tok = self.unfreeze_unexpanded_token(tok);
+                                self.no_expand_tok = tok.is_cs().then_some(tok);
+                                if tok.is_cs() {
+                                    self.set_cur_cs(tok);
+                                    self.cur_prim = Some(Prim::Relax);
+                                } else {
+                                    self.set_cur_char(tok);
+                                }
+                                return tok;
+                            }
+                            if tok.0 >= NOEXP_FLAG && tok.0 < UNEXPANDED_CS_FLAG {
+                                let cs = tok.0 & 0x3FFF_FFFF;
+                                let tok = Token::from_cs(cs);
+                                self.no_expand_tok = Some(tok);
+                                self.cur_tok = tok;
+                                self.cur_cs = Some(cs);
+                                self.cur_prim = Some(Prim::Relax);
+                                return tok;
+                            }
+                            if !tok.is_cs() {
+                                self.set_cur_char(tok);
+                                return tok;
+                            }
+                            self.push_token(tok);
+                            break 'expand;
+                        }
+                        None => break 'expand,
+                    }
+                } else if let Some(Equiv::CharTok(v)) = equiv {
+                    // tex.web scan_toks: a CS \let-equal to `}` is not
+                    // expandable and is stored as the CS. Substituting
+                    // the char would close \expanded/\edef early
+                    // (\c_group_end_token inside \cs_new_protected:Npe).
+                    if self.in_expanded_scan {
+                        self.set_cur_cs_known(t, None);
+                        return t;
+                    }
+                    let tok = Token(*v);
+                    if self.align_state != crate::align::PH_IDLE
+                        && tok.is_char()
+                        && tok.cc() == 4
+                        && self.align_intercept_raw_token(tok)
+                    {
+                        t = self.raw_token();
+                        continue 'resolve;
+                    }
+                    self.cur_tok = tok;
+                    self.cur_cs = None;
+                    self.cur_prim = None;
+                    return tok;
+                } else if let Some(tok) = self.get_token_rare_equiv(t, id) {
+                    return tok;
                 } else {
-                    self.set_cur_char(t);
-                    return t;
+                    break 'expand;
                 }
             }
             t = self.raw_token();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_token_rare_equiv(&mut self, t: Token, id: CsId) -> Option<Token> {
+        match self.eqtb.get(id) {
+            Some(&Equiv::LuaCall {
+                slot,
+                protected: false,
+            }) => {
+                if expansion_step(&mut self.expansion_steps, self.expansion_limit) {
+                    return Some(self.expansion_limit_exceeded(t, id));
+                }
+                self.call_lua_function(slot as i32);
+                None
+            }
+            None => {
+                self.undefined_cs_error(t);
+                None
+            }
+            _ => {
+                self.set_cur_cs_known(t, None);
+                Some(t)
+            }
         }
     }
 
@@ -3508,60 +3565,99 @@ impl Engine {
         if !self.pushed.is_empty() || self.align_macro_arg {
             return None;
         }
+        // Bit 7 (0x80) is unused in `Eqtb::cs_flags` (bits 0..=6), so we use
+        // it to tag non-CS tokens that need special handling (active chars,
+        // sentinels, and braces when inside an alignment) without a 50/50
+        // char-vs-CS branch in the inner loop.
+        const NONCS_ACTION: u8 = 0x80;
         const FLAG_MASK: u8 = crate::eqtb::CS_FLAG_IF_TEST
             | crate::eqtb::CS_FLAG_IF_DELIM
             | crate::eqtb::CS_FLAG_OUTER
             | crate::eqtb::CS_FLAG_ALIAS;
+        const _: () = assert!(FLAG_MASK & NONCS_ACTION == 0);
+        static PASS_TEXT_NONCS_IDLE: [u8; 256] = {
+            let mut t = [0u8; 256];
+            t[CAT_ACTIVE as usize] = NONCS_ACTION;
+            t[0xFF] = NONCS_ACTION;
+            t
+        };
+        static PASS_TEXT_NONCS_ALIGN: [u8; 256] = {
+            let mut t = [0u8; 256];
+            t[1] = NONCS_ACTION;
+            t[2] = NONCS_ACTION;
+            t[CAT_ACTIVE as usize] = NONCS_ACTION;
+            t[0xFF] = NONCS_ACTION;
+            t
+        };
+        let noncs_ptr = if self.align_state == crate::align::PH_IDLE {
+            PASS_TEXT_NONCS_IDLE.as_ptr()
+        } else {
+            PASS_TEXT_NONCS_ALIGN.as_ptr()
+        };
         loop {
             self.ensure_nonempty_list_front(false);
             let Some((segment, trace_depth)) = self.token_list_front() else {
                 return None;
             };
             let cs_flags = self.eqtb.cs_flags_slice();
+            let flags_ptr = cs_flags.as_ptr();
+            let flags_len = cs_flags.len();
             let mut braces = 0i32;
             let mut found = None;
-            let mut length = 0;
-            for &t in segment {
-                let top = t.0 >> 24;
-                if top < 0x80 {
-                    if top.wrapping_sub(1) < 2 {
-                        braces += 3 - 2 * (top as i32);
-                    } else if top == u32::from(CAT_ACTIVE) {
-                        break;
-                    }
-                } else if t.0 < NOEXP_FLAG {
-                    let cs = t.cs_id();
-                    let flags = cs_flags.get(cs as usize).copied().unwrap_or(0);
-                    if flags & FLAG_MASK != 0 {
-                        if flags == crate::eqtb::CS_FLAG_IF_TEST {
-                            *level += 1;
-                        } else if flags == crate::eqtb::CS_FLAG_OUTER {
-                            break;
+            let start = segment.as_ptr();
+            let mut ptr = start;
+            // SAFETY: `end` is one-past-the-end of `segment`.
+            let end = unsafe { start.add(segment.len()) };
+            while ptr != end {
+                // SAFETY: `ptr < end`.
+                let t = unsafe { *ptr };
+                let top = (t.0 >> 24) as usize;
+                let cs = (t.0 & 0x3FFF_FFFF) as usize;
+                // Select between `&cs_flags[cs]` and `&noncs[top]` via cmov.
+                // `wrapping_add` avoids out-of-bounds GEP when `!is_plain_cs`.
+                let is_plain_cs =
+                    t.0.wrapping_sub(0x8000_0000) < (NOEXP_FLAG - 0x8000_0000) && cs < flags_len;
+                let flag_ptr = if is_plain_cs {
+                    flags_ptr.wrapping_add(cs)
+                } else {
+                    // SAFETY: `top < 256`.
+                    unsafe { noncs_ptr.add(top) }
+                };
+                // SAFETY: `flag_ptr` points into either `cs_flags[..flags_len]` or `noncs[..256]`.
+                let byte = unsafe { *flag_ptr };
+                if byte & (FLAG_MASK | NONCS_ACTION) != 0 {
+                    if byte & NONCS_ACTION != 0 {
+                        if top.wrapping_sub(1) < 2 {
+                            braces += 3 - 2 * (top as i32);
                         } else {
-                            match self.eqtb.resolve(cs) {
-                                Some(Equiv::Prim(p)) if Self::is_if_test(*p) => *level += 1,
-                                Some(Equiv::Prim(p)) if IF_DELIMITERS.contains(*p) => {
-                                    if *level == 0 {
-                                        found = Some(*p);
-                                        length += 1;
-                                        break;
-                                    }
-                                    if *p == Prim::Fi {
-                                        *level -= 1;
-                                    }
+                            break;
+                        }
+                    } else if byte == crate::eqtb::CS_FLAG_IF_TEST {
+                        *level += 1;
+                    } else if byte == crate::eqtb::CS_FLAG_OUTER {
+                        break;
+                    } else {
+                        match self.eqtb.resolve(cs as CsId) {
+                            Some(Equiv::Prim(p)) if Self::is_if_test(*p) => *level += 1,
+                            Some(Equiv::Prim(p)) if IF_DELIMITERS.contains(*p) => {
+                                if *level == 0 {
+                                    found = Some(*p);
+                                    ptr = unsafe { ptr.add(1) };
+                                    break;
                                 }
-                                Some(Equiv::Macro(m)) if m.outer => break,
-                                _ => {}
+                                if *p == Prim::Fi {
+                                    *level -= 1;
+                                }
                             }
+                            Some(Equiv::Macro(m)) if m.outer => break,
+                            _ => {}
                         }
                     }
-                } else if t.0 >= 0xFFFF_0000 {
-                    // \par and end-of-input markers.
-                    break;
                 }
-                // A \noexpand-guarded token means \relax here (tex.web §358).
-                length += 1;
+                // SAFETY: advancing within `start..=end`.
+                ptr = unsafe { ptr.add(1) };
             }
+            let length = unsafe { ptr.offset_from(start) as usize };
             if length == 0 {
                 return None;
             }
@@ -3942,9 +4038,8 @@ impl Engine {
 
         let plan = m.has_param_refs.then(|| m.cached_plan());
         let used_mask = plan.as_ref().map_or(0, |p| p.used_mask);
-        let mut buffer = self.token_vec_pool.pop().unwrap_or_default();
-        buffer.reserve(MIN_ARG_BUFFER);
-        let mut args = crate::input::MacroArgs::with_buffer(buffer);
+        let buffer = self.token_vec_pool.pop().unwrap_or_default();
+        let mut args = crate::input::MacroArgs::with_buffer_cap(buffer, MIN_ARG_BUFFER);
         for (i, delim) in m.params.iter().enumerate().take(num_params) {
             let keep = trace.is_some() || (used_mask & (1u16 << i)) != 0;
             let start = args.open_start();
@@ -3983,14 +4078,14 @@ impl Engine {
             );
             return;
         };
-        let Some(length) =
-            m.replacement_length_for(&plan, &args, crate::input::MAX_TOKEN_LIST_TOKENS)
+        let Some(nonempty) =
+            m.replacement_fits_nonempty(&plan, &args, crate::input::MAX_TOKEN_LIST_TOKENS)
         else {
             self.recycle_token_vec(args.into_buffer());
             self.macro_arg_overflow("macro expansion size");
             return;
         };
-        if length == 0 {
+        if !nonempty {
             self.recycle_token_vec(args.into_buffer());
             return;
         }
@@ -4674,61 +4769,240 @@ impl Engine {
         depth: &mut i32,
         expanded: bool,
     ) -> Option<bool> {
-        if !self.pushed.is_empty() || (expanded && self.unexp_protect > 0) {
+        if !self.pushed.is_empty() {
             return None;
         }
-        self.ensure_nonempty_list_front(false);
-        if !(self.align_state == crate::align::PH_IDLE
-            || (!self.align_macro_arg && self.align_brace_depth >= *depth))
-        {
-            return None;
+        if expanded {
+            if self.unexp_protect > 0 {
+                return None;
+            }
+            self.take_edef_body_run(out, depth)
+        } else {
+            self.take_unexpanded_def_body_run(out, depth)
         }
-        let (segment, trace_depth) = self.token_list_front()?;
-        let outer = self.eqtb.has_outer_macros();
-        // The token loop reports an overlong body before its first excess token.
-        let room = crate::input::MAX_TOKEN_LIST_TOKENS.saturating_sub(out.len());
-        let mut after = *depth;
-        let mut length = 0;
-        for &t in segment {
-            if !plain_balanced_token(t, true, t)
-                || t.0 >> 24 == 6
-                || (expanded && (t.is_cs() || t.0 >> 24 == 13))
-                || (t.is_cs() && (self.cs.is_active(t.cs_id()) || self.is_macro_param(t)))
-                || (outer && self.is_outer_macro_token(t))
+    }
+
+    fn take_edef_body_run(&mut self, out: &mut Vec<Token>, depth: &mut i32) -> Option<bool> {
+        /// Plain non-expandable characters allowed verbatim in `\edef`/`\xdef`:
+        /// `{0, 3..=5, 7..=8, 10..=12}` -> `0`, `{` -> `1`, `}` -> `-1`, all others -> `i8::MIN`.
+        static EDEF_BODY_TOP: [i8; 256] = {
+            let mut t = [i8::MIN; 256];
+            t[0] = 0;
+            t[1] = 1;
+            t[2] = -1;
+            t[3] = 0;
+            t[4] = 0;
+            t[5] = 0;
+            t[7] = 0;
+            t[8] = 0;
+            t[10] = 0;
+            t[11] = 0;
+            t[12] = 0;
+            t
+        };
+        let mut last = None;
+        let mut closed = false;
+        loop {
+            self.ensure_nonempty_list_front(false);
+            if !(self.align_state == crate::align::PH_IDLE
+                || (!self.align_macro_arg && self.align_brace_depth >= *depth))
             {
                 break;
             }
-            let top = t.0 >> 24;
-            if top == 2 && after == 1 {
-                after = 0;
+            let Some((segment, trace_depth)) = self.token_list_front() else {
+                break;
+            };
+            let room = crate::input::MAX_TOKEN_LIST_TOKENS.saturating_sub(out.len());
+            let mut after = *depth;
+            let mut length = 0;
+            let seg_len = segment.len();
+            let seg_ptr = segment.as_ptr();
+            while length < seg_len {
+                // SAFETY: `length < seg_len`.
+                let t = unsafe { *seg_ptr.add(length) };
+                let cls = EDEF_BODY_TOP[(t.0 >> 24) as usize];
+                if cls == 0 {
+                    if length == room {
+                        break;
+                    }
+                    length += 1;
+                } else if cls < -1 {
+                    break;
+                } else if cls < 0 && after == 1 {
+                    after = 0;
+                    length += 1;
+                    break;
+                } else {
+                    if length == room {
+                        break;
+                    }
+                    after += i32::from(cls);
+                    length += 1;
+                }
+            }
+            if length == 0 {
+                break;
+            }
+            let exhausted = length == seg_len;
+            out.extend_from_slice(&segment[..length - usize::from(after == 0)]);
+            last = Some(segment[length - 1]);
+            self.consume_token_list_front(length, trace_depth);
+            if self.align_state != crate::align::PH_IDLE {
+                self.align_brace_depth = self.align_brace_depth.saturating_add(after - *depth);
+            }
+            *depth = after;
+            if after == 0 {
+                closed = true;
+                break;
+            }
+            if !exhausted {
+                break;
+            }
+        }
+        let last = last?;
+        // get_token_from() leaves the last character current.
+        self.no_expand_tok = None;
+        self.unexpanded_parameter = false;
+        self.set_cur_char(last);
+        Some(closed)
+    }
+
+    fn take_unexpanded_def_body_run(
+        &mut self,
+        out: &mut Vec<Token>,
+        depth: &mut i32,
+    ) -> Option<bool> {
+        const NONCS_ACTION: u8 = 0x80;
+        /// Non-CS action table for `\def`/`\gdef` bodies: `0` for plain
+        /// non-brace, non-param, non-active chars (`{0, 3..=5, 7..=8, 10..=12}`)
+        /// and plain CS range `0x80..0xC0` (fallback when `cs >= cs_flags.len()`);
+        /// `NONCS_ACTION` (`0x80`) for everything else (`{`, `}`, `#`, active,
+        /// ignored, guards, sentinels).
+        static DEF_BODY_NONCS: [u8; 256] = {
+            let mut t = [NONCS_ACTION; 256];
+            t[0] = 0;
+            t[3] = 0;
+            t[4] = 0;
+            t[5] = 0;
+            t[7] = 0;
+            t[8] = 0;
+            t[10] = 0;
+            t[11] = 0;
+            t[12] = 0;
+            let mut i = 0x80;
+            while i < 0xC0 {
+                t[i] = 0;
+                i += 1;
+            }
+            t
+        };
+        let outer = self.eqtb.has_outer_macros();
+        let flag_mask = crate::eqtb::CS_FLAG_MAC_PARAM
+            | crate::eqtb::CS_FLAG_ALIAS
+            | if outer { crate::eqtb::CS_FLAG_OUTER } else { 0 };
+        const _: () = assert!(
+            (crate::eqtb::CS_FLAG_MAC_PARAM
+                | crate::eqtb::CS_FLAG_ALIAS
+                | crate::eqtb::CS_FLAG_OUTER)
+                & NONCS_ACTION
+                == 0
+        );
+        let noncs_ptr = DEF_BODY_NONCS.as_ptr();
+        let mut took_any = false;
+        loop {
+            self.ensure_nonempty_list_front(false);
+            if !(self.align_state == crate::align::PH_IDLE
+                || (!self.align_macro_arg && self.align_brace_depth >= *depth))
+            {
+                return took_any.then_some(false);
+            }
+            let Some((segment, trace_depth, maybe_active_cs)) = self.token_list_front_with_active()
+            else {
+                return took_any.then_some(false);
+            };
+            let cs_flags = self.eqtb.cs_flags_slice();
+            let flags_ptr = cs_flags.as_ptr();
+            let flags_len = cs_flags.len();
+            let room = crate::input::MAX_TOKEN_LIST_TOKENS.saturating_sub(out.len());
+            let mut after = *depth;
+            let mut length = 0;
+            let seg_len = segment.len();
+            let seg_ptr = segment.as_ptr();
+            while length < seg_len {
+                // SAFETY: `length < seg_len`.
+                let t = unsafe { *seg_ptr.add(length) };
+                let top = (t.0 >> 24) as usize;
+                let cs = (t.0 & 0x3FFF_FFFF) as usize;
+                let is_plain_cs =
+                    t.0.wrapping_sub(0x8000_0000) < (NOEXP_FLAG - 0x8000_0000) && cs < flags_len;
+                if maybe_active_cs && t.is_cs() && self.cs.is_active(t.cs_id()) {
+                    break;
+                }
+                let flag_ptr = if is_plain_cs {
+                    flags_ptr.wrapping_add(cs)
+                } else {
+                    // SAFETY: `top < 256`.
+                    unsafe { noncs_ptr.add(top) }
+                };
+                // SAFETY: `flag_ptr` points into `cs_flags[..flags_len]` or `DEF_BODY_NONCS`.
+                let byte = unsafe { *flag_ptr };
+                if byte & (flag_mask | NONCS_ACTION) != 0 {
+                    if byte & NONCS_ACTION != 0 {
+                        if top == 2 {
+                            if after == 1 {
+                                after = 0;
+                                length += 1;
+                                break;
+                            }
+                            if length == room {
+                                break;
+                            }
+                            after -= 1;
+                            length += 1;
+                            continue;
+                        } else if top == 1 {
+                            if length == room {
+                                break;
+                            }
+                            after += 1;
+                            length += 1;
+                            continue;
+                        } else if top == u32::from(CAT_ACTIVE) as usize {
+                            if outer && self.is_outer_macro_token(t) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else if self.is_macro_param(t)
+                        || (outer && self.is_outer_macro_token(t))
+                    {
+                        break;
+                    }
+                }
+                if length == room {
+                    break;
+                }
                 length += 1;
-                break;
             }
-            if length == room {
-                break;
+            if length == 0 {
+                return took_any.then_some(false);
             }
-            match top {
-                1 => after += 1,
-                2 => after -= 1,
-                _ => {}
+            let exhausted = length == seg_len;
+            out.extend_from_slice(&segment[..length - usize::from(after == 0)]);
+            self.consume_token_list_front(length, trace_depth);
+            if self.align_state != crate::align::PH_IDLE {
+                self.align_brace_depth = self.align_brace_depth.saturating_add(after - *depth);
             }
-            length += 1;
+            *depth = after;
+            if after == 0 {
+                return Some(true);
+            }
+            took_any = true;
+            if !exhausted {
+                return Some(false);
+            }
         }
-        if length == 0 {
-            return None;
-        }
-        out.extend_from_slice(&segment[..length - usize::from(after == 0)]);
-        let last = segment[length - 1];
-        self.consume_token_list_front(length, trace_depth);
-        if expanded {
-            // get_token_from() leaves the last character current.
-            self.no_expand_tok = None;
-            self.unexpanded_parameter = false;
-            self.set_cur_char(last);
-        }
-        self.align_brace_depth = self.align_brace_depth.saturating_add(after - *depth);
-        *depth = after;
-        Some(after == 0)
     }
 
     /// Append the run of character tokens at the front of the current token

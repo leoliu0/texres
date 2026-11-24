@@ -204,22 +204,41 @@ pub struct Macro {
     pub replacement: CachedReplacement,
 }
 
-/// Single-threaded cached [`MacroReplacement`] without `RefCell` borrow
-/// bookkeeping: callers only ever clone out or replace the `Rc`.
+/// Single-threaded cached [`MacroReplacement`] and active-CS flag packed into
+/// a single pointer-sized word:
+/// - low 2 bits: cached active-CS scan (`0` = unchecked, `1` = none, `2` = has active CS)
+/// - upper bits (`raw & !3`): `0` or an owned `Rc::into_raw(Rc<MacroReplacement>)`
+///   pointer (guaranteed >= 8-byte aligned).
+/// Packing both into one word keeps `Macro` at 80 bytes (`RcBox<Macro>` = 96B).
 #[derive(Default)]
-pub struct CachedReplacement {
-    plan: std::cell::UnsafeCell<Option<Rc<MacroReplacement>>>,
-    /// Cached scan of `Macro::body` for active-character CS tokens
-    /// (`0` = unchecked, `1` = none, `2` = contains at least one).
-    active_cs: std::cell::Cell<u8>,
-}
+pub struct CachedReplacement(std::cell::Cell<usize>);
+
+const ACTIVE_CS_TAG_MASK: usize = 3;
+const _: () = assert!(std::mem::align_of::<MacroReplacement>() >= 8);
+const _: () = assert!(std::mem::size_of::<CachedReplacement>() == 8);
+const _: () = assert!(std::mem::size_of::<Macro>() == 80);
 
 impl CachedReplacement {
     #[inline(always)]
     pub(crate) fn with_active_cs(has_active: bool) -> Self {
-        CachedReplacement {
-            plan: std::cell::UnsafeCell::new(None),
-            active_cs: std::cell::Cell::new(if has_active { 2 } else { 1 }),
+        CachedReplacement(std::cell::Cell::new(if has_active { 2 } else { 1 }))
+    }
+
+    #[inline(always)]
+    fn plan_ptr(&self) -> *const MacroReplacement {
+        (self.0.get() & !ACTIVE_CS_TAG_MASK) as *const MacroReplacement
+    }
+}
+
+impl Drop for CachedReplacement {
+    #[inline]
+    fn drop(&mut self) {
+        let ptr = self.plan_ptr();
+        if !ptr.is_null() {
+            // SAFETY: non-null upper bits hold a valid `Rc::into_raw` count.
+            unsafe {
+                drop(Rc::from_raw(ptr));
+            }
         }
     }
 }
@@ -227,21 +246,31 @@ impl CachedReplacement {
 impl Clone for CachedReplacement {
     #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: `Macro` lives on one single-threaded `Engine`; no reference
-        // into `self.plan` ever escapes `CachedReplacement`'s methods.
-        let inner = unsafe { (*self.plan.get()).clone() };
-        CachedReplacement {
-            plan: std::cell::UnsafeCell::new(inner),
-            active_cs: std::cell::Cell::new(self.active_cs.get()),
+        let raw = self.0.get();
+        let ptr = (raw & !ACTIVE_CS_TAG_MASK) as *const MacroReplacement;
+        if !ptr.is_null() {
+            // SAFETY: single-threaded `Engine`; `ptr` stays valid for `&self`
+            // and incrementing the strong count transfers one count to the clone.
+            unsafe {
+                Rc::increment_strong_count(ptr);
+            }
         }
+        CachedReplacement(std::cell::Cell::new(raw))
     }
 }
 
 impl std::fmt::Debug for CachedReplacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: single-threaded; clone out before calling into `Formatter`
-        // so no shared reference into the `UnsafeCell` crosses user `fmt::Write`.
-        let inner = unsafe { (*self.plan.get()).clone() };
+        let ptr = self.plan_ptr();
+        let inner = if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: clone out an owned `Rc` before calling into `Formatter`.
+            unsafe {
+                Rc::increment_strong_count(ptr);
+                Some(Rc::from_raw(ptr))
+            }
+        };
         f.debug_tuple("CachedReplacement").field(&inner).finish()
     }
 }
@@ -255,18 +284,20 @@ pub struct MacroReplacement {
     pub(crate) references: Box<[(u32, u8)]>,
     /// Number of references to each of the parameters #1 to #9.
     uses: [u32; 9],
+    /// Maximum entry in `uses` (for O(1) overflow bound checks).
+    max_use: u32,
     /// Bit `i` is set iff parameter `#(i + 1)` appears in `body`.
     pub(crate) used_mask: u16,
 }
 impl Macro {
     /// True when `self.body` contains a control-sequence token naming an active
     /// character (which balanced-group fast paths must unfreeze). Cached on
-    /// first check so repeat expansions pay one byte load.
+    /// first check so repeat expansions pay one load.
     #[inline(always)]
     pub(crate) fn has_active_cs(&self, cs: &crate::token::CsTable) -> bool {
-        let cached = self.replacement.active_cs.get();
-        if cached != 0 {
-            return cached == 2;
+        let tag = self.replacement.0.get() & ACTIVE_CS_TAG_MASK;
+        if tag != 0 {
+            return tag == 2;
         }
         self.compute_has_active_cs(cs)
     }
@@ -278,7 +309,10 @@ impl Macro {
             .body
             .iter()
             .any(|t| t.is_cs() && cs.is_active(t.cs_id()));
-        self.replacement.active_cs.set(if found { 2 } else { 1 });
+        let raw = self.replacement.0.get();
+        self.replacement
+            .0
+            .set((raw & !ACTIVE_CS_TAG_MASK) | if found { 2 } else { 1 });
         found
     }
 
@@ -286,20 +320,59 @@ impl Macro {
     /// first use or after an in-place `body` replacement.
     #[inline]
     pub(crate) fn cached_plan(&self) -> Rc<MacroReplacement> {
-        // SAFETY: single-threaded `Engine`; the slot reference does not live
-        // across `build_replacement_plan`.
-        unsafe {
-            if let Some(plan) = (*self.replacement.plan.get()).as_ref() {
-                if Rc::ptr_eq(&plan.body, &self.body) {
-                    return Rc::clone(plan);
+        let ptr = self.replacement.plan_ptr();
+        if !ptr.is_null() {
+            // SAFETY: single-threaded `Engine`; `ptr` is valid while stored in `self.replacement`.
+            let plan = unsafe { &*ptr };
+            if Rc::ptr_eq(&plan.body, &self.body) {
+                unsafe {
+                    Rc::increment_strong_count(ptr);
+                    return Rc::from_raw(ptr);
                 }
             }
         }
         let built = Rc::new(self.build_replacement_plan());
-        unsafe {
-            *self.replacement.plan.get() = Some(Rc::clone(&built));
+        let new_ptr = Rc::into_raw(Rc::clone(&built)) as usize;
+        debug_assert_eq!(new_ptr & ACTIVE_CS_TAG_MASK, 0);
+        let old = self.replacement.0.get();
+        self.replacement
+            .0
+            .set(new_ptr | (old & ACTIVE_CS_TAG_MASK));
+        let old_ptr = (old & !ACTIVE_CS_TAG_MASK) as *const MacroReplacement;
+        if !old_ptr.is_null() {
+            // SAFETY: old pointer is no longer stored in `self.replacement`.
+            unsafe {
+                drop(Rc::from_raw(old_ptr));
+            }
         }
         built
+    }
+
+    /// Fast O(1) check used by `expand_macro_with_args`: returns `None` if the
+    /// replacement exceeds `limit`, `Some(false)` if it is empty, and
+    /// `Some(true)` if it is non-empty and within `limit`.
+    #[inline(always)]
+    pub(crate) fn replacement_fits_nonempty(
+        &self,
+        plan: &MacroReplacement,
+        args: &crate::input::MacroArgs,
+        limit: usize,
+    ) -> Option<bool> {
+        let total_args = args.total_arg_tokens();
+        let upper = self
+            .body
+            .len()
+            .saturating_add((plan.max_use as usize).saturating_mul(total_args));
+        if upper <= limit {
+            if self.body.len() > plan.references.len() {
+                return Some(true);
+            }
+            if total_args == 0 {
+                return Some(false);
+            }
+        }
+        self.replacement_length_for(plan, args, limit)
+            .map(|len| len > 0)
     }
 
     /// Length of the replacement for `args` under `plan`, or `None` beyond `limit`.
@@ -362,10 +435,14 @@ impl Macro {
             .collect();
         let mut uses = [0u32; 9];
         let mut used_mask = 0u16;
+        let mut max_use = 0u32;
         for &(_, parameter) in references.iter() {
             // A reference beyond the nine parameters never has an argument.
             if let Some(n) = uses.get_mut(parameter as usize) {
                 *n += 1;
+                if *n > max_use {
+                    max_use = *n;
+                }
                 used_mask |= 1u16 << parameter;
             }
         }
@@ -373,6 +450,7 @@ impl Macro {
             body: self.body.clone(),
             references,
             uses,
+            max_use,
             used_mask,
         }
     }
@@ -3231,6 +3309,45 @@ mod tests {
         m.body = vec![Token(0x4000_0002), Token(0x4000_0002)].into();
         assert_eq!(m.replacement_plan(&args, 3).1, None);
         assert_eq!(m.replacement_plan(&args, 4).1, Some(4));
+
+        // Verify pointer-tagged `CachedReplacement` preserves both the plan Rc
+        // and the active-CS flag across clones, debug formatting, and rebuilds.
+        let mut cs = crate::token::CsTable::new();
+        let active_id = cs.intern(&[0xFF, 0x00, b'A', b'C', b'T', 0x00, b'~']);
+        let plain_id = cs.intern(b"foo");
+        let plain_macro = Macro {
+            num_params: 1,
+            has_param_refs: true,
+            params: vec![vec![]],
+            prefix: vec![],
+            body: vec![Token::from_cs(plain_id), Token(0x4000_0001)].into(),
+            long: true,
+            outer: false,
+            protected: false,
+            replacement: Default::default(),
+        };
+        assert!(!plain_macro.has_active_cs(&cs));
+        let p1 = plain_macro.cached_plan();
+        assert!(!plain_macro.has_active_cs(&cs));
+        let cloned = plain_macro.clone();
+        assert!(Rc::ptr_eq(&p1, &cloned.cached_plan()));
+        assert!(!cloned.has_active_cs(&cs));
+        assert!(!format!("{:?}", cloned.replacement).is_empty());
+        assert_eq!(
+            plain_macro.replacement_fits_nonempty(&p1, &args, 10),
+            Some(true)
+        );
+        drop(cloned);
+        assert_eq!(Rc::strong_count(&p1), 2);
+
+        let active_macro = Macro {
+            body: vec![Token::from_cs(active_id)].into(),
+            replacement: Default::default(),
+            ..plain_macro
+        };
+        assert!(active_macro.has_active_cs(&cs));
+        let _ = active_macro.cached_plan();
+        assert!(active_macro.has_active_cs(&cs));
     }
 
     fn prim_of(eq: &Eqtb, id: CsId) -> Option<Prim> {

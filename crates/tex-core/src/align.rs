@@ -862,6 +862,9 @@ impl Engine {
             self.align_cur_row.push(Cell::default());
         }
         self.align_cur_row[col].span = spec.span;
+        // tex.web init_col @15564: while the u-template plays, align_state is
+        // parked at 1000000; u-part finish (or omit) resets to 0.
+        self.align_brace_depth = 1_000_000;
         self.align_state = PH_U;
         let t = match first {
             Some(t) => t,
@@ -874,8 +877,6 @@ impl Engine {
                 t
             }
         };
-        // tex.web init_col @15564: while the u-template plays, align_state is
-        // parked at 1000000; u-part finish (or omit) resets to 0.
         self.align_brace_depth = 1_000_000;
         let is_omit =
             t.is_cs() && matches!(self.eqtb.resolve(t.cs_id()), Some(Equiv::Prim(Prim::Omit)));
