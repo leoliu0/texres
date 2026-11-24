@@ -110,6 +110,9 @@ impl Engine {
                 if tracked {
                     self.finish_tracked_file();
                 }
+                if !self.if_stack.is_empty() {
+                    self.materialize_if_marks_for_closing_file(si);
+                }
                 self.input.finish_file(si);
                 if lua {
                     return None;

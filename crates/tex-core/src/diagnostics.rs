@@ -676,6 +676,54 @@ impl Engine {
         None
     }
 
+    /// Byte width to rewind a raw `current_source_mark()` to the start of the
+    /// current token (mirrors `current_token_source_mark`).
+    #[inline]
+    pub(crate) fn current_token_rewind_bytes(&self) -> usize {
+        if let Some(id) = self
+            .diagnostic_source_cs
+            .filter(|id| (*id as usize) < self.cs.len())
+        {
+            self.diagnostic_cs_source_width(id)
+        } else if self.cur_tok.is_cs() && (self.cur_tok.cs_id() as usize) < self.cs.len() {
+            self.diagnostic_cs_source_width(self.cur_tok.cs_id())
+        } else if self.cur_tok.is_char() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Reconstruct the `(file_name, SourceContext)` of `self.if_stack[index]`.
+    pub(crate) fn if_state_location(&self, index: usize) -> (String, Option<SourceContext>) {
+        let Some(state) = self.if_stack.get(index) else {
+            return (String::new(), None);
+        };
+        if state.has_saved_mark {
+            if let Some((_, loc_file, loc)) =
+                self.if_saved_marks.iter().rev().find(|(i, _, _)| *i == index)
+            {
+                let file = match (loc_file, loc) {
+                    (Some(name), _) => name.to_string(),
+                    (None, Some(mark)) => mark.file_name().to_string(),
+                    (None, None) => String::new(),
+                };
+                return (file, loc.as_ref().map(SourceMark::to_context));
+            }
+            return (String::new(), None);
+        }
+        if let Some(origin) = self.input.origin_by_seq(state.loc_file_seq) {
+            let mark = SourceMark::from_parts(
+                std::rc::Rc::clone(origin),
+                state.mark_line,
+                state.mark_line_start as usize,
+                state.mark_byte_col as usize,
+            );
+            return (origin.name().to_string(), Some(mark.to_context()));
+        }
+        (String::new(), None)
+    }
+
     /// Capture the current source position and move it back to the token that
     /// began the current operation whenever it is still visible on the line.
     pub(crate) fn current_token_source_mark(&self) -> Option<SourceMark> {
@@ -683,16 +731,7 @@ impl Engine {
             return Some(mark);
         }
         let mut mark = self.input.current_source_mark()?;
-        if let Some(id) = self
-            .diagnostic_source_cs
-            .filter(|id| (*id as usize) < self.cs.len())
-        {
-            mark.rewind(self.diagnostic_cs_source_width(id));
-        } else if self.cur_tok.is_cs() && (self.cur_tok.cs_id() as usize) < self.cs.len() {
-            mark.rewind(self.diagnostic_cs_source_width(self.cur_tok.cs_id()));
-        } else if self.cur_tok.is_char() {
-            mark.rewind(1);
-        }
+        mark.rewind(self.current_token_rewind_bytes());
         Some(mark)
     }
 
@@ -1595,18 +1634,19 @@ impl Engine {
         if self.explicit_end_seen {
             if !self.if_stack.is_empty() {
                 let count = self.if_stack.len();
-                let state = self.if_stack.last().expect("nonempty conditional stack");
+                let last_idx = count - 1;
+                let state = self.if_stack[last_idx];
                 let condition = if state.loc_cs == 0 {
                     "\\if".to_string()
                 } else {
                     self.display_cs(state.loc_cs)
                 };
-                let opened = if state.loc_file().is_empty() {
+                let (loc_file, source) = self.if_state_location(last_idx);
+                let opened = if loc_file.is_empty() {
                     format!("line {}", state.loc_line)
                 } else {
-                    format!("{}:{}", state.loc_file(), state.loc_line)
+                    format!("{loc_file}:{}", state.loc_line)
                 };
-                let source = state.loc.as_ref().map(SourceMark::to_context);
                 self.warning_at(
                     &format!(
                         "Unclosed conditional{} at \\end (missing \\fi); {condition} opened at {opened}",
@@ -1657,24 +1697,21 @@ impl Engine {
 
         if !self.if_stack.is_empty() {
             let count = self.if_stack.len();
-            let openings = self
-                .if_stack
-                .iter()
+            let openings = (0..count)
                 .rev()
                 .take(3)
-                .map(|state| {
-                    if state.loc_file().is_empty() {
-                        format!("line {}", state.loc_line)
+                .map(|index| {
+                    let loc_line = self.if_stack[index].loc_line;
+                    let (loc_file, _) = self.if_state_location(index);
+                    if loc_file.is_empty() {
+                        format!("line {loc_line}")
                     } else {
-                        format!("{}:{}", state.loc_file(), state.loc_line)
+                        format!("{loc_file}:{loc_line}")
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let opening = self
-                .if_stack
-                .last()
-                .and_then(|state| state.loc.as_ref().map(SourceMark::to_context));
+            let (_, opening) = self.if_state_location(count - 1);
             self.error_at(
                 &format!(
                     "Unclosed conditional{} (missing \\fi); opened at {}",

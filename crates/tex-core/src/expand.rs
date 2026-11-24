@@ -3143,18 +3143,82 @@ impl Engine {
     /// tex.web "Push the condition stack" (the conditional's operands are
     /// scanned with it already on top). `p` is the conditional being
     /// expanded (e-TeX `cur_if := cur_chr`).
+    ///
+    /// Keeps `IfState` `Copy` (32 bytes, zero `Rc` refcount traffic on the
+    /// hot path) by storing the open file's `file_seq` and bookmark offsets;
+    /// rare cross-file / synthetic / closing-file cases spill to
+    /// `self.if_saved_marks`.
     fn push_if(&mut self, id: CsId, p: Prim, unless: bool) -> usize {
-        let loc = self.current_token_source_mark();
-        // The file name is kept only when `loc` lies in another file.
-        let (loc_file, loc_line) = match self.input.top_file_origin() {
-            Some((origin, line)) if loc.as_ref().is_some_and(|mark| mark.in_origin(origin)) => {
-                (None, line)
+        let idx = self.if_stack.len();
+        let mut has_saved_mark = false;
+        let mut loc_file_seq = 0u32;
+        let mut loc_line = 0u32;
+        let mut mark_line = 0u32;
+        let mut mark_line_start = 0u32;
+        let mut mark_byte_col = 0u32;
+
+        if !self.diagnostic_sources_live {
+            if let Some((origin, top_line, top_line_start, top_col)) =
+                self.input.top_file_fast_pos()
+            {
+                loc_line = top_line;
+                if !self.diagnostic_macro_trace.is_empty() {
+                    if let Some(mark) = &self.diagnostic_macro_call_site {
+                        if mark.in_origin(origin)
+                            && mark.line_start() <= u32::MAX as usize
+                            && mark.byte_column() <= u32::MAX as usize
+                        {
+                            loc_file_seq = origin.file_seq();
+                            mark_line = mark.line();
+                            mark_line_start = mark.line_start() as u32;
+                            mark_byte_col = mark.byte_column() as u32;
+                        } else {
+                            has_saved_mark = true;
+                            self.if_saved_marks.push((
+                                idx,
+                                Some(origin.name().clone()),
+                                Some(mark.clone()),
+                            ));
+                        }
+                    } else if let Some(col) = top_col {
+                        if top_line_start <= u32::MAX as usize && col <= u32::MAX as usize {
+                            loc_file_seq = origin.file_seq();
+                            mark_line = top_line;
+                            mark_line_start = top_line_start as u32;
+                            mark_byte_col =
+                                col.saturating_sub(self.current_token_rewind_bytes()) as u32;
+                        } else {
+                            has_saved_mark = true;
+                            loc_line = self.push_if_saved_mark(idx);
+                        }
+                    } else {
+                        has_saved_mark = true;
+                        loc_line = self.push_if_saved_mark(idx);
+                    }
+                } else if let Some(col) = top_col {
+                    if top_line_start <= u32::MAX as usize && col <= u32::MAX as usize {
+                        loc_file_seq = origin.file_seq();
+                        mark_line = top_line;
+                        mark_line_start = top_line_start as u32;
+                        mark_byte_col =
+                            col.saturating_sub(self.current_token_rewind_bytes()) as u32;
+                    } else {
+                        has_saved_mark = true;
+                        loc_line = self.push_if_saved_mark(idx);
+                    }
+                } else {
+                    has_saved_mark = true;
+                    loc_line = self.push_if_saved_mark(idx);
+                }
+            } else {
+                has_saved_mark = true;
+                loc_line = self.push_if_saved_mark(idx);
             }
-            _ => {
-                let (name, line) = self.input.current_file_location();
-                (Some(name), line)
-            }
-        };
+        } else {
+            has_saved_mark = true;
+            loc_line = self.push_if_saved_mark(idx);
+        }
+
         self.if_stack.push(crate::engine::IfState {
             accepting: false,
             matched: false,
@@ -3164,12 +3228,66 @@ impl Engine {
             kind: Self::if_code(p),
             unless,
             in_else: false,
-            loc_file,
+            has_saved_mark,
+            loc_file_seq,
             loc_line,
             loc_cs: id,
-            loc,
+            mark_line,
+            mark_line_start,
+            mark_byte_col,
         });
-        self.if_stack.len() - 1
+        idx
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_if_saved_mark(&mut self, idx: usize) -> u32 {
+        let loc = self.current_token_source_mark();
+        let (loc_file, loc_line) = match self.input.top_file_origin() {
+            Some((origin, line)) if loc.as_ref().is_some_and(|mark| mark.in_origin(origin)) => {
+                (None, line)
+            }
+            _ => {
+                let (name, line) = self.input.current_file_location();
+                (Some(name), line)
+            }
+        };
+        self.if_saved_marks.push((idx, loc_file, loc));
+        loc_line
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pop_if_saved_mark(&mut self, idx: usize) {
+        if self.if_saved_marks.last().is_some_and(|(i, _, _)| *i == idx) {
+            self.if_saved_marks.pop();
+        } else {
+            self.if_saved_marks.retain(|(i, _, _)| *i != idx);
+        }
+    }
+
+    /// Before popping file `si`, materialize diagnostic bookmarks for any
+    /// still-open conditional that referenced it by `file_seq`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn materialize_if_marks_for_closing_file(&mut self, si: usize) {
+        let Some(crate::input::Source::File { inner, .. }) = self.input.stack.get(si) else {
+            return;
+        };
+        let seq = inner.origin.file_seq();
+        let origin = std::rc::Rc::clone(&inner.origin);
+        for (idx, state) in self.if_stack.iter_mut().enumerate() {
+            if !state.has_saved_mark && state.loc_file_seq == seq {
+                state.has_saved_mark = true;
+                let mark = crate::input::SourceMark::from_parts(
+                    std::rc::Rc::clone(&origin),
+                    state.mark_line,
+                    state.mark_line_start as usize,
+                    state.mark_byte_col as usize,
+                );
+                self.if_saved_marks.push((idx, None, Some(mark)));
+            }
+        }
     }
 
     /// tex.web "Pop the condition stack"; false when it is empty.
@@ -3189,7 +3307,11 @@ impl Engine {
         {
             self.if_warning();
         }
-        self.if_stack.pop();
+        if let Some(state) = self.if_stack.pop() {
+            if state.has_saved_mark {
+                self.pop_if_saved_mark(depth - 1);
+            }
+        }
         true
     }
 
@@ -3386,63 +3508,72 @@ impl Engine {
         if !self.pushed.is_empty() || self.align_macro_arg {
             return None;
         }
-        self.ensure_nonempty_list_front(false);
-        let Some((segment, trace_depth)) = self.token_list_front() else {
-            return None;
-        };
-        let mut braces = 0i32;
-        let mut found = None;
-        let mut length = 0;
-        for &t in segment {
-            let top = t.0 >> 24;
-            if top < 0x80 {
-                if top == u32::from(CAT_ACTIVE) {
-                    break;
-                }
-                braces += i32::from(top == 1) - i32::from(top == 2);
-            } else if t.0 < NOEXP_FLAG {
-                let cs = t.cs_id();
-                let flags = self.eqtb.cs_flags_of(cs);
-                let mask = crate::eqtb::CS_FLAG_IF_TEST
-                    | crate::eqtb::CS_FLAG_IF_DELIM
-                    | crate::eqtb::CS_FLAG_OUTER
-                    | crate::eqtb::CS_FLAG_ALIAS;
-                if flags & mask != 0 {
-                    if flags == crate::eqtb::CS_FLAG_IF_TEST {
-                        *level += 1;
-                    } else if flags == crate::eqtb::CS_FLAG_OUTER {
+        const FLAG_MASK: u8 = crate::eqtb::CS_FLAG_IF_TEST
+            | crate::eqtb::CS_FLAG_IF_DELIM
+            | crate::eqtb::CS_FLAG_OUTER
+            | crate::eqtb::CS_FLAG_ALIAS;
+        loop {
+            self.ensure_nonempty_list_front(false);
+            let Some((segment, trace_depth)) = self.token_list_front() else {
+                return None;
+            };
+            let cs_flags = self.eqtb.cs_flags_slice();
+            let mut braces = 0i32;
+            let mut found = None;
+            let mut length = 0;
+            for &t in segment {
+                let top = t.0 >> 24;
+                if top < 0x80 {
+                    if top.wrapping_sub(1) < 2 {
+                        braces += 3 - 2 * (top as i32);
+                    } else if top == u32::from(CAT_ACTIVE) {
                         break;
-                    } else {
-                        match self.eqtb.resolve(cs) {
-                            Some(Equiv::Prim(p)) if Self::is_if_test(*p) => *level += 1,
-                            Some(Equiv::Prim(p)) if IF_DELIMITERS.contains(*p) => {
-                                if *level == 0 {
-                                    found = Some(*p);
-                                    length += 1;
-                                    break;
+                    }
+                } else if t.0 < NOEXP_FLAG {
+                    let cs = t.cs_id();
+                    let flags = cs_flags.get(cs as usize).copied().unwrap_or(0);
+                    if flags & FLAG_MASK != 0 {
+                        if flags == crate::eqtb::CS_FLAG_IF_TEST {
+                            *level += 1;
+                        } else if flags == crate::eqtb::CS_FLAG_OUTER {
+                            break;
+                        } else {
+                            match self.eqtb.resolve(cs) {
+                                Some(Equiv::Prim(p)) if Self::is_if_test(*p) => *level += 1,
+                                Some(Equiv::Prim(p)) if IF_DELIMITERS.contains(*p) => {
+                                    if *level == 0 {
+                                        found = Some(*p);
+                                        length += 1;
+                                        break;
+                                    }
+                                    if *p == Prim::Fi {
+                                        *level -= 1;
+                                    }
                                 }
-                                if *p == Prim::Fi {
-                                    *level -= 1;
-                                }
+                                Some(Equiv::Macro(m)) if m.outer => break,
+                                _ => {}
                             }
-                            Some(Equiv::Macro(m)) if m.outer => break,
-                            _ => {}
                         }
                     }
+                } else if t.0 >= 0xFFFF_0000 {
+                    // \par and end-of-input markers.
+                    break;
                 }
-            } else if t.0 >= 0xFFFF_0000 {
-                // \par and end-of-input markers.
-                break;
+                // A \noexpand-guarded token means \relax here (tex.web §358).
+                length += 1;
             }
-            // A \noexpand-guarded token means \relax here (tex.web §358).
-            length += 1;
+            if length == 0 {
+                return None;
+            }
+            let exhausted_segment = length == segment.len();
+            self.consume_token_list_front(length, trace_depth);
+            if braces != 0 {
+                self.align_brace_depth = self.align_brace_depth.saturating_add(braces);
+            }
+            if found.is_some() || !exhausted_segment {
+                return found;
+            }
         }
-        if length == 0 {
-            return None;
-        }
-        self.consume_token_list_front(length, trace_depth);
-        self.align_brace_depth = self.align_brace_depth.saturating_add(braces);
-        found
     }
 
     /// tex.web §336: an \outer macro, or the end of the input, ends skipped

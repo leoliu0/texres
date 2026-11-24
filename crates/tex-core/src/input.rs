@@ -56,15 +56,35 @@ pub struct MarkOrigin {
     data: Rc<[u8]>,
     /// Location in the parent source that opened this file.
     included_from: Option<Rc<SourceMark>>,
+    /// Monotonic non-zero id assigned when pushed onto `InputStack`, allowing
+    /// lightweight `IfState` entries to reference this origin without cloning
+    /// the `Rc` unless the file closes while the conditional is still open.
+    file_seq: u32,
 }
 
 impl MarkOrigin {
-    fn new(name: Rc<str>, data: Rc<[u8]>, included_from: Option<SourceMark>) -> Rc<MarkOrigin> {
+    fn new(
+        name: Rc<str>,
+        data: Rc<[u8]>,
+        included_from: Option<SourceMark>,
+        file_seq: u32,
+    ) -> Rc<MarkOrigin> {
         Rc::new(MarkOrigin {
             name,
             data,
             included_from: included_from.map(Rc::new),
+            file_seq,
         })
+    }
+
+    #[inline(always)]
+    pub(crate) fn file_seq(&self) -> u32 {
+        self.file_seq
+    }
+
+    #[inline(always)]
+    pub(crate) fn name(&self) -> &Rc<str> {
+        &self.name
     }
 }
 
@@ -112,8 +132,39 @@ impl SourceMark {
     }
 
     /// The position lies in the file `origin` stands for.
+    #[inline(always)]
     pub(crate) fn in_origin(&self, origin: &Rc<MarkOrigin>) -> bool {
         Rc::ptr_eq(&self.origin, origin)
+    }
+
+    #[inline(always)]
+    pub(crate) fn from_parts(
+        origin: Rc<MarkOrigin>,
+        line: u32,
+        line_start: usize,
+        byte_column: usize,
+    ) -> Self {
+        SourceMark {
+            origin,
+            line,
+            line_start,
+            byte_column,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn line(&self) -> u32 {
+        self.line
+    }
+
+    #[inline(always)]
+    pub(crate) fn line_start(&self) -> usize {
+        self.line_start
+    }
+
+    #[inline(always)]
+    pub(crate) fn byte_column(&self) -> usize {
+        self.byte_column
     }
 }
 
@@ -802,6 +853,7 @@ pub struct InputStack {
     /// `current_file_line` runs on hot paths (every skipped conditional)
     /// below stacks of macro frames.
     top_file: std::cell::Cell<usize>,
+    next_file_seq: u32,
 }
 
 /// The content end and next-line offset of a pseudo-file line that starts
@@ -840,7 +892,15 @@ impl InputStack {
             disk_stamps: HashMap::new(),
             last_finished_file: None,
             top_file: std::cell::Cell::new(usize::MAX),
+            next_file_seq: 1,
         }
+    }
+
+    #[inline]
+    fn alloc_file_seq(&mut self) -> u32 {
+        let seq = self.next_file_seq;
+        self.next_file_seq = self.next_file_seq.wrapping_add(1).max(1);
+        seq
     }
 
     /// The stack depth and reading position of the top source: it differs
@@ -1198,7 +1258,8 @@ impl InputStack {
     ) {
         self.ensure_stack_room();
         let data: Rc<[u8]> = data.into();
-        let origin = MarkOrigin::new(Rc::from(name.as_str()), data.clone(), included_from);
+        let file_seq = self.alloc_file_seq();
+        let origin = MarkOrigin::new(Rc::from(name.as_str()), data.clone(), included_from, file_seq);
         self.stack.push(Source::File {
             name,
             lua_lines: None,
@@ -1259,7 +1320,8 @@ impl InputStack {
         let included_from = self.current_source_mark();
         self.ensure_stack_room();
         let data: Rc<[u8]> = Rc::from(&b""[..]);
-        let origin = MarkOrigin::new(Rc::from("<directlua>"), data.clone(), included_from);
+        let file_seq = self.alloc_file_seq();
+        let origin = MarkOrigin::new(Rc::from("<directlua>"), data.clone(), included_from, file_seq);
         self.stack.push(Source::File {
             name: "<directlua>".to_string(),
             lua_lines: Some(Box::new(lines)),
@@ -1427,6 +1489,36 @@ impl InputStack {
         }
     }
 
+    /// Borrow the innermost open file's origin and current line coordinates
+    /// without cloning any `Rc`. `byte_col` is `Some` whenever `line_buf` is
+    /// populated (or `line_no == 0`), avoiding `physical_line_bounds` on the
+    /// hot path.
+    #[inline(always)]
+    pub(crate) fn top_file_fast_pos(&self) -> Option<(&Rc<MarkOrigin>, u32, usize, Option<usize>)> {
+        let Source::File { inner, .. } = self.top_file()? else {
+            return None;
+        };
+        let col = if inner.line_buf.is_some() {
+            Some(inner.line_pos)
+        } else if inner.line_no == 0 {
+            Some(0)
+        } else {
+            None
+        };
+        Some((&inner.origin, inner.line_no, inner.line_start, col))
+    }
+
+    /// Find an open file's origin by `MarkOrigin::file_seq` (cold diagnostic path).
+    pub(crate) fn origin_by_seq(&self, seq: u32) -> Option<&Rc<MarkOrigin>> {
+        if seq == 0 {
+            return None;
+        }
+        self.stack.iter().rev().find_map(|source| match source {
+            Source::File { inner, .. } if inner.origin.file_seq == seq => Some(&inner.origin),
+            _ => None,
+        })
+    }
+
     /// web2c `print_file_line`: the innermost file and its current line
     /// for a `-file-line-error` message. A pseudo file (`\scantokens`, a
     /// Lua chunk) has no name of its own and defers to the file below it.
@@ -1488,7 +1580,7 @@ mod tests {
             name: "legacy-cr.tex".into(),
             lua_lines: None,
             inner: Box::new(FileBody {
-                origin: MarkOrigin::new(Rc::from("legacy-cr.tex"), bytes.clone(), None),
+                origin: MarkOrigin::new(Rc::from("legacy-cr.tex"), bytes.clone(), None, 1),
                 data: bytes,
                 pos: 0,
                 line_no: 2,

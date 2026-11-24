@@ -1583,8 +1583,8 @@ impl Engine {
                 None => self.def_prefix.push(t),
             }
         }
-        let mut body = if missing_brace {
-            Vec::new()
+        let (mut body, has_param_refs, checked_no_active_cs) = if missing_brace {
+            (Vec::new(), false, true)
         } else {
             self.collect_def_body(target, num_params, expanded, definition_start.as_ref())
         };
@@ -1606,7 +1606,15 @@ impl Engine {
             body.push(b);
         }
 
-        self.finish_def(target, num_params, params, body, global);
+        self.finish_def(
+            target,
+            num_params,
+            params,
+            body,
+            has_param_refs,
+            checked_no_active_cs,
+            global,
+        );
     }
 
     fn finish_def(
@@ -1615,14 +1623,23 @@ impl Engine {
         num_params: u8,
         params: Vec<Vec<Token>>,
         body: Vec<Token>,
+        has_param_refs: bool,
+        checked_no_active_cs: bool,
         global: bool,
     ) {
-        let has_param_refs =
-            num_params > 0 && body.iter().any(|t| t.0 >= 0x4000_0000 && t.0 < 0x8000_0000);
-        let stored: Rc<[Token]> = Rc::from(&body[..]);
+        let stored: Rc<[Token]> = if body.is_empty() {
+            Rc::clone(&self.empty_tokens)
+        } else {
+            Rc::from(&body[..])
+        };
         self.recycle_token_vec(body);
+        let replacement = if checked_no_active_cs {
+            crate::eqtb::CachedReplacement::with_active_cs(false)
+        } else {
+            Default::default()
+        };
         let m = Macro {
-            replacement: Default::default(),
+            replacement,
             num_params,
             has_param_refs,
             params,
@@ -1650,31 +1667,60 @@ impl Engine {
         origin: Option<&crate::input::SourceMark>,
     ) -> bool {
         let remaining = crate::input::MAX_TOKEN_LIST_TOKENS.saturating_sub(out.len());
-        let mut additional = 0usize;
-        for t in toks {
-            let width = if t.0 >= PAR_REF_FLAG && t.0 < 0x8000_0000 {
-                2
-            } else {
-                1
-            };
-            additional = additional.saturating_add(width);
-            if additional > remaining {
-                break;
+        // Only run the exact expansion-width pre-scan when the worst-case 2x
+        // expansion of `toks` could exceed `MAX_TOKEN_LIST_TOKENS`.
+        if toks.len().saturating_mul(2) > remaining {
+            let mut additional = 0usize;
+            for t in toks {
+                let width = if t.0 >= PAR_REF_FLAG && t.0 < 0x8000_0000 {
+                    2
+                } else {
+                    1
+                };
+                additional = additional.saturating_add(width);
+                if additional > remaining {
+                    break;
+                }
+            }
+            if !self.scanned_token_list_has_room(
+                out.len(),
+                additional,
+                "macro definition size",
+                origin,
+            ) {
+                return false;
             }
         }
-        if !self.scanned_token_list_has_room(out.len(), additional, "macro definition size", origin)
-        {
-            return false;
-        }
-        for &t in toks {
-            if t.is_cs() {
-                out.push(Token::from_cs(t.cs_id()));
-            } else if t.0 >= PAR_REF_FLAG && t.0 < 0x8000_0000 {
-                let n = (t.0 & 0xF) as u8;
-                out.push(Token::char(6, b'#' as u32));
-                out.push(Token::char(12, b'0' as u32 + n as u32));
-            } else {
-                out.push(Token::unfreeze(t));
+        out.reserve(toks.len());
+        let mut i = 0;
+        let len = toks.len();
+        while i < len {
+            let run_start = i;
+            // Plain chars (`< 0x1000_0000`) and plain CS (`0x8000_0000..0xA000_0000`)
+            // copy verbatim without unfreezing or expanding `#n`.
+            while i < len {
+                let v = toks[i].0;
+                if v < 0x1000_0000 || (v >= 0x8000_0000 && v < 0xA000_0000) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if i > run_start {
+                out.extend_from_slice(&toks[run_start..i]);
+            }
+            if i < len {
+                let t = toks[i];
+                i += 1;
+                if t.is_cs() {
+                    out.push(Token::from_cs(t.cs_id()));
+                } else if t.0 >= PAR_REF_FLAG && t.0 < 0x8000_0000 {
+                    let n = (t.0 & 0xF) as u8;
+                    out.push(Token::char(6, b'#' as u32));
+                    out.push(Token::char(12, b'0' as u32 + n as u32));
+                } else {
+                    out.push(Token::unfreeze(t));
+                }
             }
         }
         true
@@ -1682,69 +1728,59 @@ impl Engine {
 
     /// Collect a macro body until the closing brace at depth 0; the opening
     /// brace (or the `{` of a `#{` parameter text) has already been read.
+    /// Returns `(body, has_param_refs, checked_no_active_cs)`.
     fn collect_def_body(
         &mut self,
         target: CsId,
         num_params: u8,
         expanded: bool,
         definition_start: Option<&crate::input::SourceMark>,
-    ) -> Vec<Token> {
+    ) -> (Vec<Token>, bool, bool) {
         let prev_expanded_scan = self.in_expanded_scan;
         if expanded {
             self.in_expanded_scan = true;
         }
         let mut out = self.token_vec_pool.pop().unwrap_or_default();
         let mut depth = 1i32;
+        let mut has_param_refs = false;
+        let mut checked_no_active_cs = true;
         loop {
             if let Some(closed) = self.take_def_body_run(&mut out, &mut depth, expanded) {
                 if closed {
                     self.in_expanded_scan = prev_expanded_scan;
-                    return out;
+                    return (out, has_param_refs, checked_no_active_cs);
                 }
                 continue;
             }
             let t = if expanded {
                 let raw = self.raw_token();
-                if raw.is_cs() && raw.0 < crate::expand::NOEXP_FLAG {
-                    let mut id = raw.cs_id();
-                    for _ in 0..1024 {
-                        match self.eqtb.get(id) {
-                            Some(Equiv::Alias(next)) => id = *next,
-                            _ => break,
-                        }
-                    }
-                    if let Some(Equiv::Prim(Prim::UnExpanded)) = self.eqtb.get(id) {
-                        self.skip_spaces_relax();
-                        let nxt = self.raw_token();
-                        if nxt.is_cs() {
-                            if let Some(Equiv::ToksReg(i)) = self.eqtb.resolve(nxt.cs_id()).cloned()
-                            {
-                                let toks = Rc::clone(&self.eqtb.toks[i as usize]);
-                                if !self.store_unexpanded_in_edef(
-                                    &mut out,
-                                    &toks,
-                                    definition_start,
-                                ) {
-                                    self.in_expanded_scan = prev_expanded_scan;
-                                    return out;
-                                }
-                                continue;
+                if raw.is_cs()
+                    && raw.0 < crate::expand::NOEXP_FLAG
+                    && self.eqtb.is_unexpanded_cs(raw.cs_id())
+                {
+                    self.skip_spaces_relax();
+                    let nxt = self.raw_token();
+                    if nxt.is_cs() {
+                        if let Some(Equiv::ToksReg(i)) = self.eqtb.resolve(nxt.cs_id()).cloned() {
+                            let toks = Rc::clone(&self.eqtb.toks[i as usize]);
+                            checked_no_active_cs = false;
+                            if !self.store_unexpanded_in_edef(&mut out, &toks, definition_start) {
+                                self.in_expanded_scan = prev_expanded_scan;
+                                return (out, has_param_refs, checked_no_active_cs);
                             }
+                            continue;
                         }
-                        self.push_token(nxt);
-                        let toks = self.scan_general_text_of(Some(raw.cs_id()));
-                        if self.stopped_on_error
-                            || !self.store_unexpanded_in_edef(
-                                &mut out,
-                                &toks,
-                                definition_start,
-                            )
-                        {
-                            self.in_expanded_scan = prev_expanded_scan;
-                            return out;
-                        }
-                        continue;
                     }
+                    self.push_token(nxt);
+                    let toks = self.scan_general_text_of(Some(raw.cs_id()));
+                    checked_no_active_cs = false;
+                    if self.stopped_on_error
+                        || !self.store_unexpanded_in_edef(&mut out, &toks, definition_start)
+                    {
+                        self.in_expanded_scan = prev_expanded_scan;
+                        return (out, has_param_refs, checked_no_active_cs);
+                    }
+                    continue;
                 }
                 self.get_token_from(raw)
             } else {
@@ -1764,7 +1800,7 @@ impl Engine {
                 // tex.web §336: the inserted `}` ends the body.
                 self.outer_scan_file_ended(definition_start);
                 self.in_expanded_scan = prev_expanded_scan;
-                return out;
+                return (out, has_param_refs, checked_no_active_cs);
             }
             if expanded && self.cur_prim == Some(Prim::UnExpanded) {
                 self.skip_spaces_relax();
@@ -1772,24 +1808,22 @@ impl Engine {
                 if nxt.is_cs() {
                     if let Some(Equiv::ToksReg(i)) = self.eqtb.resolve(nxt.cs_id()).cloned() {
                         let toks = Rc::clone(&self.eqtb.toks[i as usize]);
-                        if !self.store_unexpanded_in_edef(
-                            &mut out,
-                            &toks,
-                            definition_start,
-                        ) {
+                        checked_no_active_cs = false;
+                        if !self.store_unexpanded_in_edef(&mut out, &toks, definition_start) {
                             self.in_expanded_scan = prev_expanded_scan;
-                            return out;
+                            return (out, has_param_refs, checked_no_active_cs);
                         }
                         continue;
                     }
                 }
                 self.push_token(nxt);
                 let toks = self.scan_general_text_of(Some(t.cs_id()));
+                checked_no_active_cs = false;
                 if self.stopped_on_error
                     || !self.store_unexpanded_in_edef(&mut out, &toks, definition_start)
                 {
                     self.in_expanded_scan = prev_expanded_scan;
-                    return out;
+                    return (out, has_param_refs, checked_no_active_cs);
                 }
                 continue;
             }
@@ -1801,7 +1835,7 @@ impl Engine {
                     definition_start,
                 ) {
                     self.in_expanded_scan = prev_expanded_scan;
-                    return out;
+                    return (out, has_param_refs, checked_no_active_cs);
                 }
                 // `\unexpanded{#1}` inside `\edef\foo#1#2{...}` must store
                 // a literal hash, not parameter 1 of `\foo`.
@@ -1809,11 +1843,12 @@ impl Engine {
                 // `\the\toks` in `revtex4-2` tabular preambles) must also store
                 // the literal token rather than demanding a parameter digit.
                 if from_unexp || self.unexpanded_parameter || self.no_expand_tok == Some(t) {
-                    out.push(if t.is_cs() {
-                        t
+                    if t.is_cs() {
+                        checked_no_active_cs = false;
+                        out.push(t);
                     } else {
-                        Token::char(6, b'#' as u32)
-                    });
+                        out.push(Token::char(6, b'#' as u32));
+                    }
                     continue;
                 }
                 let mut t2 = self.raw_token();
@@ -1823,7 +1858,7 @@ impl Engine {
                 if t2 == crate::input::EOF_MARKER {
                     self.outer_scan_file_ended(definition_start);
                     self.in_expanded_scan = prev_expanded_scan;
-                    return out;
+                    return (out, has_param_refs, checked_no_active_cs);
                 }
                 if self.is_macro_param(t2) {
                     // luatex scan_toks stores the second token as read, so a
@@ -1833,12 +1868,18 @@ impl Engine {
                             self.eqtb.resolve(t2.cs_id()),
                             Some(Equiv::CharTok(v)) if Token(*v).chr() == crate::token::ALIGN_PRIM_CHR
                         );
-                    out.push(if keeps_cs { t2 } else { Token::char(6, b'#' as u32) });
+                    out.push(if keeps_cs {
+                        checked_no_active_cs = false;
+                        t2
+                    } else {
+                        Token::char(6, b'#' as u32)
+                    });
                     continue;
                 }
                 if t2.is_char() && (u32::from(b'1')..=u32::from(b'9')).contains(&t2.chr()) {
                     let parameter = (t2.chr() - u32::from(b'0')) as u8;
                     if parameter <= num_params {
+                        has_param_refs = true;
                         out.push(Token(PAR_REF_FLAG | u32::from(parameter)));
                     } else {
                         // Nothing has been read since `t2`, so the mark is
@@ -1889,7 +1930,7 @@ impl Engine {
                     depth -= 1;
                     if depth == 0 {
                         self.in_expanded_scan = prev_expanded_scan;
-                        return out;
+                        return (out, has_param_refs, checked_no_active_cs);
                     }
                 }
             }
@@ -1900,7 +1941,7 @@ impl Engine {
                 definition_start,
             ) {
                 self.in_expanded_scan = prev_expanded_scan;
-                return out;
+                return (out, has_param_refs, checked_no_active_cs);
             }
             let t = self.unfreeze_input_token(t);
             out.push(t);

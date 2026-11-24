@@ -13,7 +13,7 @@ pub enum ScannerStatus {
     Aligning,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct IfState {
     pub accepting: bool,  // currently taking the true branch
     pub matched: bool,    // some branch was taken already
@@ -29,24 +29,18 @@ pub struct IfState {
     pub unless: bool,
     /// tex.web `if_limit = fi_code`: the `\else` branch is running
     pub in_else: bool,
-    /// The file open when the conditional began; `None` when that is the
-    /// file of `loc` (the usual case, sparing a reference count per
-    /// conditional). Read it with [`IfState::loc_file`].
-    pub(crate) loc_file: Option<std::rc::Rc<str>>,
+    /// True when this frame's diagnostic location was saved out-of-line in
+    /// `Engine::if_saved_marks` (cross-file macro call, synthetic source, or
+    /// its opening file already closed).
+    pub(crate) has_saved_mark: bool,
+    /// `MarkOrigin::file_seq` of the open file holding the bookmark (`0` = none).
+    pub(crate) loc_file_seq: u32,
     pub loc_line: u32,
     pub loc_cs: u32,
-    pub(crate) loc: Option<crate::input::SourceMark>,
-}
-
-impl IfState {
-    /// The name of the file open when the conditional began ("" if none).
-    pub fn loc_file(&self) -> &str {
-        match (&self.loc_file, &self.loc) {
-            (Some(name), _) => name,
-            (None, Some(mark)) => mark.file_name(),
-            (None, None) => "",
-        }
-    }
+    /// Bookmark coordinates within `loc_file_seq` when `!has_saved_mark`.
+    pub(crate) mark_line: u32,
+    pub(crate) mark_line_start: u32,
+    pub(crate) mark_byte_col: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -388,6 +382,12 @@ pub struct Engine {
     pub expansion_limit: u64,
     // scanning state
     pub if_stack: Vec<IfState>,
+    /// Out-of-line diagnostic locations for `IfState` entries with
+    /// `has_saved_mark == true`: `(if_stack_index, loc_file, loc)`.
+    pub(crate) if_saved_marks:
+        Vec<(usize, Option<std::rc::Rc<str>>, Option<crate::input::SourceMark>)>,
+    /// Shared empty token slice for parameterless empty macro definitions.
+    pub(crate) empty_tokens: std::rc::Rc<[Token]>,
     pub(crate) pending_if_depth: Option<usize>,
     pub pushed: Vec<Token>, // lookahead pushback
     /// The input stacks (with their pushback) that a private input hides, such as the one of a `\write` expansion, innermost last; `show_context` looks through them.
@@ -1238,6 +1238,8 @@ impl Engine {
                 .and_then(|value| value.trim().parse().ok())
                 .unwrap_or(DEFAULT_EXPANSION_LIMIT),
             if_stack: Vec::new(),
+            if_saved_marks: Vec::new(),
+            empty_tokens: std::rc::Rc::from(&[][..]),
             pending_if_depth: None,
             pushed: Vec::new(),
             parked_inputs: Vec::new(),
@@ -2541,15 +2543,12 @@ impl Engine {
             false
         }
     }
-    #[inline]
+    #[inline(always)]
     pub fn is_macro_param(&self, t: Token) -> bool {
         if t.is_char() {
             t.cc() == 6
         } else if t.is_cs() {
-            matches!(
-                self.eqtb.resolve(t.cs_id()),
-                Some(crate::eqtb::Equiv::CharTok(v)) if Token(*v).cc() == 6
-            )
+            self.eqtb.is_mac_param_cs(t.cs_id())
         } else {
             false
         }

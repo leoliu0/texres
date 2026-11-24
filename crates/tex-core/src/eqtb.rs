@@ -214,6 +214,16 @@ pub struct CachedReplacement {
     active_cs: std::cell::Cell<u8>,
 }
 
+impl CachedReplacement {
+    #[inline(always)]
+    pub(crate) fn with_active_cs(has_active: bool) -> Self {
+        CachedReplacement {
+            plan: std::cell::UnsafeCell::new(None),
+            active_cs: std::cell::Cell::new(if has_active { 2 } else { 1 }),
+        }
+    }
+}
+
 impl Clone for CachedReplacement {
     #[inline]
     fn clone(&self) -> Self {
@@ -653,6 +663,8 @@ pub(crate) const CS_FLAG_ROW_DELIM: u8 = 1 << 1;
 pub(crate) const CS_FLAG_IF_TEST: u8 = 1 << 2;
 pub(crate) const CS_FLAG_IF_DELIM: u8 = 1 << 3;
 pub(crate) const CS_FLAG_ALIAS: u8 = 1 << 4;
+pub(crate) const CS_FLAG_MAC_PARAM: u8 = 1 << 5;
+pub(crate) const CS_FLAG_UNEXPANDED: u8 = 1 << 6;
 
 #[inline]
 fn compute_cs_flags(equiv: Option<&Equiv>) -> u8 {
@@ -666,16 +678,16 @@ fn compute_cs_flags(equiv: Option<&Equiv>) -> u8 {
                 0
             }
         }
-        Some(Equiv::CharTok(raw)) => {
-            if Token(*raw).cc() == 4 {
-                CS_FLAG_ROW_DELIM
-            } else {
-                0
-            }
-        }
+        Some(Equiv::CharTok(raw)) => match Token(*raw).cc() {
+            4 => CS_FLAG_ROW_DELIM,
+            6 => CS_FLAG_MAC_PARAM,
+            _ => 0,
+        },
         Some(Equiv::Prim(p)) => {
             if matches!(p, Prim::Cr | Prim::CrCr) {
                 CS_FLAG_ROW_DELIM
+            } else if *p == Prim::UnExpanded {
+                CS_FLAG_UNEXPANDED
             } else if crate::expand::is_if_test_prim(*p) {
                 CS_FLAG_IF_TEST
             } else if crate::expand::is_if_delim_prim(*p) {
@@ -1227,6 +1239,41 @@ impl Eqtb {
     pub(crate) fn cs_flags_of(&self, id: CsId) -> u8 {
         self.cs_flags.get(id as usize).copied().unwrap_or(0)
     }
+
+    #[inline(always)]
+    pub(crate) fn cs_flags_slice(&self) -> &[u8] {
+        &self.cs_flags
+    }
+
+    /// True when the effective meaning of `id` is a macro-parameter character
+    /// (`\let\x=#`). Uses the compact `cs_flags` byte table unless aliased.
+    #[inline(always)]
+    pub(crate) fn is_mac_param_cs(&self, id: CsId) -> bool {
+        let f = self.cs_flags_of(id);
+        if f & (CS_FLAG_MAC_PARAM | CS_FLAG_ALIAS) == 0 {
+            return false;
+        }
+        if f & CS_FLAG_ALIAS == 0 {
+            return true;
+        }
+        matches!(
+            self.resolve(id),
+            Some(Equiv::CharTok(v)) if Token(*v).cc() == 6
+        )
+    }
+
+    /// True when the effective meaning of `id` is e-TeX `\unexpanded`.
+    #[inline(always)]
+    pub(crate) fn is_unexpanded_cs(&self, id: CsId) -> bool {
+        let f = self.cs_flags_of(id);
+        if f & (CS_FLAG_UNEXPANDED | CS_FLAG_ALIAS) == 0 {
+            return false;
+        }
+        if f & CS_FLAG_ALIAS == 0 {
+            return true;
+        }
+        matches!(self.resolve(id), Some(Equiv::Prim(Prim::UnExpanded)))
+    }
     #[inline(always)]
     pub fn get(&self, id: CsId) -> Option<&Equiv> {
         self.entries.get(id as usize).and_then(|e| e.equiv.as_ref())
@@ -1317,7 +1364,12 @@ impl Eqtb {
             self.entries.resize(idx + 1, EqEntry::UNDEFINED);
             self.cs_flags.resize(idx + 1, 0);
         }
-        let same = Equiv::same(self.entries[idx].equiv.as_ref(), equiv.as_ref());
+        let tracing = self.int_params[IntParam::TracingAssigns as usize] > 0;
+        let same = if !global || tracing {
+            Equiv::same(self.entries[idx].equiv.as_ref(), equiv.as_ref())
+        } else {
+            false
+        };
         if !self.begin_assign(global, same, TraceSlot::Eq(id)) {
             return;
         }
