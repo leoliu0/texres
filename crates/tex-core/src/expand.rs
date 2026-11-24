@@ -4745,50 +4745,105 @@ impl Engine {
     }
 
     fn take_csname_run(&mut self, name: &mut Vec<u8>) -> CsNameRun {
-        self.ensure_nonempty_list_front(false);
-        let Some((segment, trace_depth)) = self.token_list_front() else {
-            return CsNameRun::Empty;
+        /// Top bytes allowed in `take_csname_run`: `{0, 3, 5..=8, 10..=12}`.
+        static CSNAME_PLAIN_TOP: [u8; 256] = {
+            let mut t = [0u8; 256];
+            t[0] = 1;
+            t[3] = 1;
+            t[5] = 1;
+            t[6] = 1;
+            t[7] = 1;
+            t[8] = 1;
+            t[10] = 1;
+            t[11] = 1;
+            t[12] = 1;
+            t
         };
+        let can_finish = self.unexp_protect == 0
+            && self.align_state == crate::align::PH_IDLE
+            && self.lua_cb[crate::lua_callbacks::Cb::ShowErrorHook as usize] == 0;
         let mut last = None;
-        let mut length = 0;
-        for &t in segment {
-            if !matches!(t.0 >> 24, 0 | 3 | 5..=8 | 10..=12) || name.len() > 2000 {
+        loop {
+            self.ensure_nonempty_list_front(false);
+            let Some((segment, trace_depth)) = self.token_list_front() else {
+                break;
+            };
+            let mut length = 0;
+            let seg_len = segment.len();
+            if name.len() <= 2000 {
+                // Fast ASCII loop writing straight into `name`'s spare capacity
+                // without per-byte `Vec::push` checks or `name.len() <= 2000` checks.
+                let mut cur_len = name.len();
+                let limit = seg_len.min(2001 - cur_len);
+                if name.capacity() - cur_len < limit {
+                    name.reserve(limit);
+                }
+                let seg_ptr = segment.as_ptr();
+                let dst = name.as_mut_ptr();
+                while length < limit {
+                    // SAFETY: `length < limit <= seg_len`.
+                    let t = unsafe { *seg_ptr.add(length) };
+                    if (t.0 & 0x0080_0000) != 0 || CSNAME_PLAIN_TOP[(t.0 >> 24) as usize] == 0 {
+                        break;
+                    }
+                    // SAFETY: `cur_len < name.capacity()`.
+                    unsafe {
+                        *dst.add(cur_len) = t.0 as u8;
+                    }
+                    cur_len += 1;
+                    length += 1;
+                }
+                // SAFETY: bytes `name.len()..cur_len` were initialized above.
+                unsafe {
+                    name.set_len(cur_len);
+                }
+                // Handle any Unicode character tokens (XeTeX/LuaTeX) after the ASCII prefix.
+                while length < seg_len && name.len() <= 2000 {
+                    let t = segment[length];
+                    if CSNAME_PLAIN_TOP[(t.0 >> 24) as usize] == 0 {
+                        break;
+                    }
+                    if t.0 & 0x0080_0000 != 0 {
+                        t.append_character_bytes(name);
+                    } else {
+                        name.push(t.0 as u8);
+                    }
+                    length += 1;
+                }
+                if length > 0 {
+                    last = Some(segment[length - 1]);
+                }
+            }
+            if can_finish && name.len() <= 2000 {
+                if let Some(&end_tok) = segment.get(length) {
+                    if end_tok.is_cs()
+                        && end_tok.0 < NOEXP_FLAG
+                        && !self.cs.is_active(end_tok.cs_id())
+                        && matches!(
+                            self.eqtb.get(end_tok.cs_id()),
+                            Some(Equiv::Prim(Prim::EndCsName))
+                        )
+                    {
+                        self.consume_token_list_front(length + 1, trace_depth);
+                        self.no_expand_tok = None;
+                        self.unexpanded_parameter = false;
+                        self.set_cur_cs_known(end_tok, Some(Prim::EndCsName));
+                        return CsNameRun::Finished;
+                    }
+                }
+            }
+            if length == 0 {
                 break;
             }
-            if t.is_unicode_char() {
-                t.append_character_bytes(name);
-            } else {
-                name.push(t.chr() as u8);
-            }
-            last = Some(t);
-            length += 1;
-        }
-        if name.len() <= 2000
-            && self.unexp_protect == 0
-            && self.align_state == crate::align::PH_IDLE
-            && self.lua_cb[crate::lua_callbacks::Cb::ShowErrorHook as usize] == 0
-        {
-            if let Some(&end_tok) = segment.get(length) {
-                if end_tok.is_cs()
-                    && end_tok.0 < NOEXP_FLAG
-                    && !self.cs.is_active(end_tok.cs_id())
-                    && matches!(
-                        self.eqtb.get(end_tok.cs_id()),
-                        Some(Equiv::Prim(Prim::EndCsName))
-                    )
-                {
-                    self.consume_token_list_front(length + 1, trace_depth);
-                    self.no_expand_tok = None;
-                    self.unexpanded_parameter = false;
-                    self.set_cur_cs_known(end_tok, Some(Prim::EndCsName));
-                    return CsNameRun::Finished;
-                }
+            let exhausted = length == seg_len;
+            self.consume_token_list_front(length, trace_depth);
+            if !exhausted || name.len() > 2000 {
+                break;
             }
         }
         let Some(last) = last else {
             return CsNameRun::Empty;
         };
-        self.consume_token_list_front(length, trace_depth);
         self.no_expand_tok = None;
         self.unexpanded_parameter = false;
         self.set_cur_char(last);
@@ -5051,6 +5106,21 @@ impl Engine {
         // active character it is the meaning of.
         let first_char = first.0 < 0x0D00_0000;
         let first_cs = first.is_cs().then_some(first.0 & 0x3FFF_FFFF);
+        // When no alignment row delimiters, `\outer` macros, or active-CS
+        // tokens can appear in `segment`, and `first` is either a non-active
+        // char or a non-active CS, a plain non-brace token matches `first` iff
+        // it equals `stop_tok` (avoiding the 50/50 char-vs-CS branch).
+        let fast_stop = if !align_live && !outer && !maybe_active_cs {
+            if first_char {
+                Some(first)
+            } else if let Some(id) = first_cs {
+                (!self.cs.is_active(id)).then_some(Token::from_cs(id))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Tokens taken from the segment, of which `segment[..copied]` is in
         // `out` already, and the number of argument tokens they make.
         let mut length = 0;
@@ -5059,42 +5129,67 @@ impl Engine {
         loop {
             let run = length;
             let limit = segment.len().min(length + (room - stored));
-            while length < limit {
-                let t = segment[length];
-                let top = t.0 >> 24;
-                if top < 0x80 {
-                    // Ignored characters, braces and the marks above
-                    // category 13 need the token loop.
-                    if top > 13
-                        || matches!(top, 1 | 2 | 9)
-                        || t == first
-                        || (!first_char
-                            && (top == u32::from(CAT_ACTIVE) || first_cs.is_none())
-                            && self.delim_eq(t, first))
-                        || (top == u32::from(CAT_ACTIVE) && outer && self.is_outer_macro_token(t))
-                    {
-                        break;
-                    }
-                } else if top < 0xC0 {
-                    // unfreeze_input_token() turns active control sequences
-                    // into active characters.
-                    if (!long && t == partoken)
-                        || self.cs.is_active(t.cs_id())
-                        || match first_cs {
-                            Some(id) => t.0 & 0x3FFF_FFFF == id,
-                            None => !first_char && self.delim_eq(t, first),
+            if let Some(stop_tok) = fast_stop {
+                if long {
+                    while length < limit {
+                        let t = segment[length];
+                        if t == stop_tok || BALANCED_TOP_CLASS[(t.0 >> 24) as usize] != 0 {
+                            break;
                         }
-                        || (outer && self.is_outer_macro_token(t))
-                    {
-                        break;
+                        length += 1;
                     }
                 } else {
-                    break;
+                    while length < limit {
+                        let t = segment[length];
+                        if t == stop_tok
+                            || t == partoken
+                            || BALANCED_TOP_CLASS[(t.0 >> 24) as usize] != 0
+                        {
+                            break;
+                        }
+                        length += 1;
+                    }
                 }
-                if align_live && crate::align::is_row_delimiter(t, &self.eqtb) {
-                    break;
+            } else {
+                while length < limit {
+                    let t = segment[length];
+                    let top = t.0 >> 24;
+                    if top < 0x80 {
+                        // Ignored characters, braces and the marks above
+                        // category 13 need the token loop.
+                        if top > 13
+                            || matches!(top, 1 | 2 | 9)
+                            || t == first
+                            || (!first_char
+                                && (top == u32::from(CAT_ACTIVE) || first_cs.is_none())
+                                && self.delim_eq(t, first))
+                            || (top == u32::from(CAT_ACTIVE)
+                                && outer
+                                && self.is_outer_macro_token(t))
+                        {
+                            break;
+                        }
+                    } else if top < 0xC0 {
+                        // unfreeze_input_token() turns active control sequences
+                        // into active characters.
+                        if (!long && t == partoken)
+                            || (maybe_active_cs && self.cs.is_active(t.cs_id()))
+                            || match first_cs {
+                                Some(id) => t.0 & 0x3FFF_FFFF == id,
+                                None => !first_char && self.delim_eq(t, first),
+                            }
+                            || (outer && self.is_outer_macro_token(t))
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    if align_live && crate::align::is_row_delimiter(t, &self.eqtb) {
+                        break;
+                    }
+                    length += 1;
                 }
-                length += 1;
             }
             stored += length - run;
             // A group: the token loop stores its brace, its tokens
@@ -5125,17 +5220,24 @@ impl Engine {
         }
         // The delimiter that stopped the run, when macro_arg_token would
         // return its tokens as they are stored (and none ends the cell).
-        let delimited = segment.len() - length >= delim.len()
-            && delim.iter().zip(&segment[length..]).all(|(&d, &t)| {
-                let top = t.0 >> 24;
-                (if top < 0x80 {
-                    top <= 13 && !matches!(top, 1 | 2 | 9)
-                } else {
-                    top < 0xC0 && !self.cs.is_active(t.cs_id())
-                }) && !(outer && self.is_outer_macro_token(t))
-                    && !(align_live && crate::align::is_row_delimiter(t, &self.eqtb))
-                    && self.delim_eq(t, d)
-            });
+        let delimited = if delim.len() == 1
+            && fast_stop
+                .is_some_and(|stop_tok| BALANCED_TOP_CLASS[(stop_tok.0 >> 24) as usize] == 0)
+        {
+            segment.get(length) == fast_stop.as_ref()
+        } else {
+            segment.len() - length >= delim.len()
+                && delim.iter().zip(&segment[length..]).all(|(&d, &t)| {
+                    let top = t.0 >> 24;
+                    (if top < 0x80 {
+                        top <= 13 && !matches!(top, 1 | 2 | 9)
+                    } else {
+                        top < 0xC0 && !(maybe_active_cs && self.cs.is_active(t.cs_id()))
+                    }) && !(outer && self.is_outer_macro_token(t))
+                        && !(align_live && crate::align::is_row_delimiter(t, &self.eqtb))
+                        && self.delim_eq(t, d)
+                })
+        };
         if length == 0 && !delimited {
             return DelimitedRun::None;
         }

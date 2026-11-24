@@ -154,13 +154,50 @@ impl std::hash::Hasher for NameHasher {
     }
 }
 
+/// Fast word-at-a-time FxHash with final avalanche mixing for CS names.
+#[inline(always)]
+fn hash_cs_name(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+        h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+    }
+    let h = (h ^ (h >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^ (h >> 29)
+}
+
 /// No id has been cached for this active character.
 const NO_ACTIVE_ID: CsId = CsId::MAX;
+/// Empty SwissTable control byte (high bit set; occupied entries store 7-bit h2 in `0..=127`).
+const CTRL_EMPTY: u8 = 0x80;
+const GROUP_WIDTH: usize = 16;
 
 /// Interning table for control sequence names (byte strings).
+///
+/// Stores all names contiguously in `arena` indexed by `offsets` and uses a
+/// deletion-free 16-way SwissTable (`ctrl` + `slots`), eliminating per-CS heap
+/// allocations while probing 16 buckets per SSE2 instruction with minimal
+/// branch misses on both hits and `\ifcsname` misses.
 pub struct CsTable {
-    names: Vec<Vec<u8>>,
-    map: std::collections::HashMap<Vec<u8>, CsId, std::hash::BuildHasherDefault<NameHasher>>,
+    arena: Vec<u8>,
+    /// Length `count + 1`; name of `id` is `arena[offsets[id]..offsets[id + 1]]`.
+    offsets: Vec<u32>,
+    /// SwissTable control bytes of length `cap + GROUP_WIDTH` (when `cap > 0`),
+    /// with `ctrl[cap..cap + 16]` mirroring `ctrl[0..16]`.
+    ctrl: Vec<u8>,
+    /// Parallel CS ids of length `cap`.
+    slots: Vec<CsId>,
+    /// `cap - 1` when non-empty, `0` when `slots` is empty.
+    mask: usize,
+    table_entries: usize,
     capacity_exceeded: bool,
     /// Ids of the 8-bit active characters, filled on first use.
     active_ids: Box<[CsId; 256]>,
@@ -176,6 +213,36 @@ pub struct CsTable {
     frozen_by_name: std::collections::HashMap<Vec<u8>, CsId, std::hash::BuildHasherDefault<NameHasher>>,
 }
 
+#[inline(always)]
+fn group_match(ctrl: &[u8], pos: usize, h2: u8) -> (u32, u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: `ctrl.len() == cap + 16` and `pos < cap`, so 16 bytes are valid.
+        unsafe {
+            let g = _mm_loadu_si128(ctrl.as_ptr().add(pos).cast());
+            let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(g, _mm_set1_epi8(h2 as i8))) as u32;
+            // Only `CTRL_EMPTY` (0x80) has bit 7 set.
+            let empty = _mm_movemask_epi8(g) as u32;
+            (eq, empty)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut eq = 0u32;
+        let mut empty = 0u32;
+        for i in 0..GROUP_WIDTH {
+            let b = ctrl[pos + i];
+            if b == h2 {
+                eq |= 1u32 << i;
+            } else if b == CTRL_EMPTY {
+                empty |= 1u32 << i;
+            }
+        }
+        (eq, empty)
+    }
+}
+
 impl CsTable {
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -183,22 +250,99 @@ impl CsTable {
 
     /// An empty table with room for `names` names.
     pub fn with_capacity(names: usize) -> Self {
+        let mut offsets = Vec::with_capacity(names.saturating_add(1));
+        offsets.push(0);
+        let (ctrl, slots, mask) = if names == 0 {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            let cap = (names.saturating_mul(4) / 3 + 1)
+                .next_power_of_two()
+                .max(GROUP_WIDTH);
+            (vec![CTRL_EMPTY; cap + GROUP_WIDTH], vec![0; cap], cap - 1)
+        };
         CsTable {
-            names: Vec::with_capacity(names),
-            map: std::collections::HashMap::with_capacity_and_hasher(names, Default::default()),
+            arena: Vec::with_capacity(names.saturating_mul(14)),
+            offsets,
+            ctrl,
+            slots,
+            mask,
+            table_entries: 0,
             capacity_exceeded: false,
             active_ids: Box::new([NO_ACTIVE_ID; 256]),
-            name_flags: Vec::new(),
+            name_flags: Vec::with_capacity(names),
             frozen: Default::default(),
             frozen_by_name: Default::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn push_arena_name(&mut self, name: &[u8]) -> CsId {
+        let id = (self.offsets.len() - 1) as CsId;
+        self.arena.extend_from_slice(name);
+        debug_assert!(self.arena.len() <= u32::MAX as usize);
+        self.offsets.push(self.arena.len() as u32);
+        id
+    }
+
+    #[inline(always)]
+    fn set_ctrl(&mut self, idx: usize, h2: u8) {
+        let cap = self.mask + 1;
+        debug_assert!(idx < cap);
+        // SAFETY: `ctrl.len() == cap + GROUP_WIDTH`.
+        unsafe {
+            *self.ctrl.get_unchecked_mut(idx) = h2;
+            if idx < GROUP_WIDTH {
+                *self.ctrl.get_unchecked_mut(cap + idx) = h2;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn insert_into_table(&mut self, h: u64, h2: u8, id: CsId) {
+        let mask = self.mask;
+        let mut pos = (h as usize) & mask;
+        let mut step = 0usize;
+        loop {
+            let (_, empty) = group_match(&self.ctrl, pos, h2);
+            if empty != 0 {
+                let idx = (pos + empty.trailing_zeros() as usize) & mask;
+                self.set_ctrl(idx, h2);
+                // SAFETY: `idx <= mask < slots.len()`.
+                unsafe {
+                    *self.slots.get_unchecked_mut(idx) = id;
+                }
+                return;
+            }
+            step += GROUP_WIDTH;
+            pos = (pos + step) & mask;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_table(&mut self) {
+        let old_cap = self.slots.len();
+        let new_cap = (old_cap.saturating_mul(2)).max(64);
+        let old_ctrl = std::mem::replace(&mut self.ctrl, vec![CTRL_EMPTY; new_cap + GROUP_WIDTH]);
+        let old_slots = std::mem::replace(&mut self.slots, vec![0; new_cap]);
+        self.mask = new_cap - 1;
+        for i in 0..old_cap {
+            let h2 = old_ctrl[i];
+            if h2 == CTRL_EMPTY {
+                continue;
+            }
+            let id = old_slots[i];
+            let start = self.offsets[id as usize] as usize;
+            let end = self.offsets[id as usize + 1] as usize;
+            let h = hash_cs_name(&self.arena[start..end]);
+            self.insert_into_table(h, h2, id);
         }
     }
 
     /// A new frozen id named `name`. `by_name` entries are found again by
     /// [`CsTable::frozen_lookup`].
     pub fn push_frozen(&mut self, name: &[u8], by_name: bool) -> CsId {
-        let id = self.names.len() as CsId;
-        self.names.push(name.to_vec());
+        let id = self.push_arena_name(name);
         self.name_flags.push(0);
         self.frozen.insert(id, by_name);
         if by_name {
@@ -229,27 +373,73 @@ impl CsTable {
         }
     }
 
+    #[inline]
     pub fn intern(&mut self, name: &[u8]) -> CsId {
         self.intern_with_limit(name, MAX_HASH_NAMES)
     }
 
     fn intern_with_limit(&mut self, name: &[u8], limit: usize) -> CsId {
-        if let Some(&id) = self.map.get(name) {
+        let h = hash_cs_name(name);
+        let h2 = (h >> 57) as u8;
+        if !self.slots.is_empty() {
+            let mask = self.mask;
+            let mut pos = (h as usize) & mask;
+            let mut step = 0usize;
+            let empty_idx = loop {
+                let (mut eq, empty) = group_match(&self.ctrl, pos, h2);
+                while eq != 0 {
+                    let bit = eq.trailing_zeros() as usize;
+                    let idx = (pos + bit) & mask;
+                    // SAFETY: `idx <= mask < slots.len()`, every occupied `id`
+                    // has valid `offsets[id]..offsets[id + 1] <= arena.len()`.
+                    let id = unsafe { *self.slots.get_unchecked(idx) } as usize;
+                    let start = unsafe { *self.offsets.get_unchecked(id) as usize };
+                    let end = unsafe { *self.offsets.get_unchecked(id + 1) as usize };
+                    if unsafe { self.arena.get_unchecked(start..end) } == name {
+                        return id as CsId;
+                    }
+                    eq &= eq - 1;
+                }
+                if empty != 0 {
+                    break (pos + empty.trailing_zeros() as usize) & mask;
+                }
+                step += GROUP_WIDTH;
+                pos = (pos + step) & mask;
+            };
+            // Main control reports the latched error at its next safe boundary.
+            // Until then, reuse the one valid overflow id so an expandable scan
+            // cannot allocate an unbounded number of additional names.
+            if self.capacity_exceeded {
+                return self.len().saturating_sub(1) as CsId;
+            }
+            if self.len() >= limit {
+                self.capacity_exceeded = true;
+            }
+            let id = self.push_arena_name(name);
+            self.name_flags.push(name_flags_of(name));
+            if (self.table_entries + 1) * 4 > self.slots.len() * 3 {
+                self.grow_table();
+                self.insert_into_table(h, h2, id);
+            } else {
+                self.set_ctrl(empty_idx, h2);
+                unsafe {
+                    *self.slots.get_unchecked_mut(empty_idx) = id;
+                }
+            }
+            self.table_entries += 1;
             return id;
         }
-        // Main control reports the latched error at its next safe boundary.
-        // Until then, reuse the one valid overflow id so an expandable scan
-        // cannot allocate an unbounded number of additional names.
         if self.capacity_exceeded {
-            return self.names.len().saturating_sub(1) as CsId;
+            return self.len().saturating_sub(1) as CsId;
         }
-        if self.names.len() >= limit {
+        if self.len() >= limit {
             self.capacity_exceeded = true;
         }
-        let id = self.names.len() as CsId;
-        self.names.push(name.to_vec());
+        self.grow_table();
+        let id = self.push_arena_name(name);
         self.name_flags.push(name_flags_of(name));
-        self.map.insert(name.to_vec(), id);
+        self.insert_into_table(h, h2, id);
+        self.table_entries = 1;
         id
     }
 
@@ -303,22 +493,58 @@ impl CsTable {
         self.capacity_exceeded = true;
     }
 
+    #[inline]
     pub fn lookup(&self, name: &[u8]) -> Option<CsId> {
-        self.map.get(name).copied()
+        if self.slots.is_empty() {
+            return None;
+        }
+        let h = hash_cs_name(name);
+        let h2 = (h >> 57) as u8;
+        let mask = self.mask;
+        let mut pos = (h as usize) & mask;
+        let mut step = 0usize;
+        loop {
+            let (mut eq, empty) = group_match(&self.ctrl, pos, h2);
+            while eq != 0 {
+                let bit = eq.trailing_zeros() as usize;
+                let idx = (pos + bit) & mask;
+                // SAFETY: `idx <= mask < slots.len()` and every occupied `id`
+                // has valid `offsets[id]..offsets[id + 1] <= arena.len()`.
+                let id = unsafe { *self.slots.get_unchecked(idx) } as usize;
+                let start = unsafe { *self.offsets.get_unchecked(id) as usize };
+                let end = unsafe { *self.offsets.get_unchecked(id + 1) as usize };
+                if unsafe { self.arena.get_unchecked(start..end) } == name {
+                    return Some(id as CsId);
+                }
+                eq &= eq - 1;
+            }
+            if empty != 0 {
+                return None;
+            }
+            step += GROUP_WIDTH;
+            pos = (pos + step) & mask;
+        }
     }
 
+    #[inline]
     pub fn name(&self, id: CsId) -> &[u8] {
-        self.names
-            .get(id as usize)
-            .map(|v| v.as_slice())
-            .unwrap_or(b"??")
+        let idx = id as usize;
+        if idx + 1 < self.offsets.len() {
+            let start = self.offsets[idx] as usize;
+            let end = self.offsets[idx + 1] as usize;
+            &self.arena[start..end]
+        } else {
+            b"??"
+        }
     }
+
+    #[inline]
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.offsets.len() - 1
     }
 
     pub fn all_ids(&self) -> impl Iterator<Item = CsId> {
-        0..self.names.len() as CsId
+        0..self.len() as CsId
     }
 }
 

@@ -211,7 +211,7 @@ impl<'a> R<'a> {
         Ok(n)
     }
     /// LEB128 unsigned integer (at most five bytes)
-    #[inline]
+    #[inline(always)]
     fn varint(&mut self) -> io::Result<u32> {
         if let Some(&byte) = self.b.get(self.p) {
             if byte < 0x80 {
@@ -219,6 +219,12 @@ impl<'a> R<'a> {
                 return Ok(u32::from(byte));
             }
         }
+        self.varint_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn varint_slow(&mut self) -> io::Result<u32> {
         let mut v = 0u32;
         for shift in (0..35).step_by(7) {
             let byte = self.u8()?;
@@ -2028,36 +2034,81 @@ fn read_trie(r: &mut R) -> io::Result<Trie> {
         return Err(bad("trie has no root"));
     }
     let mut nodes = Vec::with_capacity(n);
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(n / 4);
+    let b = r.b;
+    let mut p = r.p;
+    #[inline(always)]
+    fn next_u8(b: &[u8], p: &mut usize) -> io::Result<u8> {
+        let Some(&v) = b.get(*p) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "format truncated",
+            ));
+        };
+        *p += 1;
+        Ok(v)
+    }
+    #[cold]
+    #[inline(never)]
+    fn next_varint_slow(b: &[u8], p: &mut usize) -> io::Result<u32> {
+        let mut v = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = next_u8(b, p)?;
+            let part = u32::from(byte & 0x7f);
+            if shift == 28 && part > 0x0f {
+                break;
+            }
+            v |= part << shift;
+            if byte & 0x80 == 0 {
+                return Ok(v);
+            }
+        }
+        Err(bad("varint out of range"))
+    }
+    #[inline(always)]
+    fn next_varint(b: &[u8], p: &mut usize) -> io::Result<u32> {
+        if let Some(&byte) = b.get(*p) {
+            if byte < 0x80 {
+                *p += 1;
+                return Ok(u32::from(byte));
+            }
+        }
+        next_varint_slow(b, p)
+    }
     for i in 0..n as u32 {
-        let byte = r.u8()?;
-        let child = match r.varint()? {
+        let byte = next_u8(b, &mut p)?;
+        let child = match next_varint(b, &mut p)? {
             0 => NO_LINK,
             d => i
                 .checked_add(d)
                 .filter(|&c| (c as usize) < n)
                 .ok_or_else(|| bad("trie link"))?,
         };
-        let sibling = match r.varint()? {
+        let sibling = match next_varint(b, &mut p)? {
             0 => NO_LINK,
             d => i.checked_sub(d).ok_or_else(|| bad("trie link"))?,
         };
-        let k = r.varint()?;
-        let value = if k == 0 { NO_LINK } else { values.len() as u32 };
-        for j in 0..k {
-            let pos = r.varint()?;
-            let v = r.u8()?;
-            let next = if j + 1 == k {
-                NO_LINK
-            } else {
-                values.len() as u32 + 1
-            };
-            values.push(TrieValue {
-                pos,
-                value: v,
-                next,
-            });
-        }
+        let k = next_varint(b, &mut p)?;
+        let value = if k == 0 {
+            NO_LINK
+        } else {
+            let start = values.len() as u32;
+            for j in 0..k {
+                let pos = next_varint(b, &mut p)?;
+                let v = next_u8(b, &mut p)?;
+                let next = if j + 1 == k {
+                    NO_LINK
+                } else {
+                    values.len() as u32 + 1
+                };
+                values.push(TrieValue {
+                    pos,
+                    value: v,
+                    next,
+                });
+            }
+            start
+        };
         nodes.push(TrieNode {
             byte,
             child,
@@ -2065,13 +2116,14 @@ fn read_trie(r: &mut R) -> io::Result<Trie> {
             value,
         });
     }
+    r.p = p;
     let mut exceptions = crate::FxHashMap::default();
     let n = r.count()?;
     for _ in 0..n {
         let len = r.varint()? as usize;
         let k = r.take(len)?.to_vec();
         let np = r.varint()?;
-        let mut pts = Vec::new();
+        let mut pts = Vec::with_capacity(np as usize);
         for _ in 0..np {
             pts.push(r.varint()? as usize);
         }
