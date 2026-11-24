@@ -16,47 +16,115 @@ const UNEXPANDED_CS_FLAG: u32 = 0xE000_0000;
 /// for per-argument end offsets + room for argument tokens).
 const MIN_ARG_BUFFER: usize = 40;
 
+/// Per top-byte (`t.0 >> 24`) classification for `raw_token_fast`:
+/// - `0`: plain token returned as stored, brace delta 0
+/// - `1`: `{` (cat 1), brace delta +1
+/// - `-1`: `}` (cat 2), brace delta -1
+/// - `i8::MIN`: needs `raw_token_general` (`top in {9, 14, 15}`, `0x40..0x80`
+///   parameter references, or `0xFF` sentinels including `PAR_END`).
+static RAW_TOP_DELTA: [i8; 256] = {
+    let mut t = [0i8; 256];
+    t[1] = 1;
+    t[2] = -1;
+    t[9] = i8::MIN;
+    t[14] = i8::MIN;
+    t[15] = i8::MIN;
+    let mut i = 0x40;
+    while i < 0x80 {
+        t[i] = i8::MIN;
+        i += 1;
+    }
+    t[0xFF] = i8::MIN;
+    t
+};
+
+/// Per top-byte (`t.0 >> 24`) classification for `balanced_prefix`:
+/// - `0`: plain non-brace token (char in `{0, 3..=8, 10..=13}` or CS in `0x80..0xC0`)
+/// - `1`: `{` (cat 1)
+/// - `-1`: `}` (cat 2)
+/// - `i8::MIN`: guard token that stops `balanced_prefix`.
+static BALANCED_TOP_CLASS: [i8; 256] = {
+    let mut t = [i8::MIN; 256];
+    t[0] = 0;
+    t[1] = 1;
+    t[2] = -1;
+    let mut i = 3;
+    while i <= 8 {
+        t[i] = 0;
+        i += 1;
+    }
+    let mut i = 10;
+    while i <= 13 {
+        t[i] = 0;
+        i += 1;
+    }
+    let mut i = 0x80;
+    while i < 0xC0 {
+        t[i] = 0;
+        i += 1;
+    }
+    t
+};
+
 /// True when a token list token may be moved into balanced text as is: it
 /// is a brace, an ordinary character or a plain control sequence. Every
 /// other token (expansion guards, parameter references, sentinels, ignored
 /// characters and, in a short argument, \par) needs `raw_token`'s handling.
 #[inline(always)]
 fn plain_balanced_token(t: Token, long: bool, partoken: Token) -> bool {
-    let top = t.0 >> 24;
-    if top < 0x80 {
-        top <= 13 && top != 9
-    } else {
-        top < 0xC0 && (long || t != partoken)
-    }
+    BALANCED_TOP_CLASS[(t.0 >> 24) as usize] != i8::MIN && (long || t != partoken)
 }
 
-fn balanced_prefix_scalar(
+/// True when `t` is a plain balanced token that is neither `{` (cat 1) nor `}`
+/// (cat 2). Single L1 table lookup without a 50/50 char-vs-CS branch.
+#[inline(always)]
+fn plain_non_brace_balanced_token(t: Token, long: bool, partoken: Token) -> bool {
+    BALANCED_TOP_CLASS[(t.0 >> 24) as usize] == 0 && (long || t != partoken)
+}
+
+#[inline(always)]
+fn balanced_prefix_scalar_impl<const LONG: bool>(
     tokens: &[Token],
-    long: bool,
     partoken: Token,
     mut depth: i32,
 ) -> (usize, i32) {
     for (index, &t) in tokens.iter().enumerate() {
-        if !plain_balanced_token(t, long, partoken) {
+        if !LONG && t == partoken {
             return (index, depth);
         }
-        match t.0 >> 24 {
-            1 => depth += 1,
-            2 => {
-                depth -= 1;
-                if depth == 0 {
-                    return (index + 1, 0);
-                }
-            }
-            _ => {}
+        let cls = BALANCED_TOP_CLASS[(t.0 >> 24) as usize];
+        if cls == 0 {
+            continue;
+        }
+        if cls < -1 {
+            return (index, depth);
+        }
+        depth += i32::from(cls);
+        if depth == 0 {
+            return (index + 1, 0);
         }
     }
     (tokens.len(), depth)
 }
 
+#[inline]
+fn balanced_prefix_scalar(
+    tokens: &[Token],
+    long: bool,
+    partoken: Token,
+    depth: i32,
+) -> (usize, i32) {
+    if long {
+        balanced_prefix_scalar_impl::<true>(tokens, partoken, depth)
+    } else {
+        balanced_prefix_scalar_impl::<false>(tokens, partoken, depth)
+    }
+}
+
 /// The longest prefix of `tokens` that balanced text at brace depth `depth`
 /// (> 0) can take without per-token handling, and the depth after it. A
 /// depth of zero means the prefix ends with the closing brace.
+#[inline]
 fn balanced_prefix(tokens: &[Token], long: bool, partoken: CsId, depth: i32) -> (usize, i32) {
     let partoken = Token::from_cs(partoken);
     #[cfg(target_arch = "x86_64")]
@@ -73,53 +141,58 @@ unsafe fn balanced_prefix_avx2(
     tokens: &[Token],
     long: bool,
     partoken: Token,
-    mut depth: i32,
+    depth: i32,
 ) -> (usize, i32) {
     use std::arch::x86_64::*;
+    let zero = _mm256_setzero_si256();
+    let v_one = _mm256_set1_epi32(1);
+    let v_two = _mm256_set1_epi32(2);
+    let v_nine = _mm256_set1_epi32(9);
+    let v_thirteen = _mm256_set1_epi32(13);
+    let v_x80 = _mm256_set1_epi32(0x80);
+    let v_xbf = _mm256_set1_epi32(0xBF);
+    let v_par = _mm256_set1_epi32(partoken.0 as i32);
+    let mut depth_vec = _mm256_set1_epi32(depth);
     let mut position = 0;
     while tokens.len() - position >= 8 {
         // Token is repr(transparent) over u32 and eight initialized elements
         // remain. Unaligned loads support every token-slice starting offset.
         let values = _mm256_loadu_si256(tokens.as_ptr().add(position).cast());
         let top = _mm256_srli_epi32::<24>(values);
-        let opens = _mm256_cmpeq_epi32(top, _mm256_set1_epi32(1));
-        let closes = _mm256_cmpeq_epi32(top, _mm256_set1_epi32(2));
+        let opens = _mm256_cmpeq_epi32(top, v_one);
+        let closes = _mm256_cmpeq_epi32(top, v_two);
         let mut prefix = _mm256_sub_epi32(closes, opens);
-        // Inclusive prefix sums within each 128-bit half, then carry the
-        // low half's total into the high half.
+        // Inclusive prefix sums within each 128-bit half, then carry lane 3
+        // into the high 128-bit half in registers (no GPR round-trip).
         prefix = _mm256_add_epi32(prefix, _mm256_slli_si256::<4>(prefix));
         prefix = _mm256_add_epi32(prefix, _mm256_slli_si256::<8>(prefix));
-        let carry = _mm256_extract_epi32::<3>(prefix);
-        prefix = _mm256_add_epi32(
-            prefix,
-            _mm256_setr_epi32(0, 0, 0, 0, carry, carry, carry, carry),
-        );
-        let depths = _mm256_add_epi32(prefix, _mm256_set1_epi32(depth));
-        let ends = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
-            depths,
-            _mm256_setzero_si256(),
-        ))) as u32;
+        let low_in_hi = _mm256_permute2x128_si256::<0x08>(prefix, zero);
+        let carry_vec = _mm256_shuffle_epi32::<0xFF>(low_in_hi);
+        prefix = _mm256_add_epi32(prefix, carry_vec);
+        let depths = _mm256_add_epi32(prefix, depth_vec);
+        let ends =
+            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(depths, zero))) as u32;
         // The negation of `plain_balanced_token`, on the top byte.
-        let ignored = _mm256_cmpeq_epi32(top, _mm256_set1_epi32(9));
+        let ignored = _mm256_cmpeq_epi32(top, v_nine);
         let flagged_char = _mm256_and_si256(
-            _mm256_cmpgt_epi32(top, _mm256_set1_epi32(13)),
-            _mm256_cmpgt_epi32(_mm256_set1_epi32(0x80), top),
+            _mm256_cmpgt_epi32(top, v_thirteen),
+            _mm256_cmpgt_epi32(v_x80, top),
         );
-        let marked = _mm256_cmpgt_epi32(top, _mm256_set1_epi32(0xBF));
+        let marked = _mm256_cmpgt_epi32(top, v_xbf);
         let mut guards = _mm256_or_si256(_mm256_or_si256(ignored, flagged_char), marked);
         if !long {
-            guards = _mm256_or_si256(
-                guards,
-                _mm256_cmpeq_epi32(values, _mm256_set1_epi32(partoken.0 as i32)),
-            );
+            guards = _mm256_or_si256(guards, _mm256_cmpeq_epi32(values, v_par));
         }
         let guards = _mm256_movemask_ps(_mm256_castsi256_ps(guards)) as u32;
         if ends | guards != 0 {
             break;
         }
-        depth += _mm256_extract_epi32::<7>(prefix);
+        // Broadcast depths[7] across all 8 lanes for the next iteration.
+        let hi_dup = _mm256_permute2x128_si256::<0x11>(depths, depths);
+        depth_vec = _mm256_shuffle_epi32::<0xFF>(hi_dup);
         position += 8;
     }
+    let depth = _mm256_cvtsi256_si32(depth_vec);
     let (length, depth) = balanced_prefix_scalar(&tokens[position..], long, partoken, depth);
     (position + length, depth)
 }
@@ -182,6 +255,51 @@ mod balanced_scan_tests {
         assert_eq!(balanced_prefix(&par, false, 7, 1), (1, 1));
         assert_eq!(balanced_prefix(&par, true, 7, 1), (3, 0));
     }
+
+    #[test]
+    fn branchless_token_predicates_match_reference_over_all_top_bytes() {
+        let partoken = Token::from_cs(7);
+        for top in 0u32..=255 {
+            for low in [0u32, 7, 0x00FF_FFFE, 0x00FF_FFFF] {
+                let t = Token((top << 24) | low);
+                let ref_raw = if top == 0xFF {
+                    false
+                } else if t.0 >= 0x8000_0000 {
+                    t != PAR_END
+                } else {
+                    t.0 < PAR_REF_FLAG && !matches!(top, 9 | 14 | 15)
+                };
+                assert_eq!(Engine::is_plain_raw_token(t), ref_raw, "raw {:#x}", t.0);
+                if ref_raw {
+                    let expected_delta = match top {
+                        1 => 1,
+                        2 => -1,
+                        _ => 0,
+                    };
+                    assert_eq!(RAW_TOP_DELTA[top as usize], expected_delta);
+                }
+                for long in [false, true] {
+                    let ref_bal = if top < 0x80 {
+                        top <= 13 && top != 9
+                    } else {
+                        top < 0xC0 && (long || t != partoken)
+                    };
+                    assert_eq!(
+                        plain_balanced_token(t, long, partoken),
+                        ref_bal,
+                        "bal long={long} {:#x}",
+                        t.0
+                    );
+                    assert_eq!(
+                        plain_non_brace_balanced_token(t, long, partoken),
+                        ref_bal && top != 1 && top != 2,
+                        "non_brace long={long} {:#x}",
+                        t.0
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Which plain tokens (see `Engine::is_plain_raw_token`) `raw_token`'s fast
@@ -194,14 +312,6 @@ enum AlignFilter {
     /// must not swallow the frozen end of a cell (a `\cr`/`\crcr` meaning,
     /// see `raw_token_general`): only tokens that are no row delimiter pass.
     Delimiters,
-}
-
-impl AlignFilter {
-    #[inline(always)]
-    fn passes(self, t: Token, eqtb: &crate::eqtb::Eqtb) -> bool {
-        Engine::is_plain_raw_token(t)
-            && (self == AlignFilter::None || !crate::align::is_row_delimiter(t, eqtb))
-    }
 }
 
 /// Count one expansion step; true once the step count passes a nonzero
@@ -395,11 +505,13 @@ impl Engine {
     /// position is live.
     #[inline(always)]
     fn raw_token_fast(&mut self, filter: AlignFilter) -> Option<Token> {
-        let token = if let Some(&t) = self.pushed.last() {
+        let (token, delta) = if let Some(&t) = self.pushed.last() {
+            let delta = RAW_TOP_DELTA[(t.0 >> 24) as usize];
             // While an alignment is scanned, pushback below
             // `align_pushed_base` predates the template and waits (see
             // `raw_token_general`); pushback above it is read as usual.
-            if !filter.passes(t, &self.eqtb)
+            if delta == i8::MIN
+                || (filter != AlignFilter::None && crate::align::is_row_delimiter(t, &self.eqtb))
                 || (self.scanner_status == ScannerStatus::Aligning
                     && self.pushed.len() <= self.align_pushed_base)
                 || self.lua_cb[crate::lua_callbacks::Cb::ShowErrorHook as usize] > 0
@@ -408,7 +520,7 @@ impl Engine {
             }
             self.pushed.pop();
             self.pushed_read = t;
-            t
+            (t, delta)
         } else {
             use crate::input::Source;
             let eqtb = &self.eqtb;
@@ -424,18 +536,19 @@ impl Engine {
             // token buffer the source owns and never changes, and
             // `pos < end <=` its length.
             let t = unsafe { *cursor.seg.add(cursor.pos as usize) };
-            if !filter.passes(t, eqtb) {
+            let delta = RAW_TOP_DELTA[(t.0 >> 24) as usize];
+            if delta == i8::MIN
+                || (filter != AlignFilter::None && crate::align::is_row_delimiter(t, eqtb))
+            {
                 return None;
             }
             cursor.pos += 1;
             let depth = cursor.trace_depth;
             self.unwind_macro_trace(depth);
-            t
+            (t, delta)
         };
-        match token.0 >> 24 {
-            1 => self.align_brace_depth = self.align_brace_depth.saturating_add(1),
-            2 => self.align_brace_depth = self.align_brace_depth.saturating_sub(1),
-            _ => {}
+        if delta != 0 {
+            self.align_brace_depth = self.align_brace_depth.saturating_add(i32::from(delta));
         }
         Some(token)
     }
@@ -478,16 +591,13 @@ impl Engine {
             && !self.align_delimiter_hidden()
     }
 
-    /// Tokens `raw_token` returns exactly as they are stored: control
-    /// sequences and sentinels other than `\par` markers, and characters
-    /// that are neither ignored, comments, invalid nor parameter references.
+    /// Tokens `raw_token_fast` returns as stored: single L1 table lookup
+    /// avoiding the 50/50 char-vs-CS branch (sentinels with top byte `0xFF`
+    /// fall through to `raw_token_general`).
+    #[cfg(test)]
     #[inline(always)]
     fn is_plain_raw_token(t: Token) -> bool {
-        if t.0 >= 0x8000_0000 {
-            t != PAR_END
-        } else {
-            t.0 < PAR_REF_FLAG && !matches!(t.0 >> 24, 9 | 14 | 15)
-        }
+        RAW_TOP_DELTA[(t.0 >> 24) as usize] != i8::MIN
     }
 
     #[inline(never)]
@@ -3795,16 +3905,25 @@ impl Engine {
         length += 1;
         let outer = self.check_outer_enabled();
         let taken = if t.0 >> 24 == 1 {
-            // Inside an alignment with negative align_brace_depth (e.g. a `}`
-            // closed an implicit `\bgroup`), this `{` can raise depth back to
-            // zero and expose a live `&`/`\cr` inside the group.
-            if self.align_state != crate::align::PH_IDLE && self.align_brace_depth < 0 {
+            let group = &segment[length..];
+            if group.is_empty() {
+                // `{` sits right at a segment boundary (e.g. `{#1}`); avoid
+                // calling `balanced_prefix` on an empty slice.
+                self.align_brace_depth = self.align_brace_depth.saturating_add(1);
+                UndelimitedArg::Group
+            } else if group[0].0 >> 24 == 2 {
+                // Empty `{}` argument: no tokens between `{` and `}`, net depth 0.
+                length += 1;
+                UndelimitedArg::Taken
+            } else if self.align_state != crate::align::PH_IDLE && self.align_brace_depth < 0 {
+                // Inside an alignment with negative align_brace_depth (e.g. a `}`
+                // closed an implicit `\bgroup`), this `{` can raise depth back to
+                // zero and expose a live `&`/`\cr` inside the group.
                 self.align_brace_depth = self.align_brace_depth.saturating_add(1);
                 UndelimitedArg::Group
             } else {
                 // A group that closes inside the segment leaves
                 // align_brace_depth as it was.
-                let group = &segment[length..];
                 let (size, after) = balanced_prefix(group, long, partoken, 1);
                 let content = &group[..size.saturating_sub(1)];
                 if after != 0
@@ -3825,9 +3944,8 @@ impl Engine {
         } else {
             // A token that raw_token returns, unfreeze_input_token keeps and
             // that neither ends the call nor opens a group.
-            if !plain_balanced_token(t, long, Token::from_cs(partoken))
-                || t.0 >> 24 == 2
-                || (t.is_cs() && self.cs.is_active(t.cs_id()))
+            if !plain_non_brace_balanced_token(t, long, Token::from_cs(partoken))
+                || (maybe_active_cs && t.is_cs() && self.cs.is_active(t.cs_id()))
                 || (outer && self.is_outer_macro_token(t))
                 || (align_live && crate::align::is_row_delimiter(t, &self.eqtb))
             {
@@ -4359,42 +4477,58 @@ impl Engine {
         depth: &mut i32,
         scanned: &mut usize,
     ) -> Option<bool> {
-        self.ensure_nonempty_list_front(false);
-        if !(self.align_state == crate::align::PH_IDLE
-            || (!self.align_macro_arg && self.align_brace_depth >= *depth))
-        {
-            return None;
-        }
         let partoken = self.partoken_id();
         let check_outer = self.check_outer_enabled();
-        let (segment, trace_depth, maybe_active_cs) = self.token_list_front_with_active()?;
-        let (mut length, mut after) = balanced_prefix(segment, long, partoken, *depth);
-        // Active-CS tokens and \outer macros need the token-by-token path.
-        if maybe_active_cs || check_outer {
-            if let Some(slow_pos) = self.find_slow_balanced_token(&segment[..length], check_outer) {
-                (length, after) = balanced_prefix(&segment[..slow_pos], long, partoken, *depth);
+        let mut took_any = false;
+        loop {
+            self.ensure_nonempty_list_front(false);
+            if !(self.align_state == crate::align::PH_IDLE
+                || (!self.align_macro_arg && self.align_brace_depth >= *depth))
+            {
+                return took_any.then_some(false);
+            }
+            let Some((segment, trace_depth, maybe_active_cs)) = self.token_list_front_with_active()
+            else {
+                return took_any.then_some(false);
+            };
+            let (mut length, mut after) = balanced_prefix(segment, long, partoken, *depth);
+            // Active-CS tokens and \outer macros need the token-by-token path.
+            if maybe_active_cs || check_outer {
+                if let Some(slow_pos) =
+                    self.find_slow_balanced_token(&segment[..length], check_outer)
+                {
+                    (length, after) =
+                        balanced_prefix(&segment[..slow_pos], long, partoken, *depth);
+                }
+            }
+            let mut content = length - usize::from(after == 0);
+            // The token-by-token loop reports an overlong text before its first
+            // excess token.
+            let room = crate::input::MAX_TOKEN_LIST_TOKENS - *scanned;
+            if content > room {
+                (length, after) = balanced_prefix(&segment[..room], long, partoken, *depth);
+                content = length;
+            }
+            if length == 0 {
+                return took_any.then_some(false);
+            }
+            let exhausted_segment = length == segment.len();
+            if collect {
+                out.extend_from_slice(&segment[..content]);
+            }
+            self.consume_token_list_front(length, trace_depth);
+            // raw_token() counts every brace it fetches in align_brace_depth.
+            self.align_brace_depth = self.align_brace_depth.saturating_add(after - *depth);
+            *depth = after;
+            *scanned += content;
+            if after == 0 {
+                return Some(true);
+            }
+            took_any = true;
+            if !exhausted_segment {
+                return Some(false);
             }
         }
-        let mut content = length - usize::from(after == 0);
-        // The token-by-token loop reports an overlong text before its first
-        // excess token.
-        let room = crate::input::MAX_TOKEN_LIST_TOKENS - *scanned;
-        if content > room {
-            (length, after) = balanced_prefix(&segment[..room], long, partoken, *depth);
-            content = length;
-        }
-        if length == 0 {
-            return None;
-        }
-        if collect {
-            out.extend_from_slice(&segment[..content]);
-        }
-        self.consume_token_list_front(length, trace_depth);
-        // raw_token() counts every brace it fetches in align_brace_depth.
-        self.align_brace_depth = self.align_brace_depth.saturating_add(after - *depth);
-        *depth = after;
-        *scanned += content;
-        Some(after == 0)
     }
 
     /// Move the run of tokens at the front of the current token list that a
