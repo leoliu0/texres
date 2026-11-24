@@ -1462,7 +1462,6 @@ impl LuaState {
                 continue;
             }
 
-
             match get_metamethod_event(self, &value, TmKind::Close) {
                 Some(close_fn) => self.call_close_method(&close_fn, &value, None)?,
                 // A userdata without a `__close` metamethod uses its trait-based close.
@@ -1475,7 +1474,11 @@ impl LuaState {
 
     /// `UserDataTrait::lua_close` of the full userdata in stack slot `tbc_idx`.
     fn close_userdata_trait(&mut self, tbc_idx: usize) {
-        if let Some(ud_mut) = self.stack_mut().get_mut(tbc_idx).and_then(|v| v.as_userdata_mut()) {
+        if let Some(ud_mut) = self
+            .stack_mut()
+            .get_mut(tbc_idx)
+            .and_then(|v| v.as_userdata_mut())
+        {
             ud_mut.get_trait_mut().lua_close();
         }
     }
@@ -1551,7 +1554,6 @@ impl LuaState {
             if value.is_falsy() {
                 continue;
             }
-
 
             let caller_depth = self.call_depth();
             let result = match get_metamethod_event(self, &value, TmKind::Close) {
@@ -2006,7 +2008,10 @@ impl LuaState {
     #[cold]
     #[inline(never)]
     fn c_stack_overflow(&mut self, in_error_handler: bool) -> LuaResult<()> {
-        if self.current_frame().is_some_and(|ci| ci.is_lua() && ci.pc == 0) {
+        if self
+            .current_frame()
+            .is_some_and(|ci| ci.is_lua() && ci.pc == 0)
+        {
             self.pop_frame();
         }
         if in_error_handler {
@@ -2146,12 +2151,9 @@ impl LuaState {
         if self.call_depth == 0 {
             return 0;
         }
-
-        let frame = &self.call_stack[self.call_depth - 1];
+        let frame = unsafe { &*self.current_ci };
         let base = frame.base;
         let top = frame.top as usize;
-
-        // Arguments are from base to top-1
         top.saturating_sub(base)
     }
 
@@ -2719,8 +2721,9 @@ impl LuaState {
         let message = match &self.global_state().error_msg {
             _ if matches!(e, LuaError::OutOfMemory) => None,
             ErrorMsg::Msg(msg) => Some(msg.clone()),
-            ErrorMsg::Object(obj) => lauxlib::to_lstr(self, obj)
-                .map(|text| String::from_utf8_lossy(&text).into_owned()),
+            ErrorMsg::Object(obj) => {
+                lauxlib::to_lstr(self, obj).map(|text| String::from_utf8_lossy(&text).into_owned())
+            }
             _ => None,
         };
         let handler = LuaValue::cfunction(Self::host_message_handler);
@@ -2734,7 +2737,11 @@ impl LuaState {
                     .unwrap_or_else(|| full.clone());
                 self.set_top_raw(func_idx);
                 self.global_state_mut().error_msg = ErrorMsg::Traced { message, full };
-                if error_in_handler { LuaError::ErrorInErrorHandling } else { e }
+                if error_in_handler {
+                    LuaError::ErrorInErrorHandling
+                } else {
+                    e
+                }
             }
             Err(error) => {
                 while self.call_depth() > 0 {
@@ -2757,7 +2764,12 @@ impl LuaState {
     /// object (a GC root) from here on.
     #[cold]
     #[inline(never)]
-    fn unwind_foreign_error(&mut self, e: LuaError, initial_depth: usize, func_idx: usize) -> LuaError {
+    fn unwind_foreign_error(
+        &mut self,
+        e: LuaError,
+        initial_depth: usize,
+        func_idx: usize,
+    ) -> LuaError {
         if self.call_depth() <= initial_depth {
             // Failed before a frame existed (e.g. calling a non-function).
             self.set_top_raw(func_idx);
@@ -2767,7 +2779,11 @@ impl LuaState {
             Ok((err, error_in_handler)) => {
                 self.set_top_raw(func_idx);
                 self.set_error_object(err);
-                if error_in_handler { LuaError::ErrorInErrorHandling } else { e }
+                if error_in_handler {
+                    LuaError::ErrorInErrorHandling
+                } else {
+                    e
+                }
             }
             Err(error) => {
                 while self.call_depth() > initial_depth {
@@ -3042,7 +3058,8 @@ impl LuaState {
         let foreign = !outer.is_null() && !std::ptr::eq(outer, me);
         let result = 'call: {
             // Resolve __call metamethod chain if needed
-            let (actual_arg_count, ccmt_depth) = match resolve_call_chain(self, func_idx, arg_count) {
+            let (actual_arg_count, ccmt_depth) = match resolve_call_chain(self, func_idx, arg_count)
+            {
                 Ok(resolved) => resolved,
                 Err(error) => break 'call Err(error),
             };
@@ -3954,26 +3971,26 @@ impl LuaState {
                     }
                     self.close_upvalues(close_level);
                     let handler = is_xpcall.then_some(xpcall_handler);
-                    let result_err = match self.close_tbc_with_handler(close_level, error_val, handler)
-                    {
-                        Ok(()) => error_val,
-                        Err(LuaError::Yield) => {
-                            // A __close yielded during error recovery: mark the
-                            // pcall frame so finish_c_frame sets up the error
-                            // result once the remaining variables are closed.
-                            if pcall_frame_idx < self.call_depth() {
-                                let ci = self.get_call_info_mut(pcall_frame_idx);
-                                ci.call_status |= CIST_RECST;
+                    let result_err =
+                        match self.close_tbc_with_handler(close_level, error_val, handler) {
+                            Ok(()) => error_val,
+                            Err(LuaError::Yield) => {
+                                // A __close yielded during error recovery: mark the
+                                // pcall frame so finish_c_frame sets up the error
+                                // result once the remaining variables are closed.
+                                if pcall_frame_idx < self.call_depth() {
+                                    let ci = self.get_call_info_mut(pcall_frame_idx);
+                                    ci.call_status |= CIST_RECST;
+                                }
+                                if !self.has_error_object() {
+                                    self.set_error_object(error_val);
+                                }
+                                self.yielded = true;
+                                let yield_vals = self.take_yield();
+                                return Ok((false, yield_vals));
                             }
-                            if !self.has_error_object() {
-                                self.set_error_object(error_val);
-                            }
-                            self.yielded = true;
-                            let yield_vals = self.take_yield();
-                            return Ok((false, yield_vals));
-                        }
-                        Err(_) => self.take_error_object(),
-                    };
+                            Err(_) => self.take_error_object(),
+                        };
 
                     if has_c_continuation {
                         // lua_pcallk resumes its continuation with the
@@ -4293,7 +4310,10 @@ impl LuaState {
             }
             LuaValueKind::Float => {
                 if let Some(n) = value.as_number() {
-                    return Ok(crate::stdlib::numfmt::lua_float_to_string(n, self.global_state().language()));
+                    return Ok(crate::stdlib::numfmt::lua_float_to_string(
+                        n,
+                        self.global_state().language(),
+                    ));
                 }
             }
             LuaValueKind::String => {

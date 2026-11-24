@@ -237,7 +237,8 @@ impl MacroArgs {
 
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<&[Token]> {
-        (index < self.count as usize).then(|| &self.toks[self.start(index)..self.ends[index] as usize])
+        (index < self.count as usize)
+            .then(|| &self.toks[self.start(index)..self.ends[index] as usize])
     }
 
     /// The lengths of the collected arguments, in order.
@@ -292,7 +293,7 @@ impl MacroFrame {
         let end = plan
             .references
             .first()
-            .map_or(plan.body.len(), |&(position, _)| position);
+            .map_or(plan.body.len(), |&(position, _)| position as usize);
         MacroFrame {
             seg: plan.body.as_ptr(),
             pos: 0,
@@ -316,15 +317,13 @@ impl MacroFrame {
 
     #[inline(always)]
     pub fn next_token(&mut self) -> Option<Token> {
-        loop {
-            if let Some(t) = self.peek_token() {
-                self.pos += 1;
-                return Some(t);
-            }
-            if !self.next_segment() {
-                return None;
-            }
+        if self.pos >= self.end && !self.advance_segment() {
+            return None;
         }
+        // SAFETY: `advance_segment` establishes `pos < end` within `seg`.
+        let t = unsafe { *self.seg.add(self.pos) };
+        self.pos += 1;
+        Some(t)
     }
 
     /// The next token of the current segment, without consuming it; `None`
@@ -338,12 +337,65 @@ impl MacroFrame {
     /// frame is exhausted.
     #[inline]
     pub(crate) fn advance_segment(&mut self) -> bool {
-        while self.pos >= self.end {
-            if !self.next_segment() {
+        if self.pos < self.end {
+            return true;
+        }
+        self.advance_segment_slow()
+    }
+
+    /// Step across empty body slices and empty/omitted arguments in registers
+    /// until a non-empty segment is reached, or mark the frame exhausted.
+    fn advance_segment_slow(&mut self) -> bool {
+        let refs = &*self.plan.references;
+        let body_len = self.plan.body.len();
+        let arg_count = self.args.count;
+        let mut next_ref = self.next_ref as usize;
+        let mut in_arg = self.in_arg;
+        let mut resume = self.resume as usize;
+        loop {
+            let body_from = if in_arg {
+                in_arg = false;
+                resume
+            } else if let Some(&(position, index)) = refs.get(next_ref) {
+                let pos_usize = position as usize;
+                next_ref += 1;
+                resume = pos_usize + 1;
+                if index < arg_count {
+                    let i = index as usize;
+                    let start = self.args.start(i);
+                    let end = self.args.ends[i] as usize;
+                    if start < end {
+                        self.next_ref = next_ref as u32;
+                        self.resume = resume as u32;
+                        self.in_arg = true;
+                        self.seg = self.args.toks.as_ptr();
+                        self.pos = start;
+                        self.end = end;
+                        return true;
+                    }
+                }
+                pos_usize + 1
+            } else {
+                self.next_ref = next_ref as u32;
+                self.resume = resume as u32;
+                self.in_arg = false;
+                self.pos = body_len;
+                self.end = body_len;
                 return false;
+            };
+            let body_end = refs
+                .get(next_ref)
+                .map_or(body_len, |&(position, _)| position as usize);
+            if body_from < body_end {
+                self.next_ref = next_ref as u32;
+                self.resume = resume as u32;
+                self.in_arg = false;
+                self.seg = self.plan.body.as_ptr();
+                self.pos = body_from;
+                self.end = body_end;
+                return true;
             }
         }
-        true
     }
 
     /// The undelivered rest of the current body or argument segment.
@@ -365,36 +417,6 @@ impl MacroFrame {
         self.pos += count;
     }
 
-    /// Move to the segment after the current one; false at the end.
-    fn next_segment(&mut self) -> bool {
-        let body_from = if self.in_arg {
-            self.in_arg = false;
-            self.resume as usize
-        } else if let Some(&(position, index)) = self.plan.references.get(self.next_ref as usize) {
-            self.next_ref += 1;
-            self.resume = position as u32 + 1;
-            if index < self.args.count as usize {
-                self.in_arg = true;
-                self.seg = self.args.toks.as_ptr();
-                self.pos = self.args.start(index);
-                self.end = self.args.ends[index] as usize;
-                return true;
-            }
-            // A reference beyond the supplied arguments contributes nothing.
-            position + 1
-        } else {
-            return false;
-        };
-        self.seg = self.plan.body.as_ptr();
-        self.pos = body_from;
-        self.end = self
-            .plan
-            .references
-            .get(self.next_ref as usize)
-            .map_or(self.plan.body.len(), |&(position, _)| position);
-        true
-    }
-
     /// A number that changes whenever a token is delivered.
     pub(crate) fn signature(&self) -> usize {
         self.pos << 8 ^ (self.next_ref as usize) << 1 ^ usize::from(self.in_arg)
@@ -408,10 +430,14 @@ impl MacroFrame {
         if !self.in_arg {
             return (&self.plan.body, self.pos, None);
         }
-        let index = self.plan.references[self.next_ref as usize - 1].1;
+        let index = self.plan.references[self.next_ref as usize - 1].1 as usize;
         let start = self.args.start(index);
         let arg = &self.args.toks[start..self.end];
-        (&self.plan.body, self.resume as usize, Some((arg, self.pos - start)))
+        (
+            &self.plan.body,
+            self.resume as usize,
+            Some((arg, self.pos - start)),
+        )
     }
 
     /// Take the argument buffer of a frame that is about to be dropped.
@@ -519,7 +545,9 @@ impl InputStack {
     /// after any token has been read from the stack.
     pub(crate) fn signature(&self) -> (usize, usize) {
         let position = match self.stack.last() {
-            Some(Source::File { line_no, line_pos, .. }) => (*line_no as usize).wrapping_mul(1 << 20) ^ *line_pos,
+            Some(Source::File {
+                line_no, line_pos, ..
+            }) => (*line_no as usize).wrapping_mul(1 << 20) ^ *line_pos,
             Some(Source::TokList { pos, .. }) => *pos,
             Some(Source::MacroFrame(frame)) => frame.signature(),
             None => 0,
@@ -900,7 +928,12 @@ impl InputStack {
     }
 
     /// Push a file whose lines come from an `open_read_file` object.
-    pub(crate) fn push_reader_file(&mut self, name: String, reader: u32, included_from: Option<SourceMark>) {
+    pub(crate) fn push_reader_file(
+        &mut self,
+        name: String,
+        reader: u32,
+        included_from: Option<SourceMark>,
+    ) {
         self.push_file_from(name, Vec::<u8>::new(), included_from);
         if let Some(Source::File { lua_reader, .. }) = self.stack.last_mut() {
             *lua_reader = reader;
@@ -1032,9 +1065,10 @@ impl InputStack {
         {
             return (origin.name.clone(), *line_no);
         }
-        self.last_finished_file
-            .as_ref()
-            .map_or_else(|| (Rc::from(""), 0), |context| (Rc::from(context.name.as_str()), context.line))
+        self.last_finished_file.as_ref().map_or_else(
+            || (Rc::from(""), 0),
+            |context| (Rc::from(context.name.as_str()), context.line),
+        )
     }
 
     /// The innermost open file's bookmark origin and current line, without
@@ -1042,7 +1076,9 @@ impl InputStack {
     #[inline]
     pub(crate) fn top_file_origin(&self) -> Option<(&Rc<MarkOrigin>, u32)> {
         match self.top_file()? {
-            Source::File { origin, line_no, .. } => Some((origin, *line_no)),
+            Source::File {
+                origin, line_no, ..
+            } => Some((origin, *line_no)),
             _ => None,
         }
     }
@@ -1052,8 +1088,15 @@ impl InputStack {
     /// Lua chunk) has no name of its own and defers to the file below it.
     pub(crate) fn tex_error_file(&self) -> Option<(Rc<str>, u32)> {
         self.stack.iter().rev().find_map(|source| match source {
-            Source::File { name, origin, line_no, .. }
-                if !matches!(name.as_str(), "<scantokens>" | "<scantextokens>" | "<directlua>") =>
+            Source::File {
+                name,
+                origin,
+                line_no,
+                ..
+            } if !matches!(
+                name.as_str(),
+                "<scantokens>" | "<scantextokens>" | "<directlua>"
+            ) =>
             {
                 Some((origin.name.clone(), *line_no))
             }

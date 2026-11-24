@@ -10,7 +10,7 @@
 //! [`UserDataRef`], [`Value`]) that the existing liveness checks police, and
 //! results are anchored on the call's stack as they are pushed.
 
-use crate::lua_api::{LuaApi, LuaFunction, LuaString, LuaTable, Lua, Value};
+use crate::lua_api::{Lua, LuaApi, LuaFunction, LuaString, LuaTable, Value};
 use crate::stdlib::lauxlib;
 use crate::{
     FromLua, IntoLua, LuaError, LuaResult, LuaState, LuaValueKind, UserDataRef, UserDataTrait,
@@ -40,6 +40,32 @@ impl CallbackLua<'_> {
     pub fn arg_bytes<R>(&self, index: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let value = self.state.get_arg(index)?;
         value.as_bytes().map(f)
+    }
+
+    /// Borrow typed userdata at argument `index` (1-based) directly on the VM
+    /// stack without creating or dropping a registry handle.
+    #[inline]
+    pub fn arg_userdata_mut<T: UserDataTrait + 'static, R>(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let value = self.state.get_arg(index)?;
+        let ud = value.as_userdata_mut()?.downcast_mut::<T>()?;
+        Some(f(ud))
+    }
+
+    /// Exact integer value of argument `index` (Lua `math.tointeger` semantics:
+    /// integers or floats with an exact integer value; strings are not coerced).
+    #[inline]
+    pub fn arg_integer(&self, index: usize) -> Option<i64> {
+        self.state.get_arg(index)?.as_integer()
+    }
+
+    /// Numeric value of argument `index` (integer or float; strings not coerced).
+    #[inline]
+    pub fn arg_number(&self, index: usize) -> Option<f64> {
+        self.state.get_arg(index)?.as_number()
     }
 
     /// Argument `index` (1-based) converted to `T`; an absent argument is nil.
@@ -75,6 +101,64 @@ impl CallbackLua<'_> {
     /// pushed, to be added to the closure's result count.
     pub fn push<T: IntoLua>(&mut self, value: T) -> LuaResult<usize> {
         self.state.push_multi(value)
+    }
+
+    /// Push `nil` directly onto the VM stack without `IntoLua` dispatch.
+    #[inline]
+    pub fn push_nil(&mut self) -> LuaResult<usize> {
+        self.state.push_value(crate::LuaValue::nil())?;
+        Ok(1)
+    }
+
+    /// Push a boolean directly onto the VM stack.
+    #[inline]
+    pub fn push_bool(&mut self, value: bool) -> LuaResult<usize> {
+        self.state.push_value(crate::LuaValue::boolean(value))?;
+        Ok(1)
+    }
+
+    /// Push an integer directly onto the VM stack.
+    #[inline]
+    pub fn push_int(&mut self, value: i64) -> LuaResult<usize> {
+        self.state.push_value(crate::LuaValue::integer(value))?;
+        Ok(1)
+    }
+
+    /// Push a float directly onto the VM stack.
+    #[inline]
+    pub fn push_float(&mut self, value: f64) -> LuaResult<usize> {
+        self.state.push_value(crate::LuaValue::float(value))?;
+        Ok(1)
+    }
+
+    /// Create a Lua byte string and push it directly onto the VM stack without
+    /// allocating an intermediate `Vec<u8>` or registry `LuaString` handle.
+    #[inline]
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> LuaResult<usize> {
+        let val = self.state.create_bytes(bytes)?;
+        self.state.push_value(val)?;
+        Ok(1)
+    }
+
+    /// Create a pre-sized Lua array table `[1..=len]` of integers and push it
+    /// directly onto the VM stack in a single allocation.
+    pub fn push_int_array(
+        &mut self,
+        values: impl ExactSizeIterator<Item = i64>,
+    ) -> LuaResult<usize> {
+        let len = values.len();
+        let tbl_val = self.state.create_table(len, 0)?;
+        self.state.push_value(tbl_val)?;
+        if let Some(table) = tbl_val.as_table_mut() {
+            for (idx, v) in values.enumerate() {
+                let key = (idx + 1) as i64;
+                let lv = crate::LuaValue::integer(v);
+                if !table.impl_table.fast_seti(key, lv) {
+                    self.state.raw_seti(&tbl_val, key, lv);
+                }
+            }
+        }
+        Ok(1)
     }
 
     pub fn create_table(&mut self) -> LuaResult<LuaTable> {

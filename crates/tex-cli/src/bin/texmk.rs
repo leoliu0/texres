@@ -14,10 +14,10 @@
 
 #[path = "../bibtex/mod.rs"]
 mod embedded_bibtex;
-#[path = "../index/mod.rs"]
-mod embedded_index;
 #[path = "pdflatex.rs"]
 mod embedded_engine;
+#[path = "../index/mod.rs"]
+mod embedded_index;
 #[path = "latexdiff.rs"]
 mod latexdiff;
 #[path = "../watch/mod.rs"]
@@ -178,17 +178,30 @@ fn substitute_placeholders(command: &str, opt: &Options) -> String {
     } else {
         opt.file.display().to_string()
     };
-    let basename = Path::new(&texfile).file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    let basename = Path::new(&texfile)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let root = opt.jobname.clone().unwrap_or_else(|| basename.clone());
     let prefix = |dir: &str| match dir {
         "." => String::new(),
         dir if dir.ends_with(['/', '\\', ':']) => dir.to_string(),
         dir => format!("{dir}/"),
     };
-    let out_dir = opt.out_dir.as_ref().map_or_else(|| ".".to_string(), |dir| dir.display().to_string());
-    let aux_dir = opt.aux_dir.as_ref().map_or_else(|| out_dir.clone(), |dir| dir.display().to_string());
+    let out_dir = opt
+        .out_dir
+        .as_ref()
+        .map_or_else(|| ".".to_string(), |dir| dir.display().to_string());
+    let aux_dir = opt
+        .aux_dir
+        .as_ref()
+        .map_or_else(|| out_dir.clone(), |dir| dir.display().to_string());
     let (out_prefix, aux_prefix) = (prefix(&out_dir), prefix(&aux_dir));
-    let view = if opt.view_none { String::new() } else { format!("{out_prefix}{root}.pdf") };
+    let view = if opt.view_none {
+        String::new()
+    } else {
+        format!("{out_prefix}{root}.pdf")
+    };
     let mut table = vec![
         ("%A", quoted(&basename)),
         ("%B", quoted(&root)),
@@ -216,7 +229,10 @@ fn substitute_placeholders(command: &str, opt: &Options) -> String {
     let mut out = String::with_capacity(command.len());
     let mut chars = command.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        let next = chars.peek().map(|&(_, next)| next).filter(|&next| c == '%' && next != '\n');
+        let next = chars
+            .peek()
+            .map(|&(_, next)| next)
+            .filter(|&next| c == '%' && next != '\n');
         let Some(next) = next else {
             out.push(c);
             continue;
@@ -250,113 +266,547 @@ fn run_hooks(commands: &[String], opt: &Options) {
 /// Packages and classes which TeX Live compiles only with a Unicode engine
 /// (XeTeX or LuaTeX); pdfLaTeX rejects them or lacks their fonts.
 const UNICODE_ENGINE_PACKAGES: &[&str] = &[
-    "aidisclose", "akshar", "arabdoc-bib", "arabdoc-glossary", "arabdoc-setup", "arabxetex",
-    "babelbidi", "bacex", "bidi", "bidi-atbegshi", "bidicontour", "bidihl", "bidipagegrid",
-    "bidishadowtext", "brandstyler", "causalmodels", "churchslavonic", "codemwe", "cqubeamer",
-    "ctex", "datemultical", "ecnuvi", "exam-rtl", "facture-belge-simple-sans-tva", "fariscovernew",
-    "fixlatvian", "fontbook", "fontspec", "fontwrap", "graph-theory-symbol", "hanzibox", "hawkdraw",
-    "hithesis", "hvarabic", "impe", "interchar", "jiffy", "kurdishlipsum", "langsci-affiliations",
-    "langsci-bidi", "langsci-gb4e", "langsci-lgr", "langsci-optional", "langsci-plot-templates",
-    "langsci-subparts", "langsci-tbls", "langsci-textipa", "latexbangla", "marathi",
-    "math-shorthandz", "mathspec", "mayanumber", "na-box", "na-list", "na-position", "parsa",
-    "pmhanguljamo", "polyglossia", "programmes-cpge", "sblfonts", "sexam", "siicusp-abstracts",
-    "styleitems", "suai-report", "substnote", "technionThesisSetup", "tetragonos", "texnegar",
-    "thaispec", "transition-metals", "ucharclasses", "unicode-bidi", "unicode-math", "unipersian",
-    "unisugar", "wexam", "wiseref", "xdufont", "xeCJK", "xeCJK-listings", "xeCJKfntef",
-    "xechangebar", "xecolor", "xecyr", "xecyrmongolian", "xeindex", "xepersian", "xepersian-hm",
-    "xesearch", "xespotcolor", "xetexko", "xetexko-font", "xetexko-hanging", "xetexko-josa",
-    "xetexko-space", "xetexko-vertical", "xevlna", "xltxtra", "xunicode", "xunicode-addon",
-    "zb-basics", "zitie",
+    "aidisclose",
+    "akshar",
+    "arabdoc-bib",
+    "arabdoc-glossary",
+    "arabdoc-setup",
+    "arabxetex",
+    "babelbidi",
+    "bacex",
+    "bidi",
+    "bidi-atbegshi",
+    "bidicontour",
+    "bidihl",
+    "bidipagegrid",
+    "bidishadowtext",
+    "brandstyler",
+    "causalmodels",
+    "churchslavonic",
+    "codemwe",
+    "cqubeamer",
+    "ctex",
+    "datemultical",
+    "ecnuvi",
+    "exam-rtl",
+    "facture-belge-simple-sans-tva",
+    "fariscovernew",
+    "fixlatvian",
+    "fontbook",
+    "fontspec",
+    "fontwrap",
+    "graph-theory-symbol",
+    "hanzibox",
+    "hawkdraw",
+    "hithesis",
+    "hvarabic",
+    "impe",
+    "interchar",
+    "jiffy",
+    "kurdishlipsum",
+    "langsci-affiliations",
+    "langsci-bidi",
+    "langsci-gb4e",
+    "langsci-lgr",
+    "langsci-optional",
+    "langsci-plot-templates",
+    "langsci-subparts",
+    "langsci-tbls",
+    "langsci-textipa",
+    "latexbangla",
+    "marathi",
+    "math-shorthandz",
+    "mathspec",
+    "mayanumber",
+    "na-box",
+    "na-list",
+    "na-position",
+    "parsa",
+    "pmhanguljamo",
+    "polyglossia",
+    "programmes-cpge",
+    "sblfonts",
+    "sexam",
+    "siicusp-abstracts",
+    "styleitems",
+    "suai-report",
+    "substnote",
+    "technionThesisSetup",
+    "tetragonos",
+    "texnegar",
+    "thaispec",
+    "transition-metals",
+    "ucharclasses",
+    "unicode-bidi",
+    "unicode-math",
+    "unipersian",
+    "unisugar",
+    "wexam",
+    "wiseref",
+    "xdufont",
+    "xeCJK",
+    "xeCJK-listings",
+    "xeCJKfntef",
+    "xechangebar",
+    "xecolor",
+    "xecyr",
+    "xecyrmongolian",
+    "xeindex",
+    "xepersian",
+    "xepersian-hm",
+    "xesearch",
+    "xespotcolor",
+    "xetexko",
+    "xetexko-font",
+    "xetexko-hanging",
+    "xetexko-josa",
+    "xetexko-space",
+    "xetexko-vertical",
+    "xevlna",
+    "xltxtra",
+    "xunicode",
+    "xunicode-addon",
+    "zb-basics",
+    "zitie",
 ];
 const UNICODE_ENGINE_CLASSES: &[&str] = &[
-    "BHCexam", "abntexto-ufc", "arabdoc-article", "arabdoc-book", "arabdoc-report",
-    "arabdoc-thesis", "arabic-book", "atsresume", "attinormativi", "bidipresentation", "buctthesis",
-    "businesscard-qrcode", "ctexart", "ctexbeamer", "ctexbook", "ctexrep", "ecnuthesis", "facture",
-    "gbt9704", "gia-handout", "hauthesis", "hfutthesis", "hithesis", "impeart", "impeart_zh",
-    "impebeamer", "impebeamer_zh", "impebook", "impebook_zh", "impereport", "impereport_zh",
-    "imsproc", "infufrgs", "iptconf", "jouthesis", "langscibook", "mohe-book", "nanicolle",
-    "nwafupaper", "onlinebrief24", "resumecls", "simpleresumecv", "simplethesisdissertation",
-    "tabriz-thesis", "technionThesis", "thesis-qom", "tvthesis", "xdupgthesis", "xduugthesis",
-    "xduugtp", "yazd-thesis", "zbMATH",
+    "BHCexam",
+    "abntexto-ufc",
+    "arabdoc-article",
+    "arabdoc-book",
+    "arabdoc-report",
+    "arabdoc-thesis",
+    "arabic-book",
+    "atsresume",
+    "attinormativi",
+    "bidipresentation",
+    "buctthesis",
+    "businesscard-qrcode",
+    "ctexart",
+    "ctexbeamer",
+    "ctexbook",
+    "ctexrep",
+    "ecnuthesis",
+    "facture",
+    "gbt9704",
+    "gia-handout",
+    "hauthesis",
+    "hfutthesis",
+    "hithesis",
+    "impeart",
+    "impeart_zh",
+    "impebeamer",
+    "impebeamer_zh",
+    "impebook",
+    "impebook_zh",
+    "impereport",
+    "impereport_zh",
+    "imsproc",
+    "infufrgs",
+    "iptconf",
+    "jouthesis",
+    "langscibook",
+    "mohe-book",
+    "nanicolle",
+    "nwafupaper",
+    "onlinebrief24",
+    "resumecls",
+    "simpleresumecv",
+    "simplethesisdissertation",
+    "tabriz-thesis",
+    "technionThesis",
+    "thesis-qom",
+    "tvthesis",
+    "xdupgthesis",
+    "xduugthesis",
+    "xduugtp",
+    "yazd-thesis",
+    "zbMATH",
 ];
 /// Packages and classes that only work under LuaTeX (`tex/lualatex/*` and
 /// `tex/luatex/*` in the bundled archive).
 const LUATEX_PACKAGES: &[&str] = &[
-    "KKluaverb", "SympyCalc", "addliga", "addtoluatexpath", "animategif", "arabluatex",
-    "arabluatex-patch", "autopuncitems", "barracuda", "beamertheme-niederrhein", "bezierplot",
-    "chemidentifier", "chemidentifier-v1", "chickenize", "cloze", "combofont", "countwords",
-    "cstypo", "ctablestack", "datestamp", "dichromacy", "docref", "docstrip-luacode",
-    "domaincoloring", "ekdosis", "emojicite", "emojinames", "farbe", "fits-astro", "florilegium",
-    "gitinfo-lua", "hu-berlin-base", "hu-berlin-bundle-style", "ideavault", "import-citation-cff",
-    "innerscript", "interpreter", "japanese-mathformulas", "jsonresume", "letgut-banner",
-    "letgut-lstlang", "ligtype", "linebreaker", "lltjcore", "lltjdefs", "lltjext", "lltjext-251101",
-    "lltjfont", "lltjp-array", "lltjp-atbegshi", "lltjp-collcell", "lltjp-everyshi",
-    "lltjp-fancyvrb", "lltjp-fontspec", "lltjp-footmisc", "lltjp-geometry", "lltjp-listings",
-    "lltjp-lua-unicode-math", "lltjp-microtype", "lltjp-preview", "lltjp-siunitx", "lltjp-stfloats",
-    "lltjp-tascmac", "lltjp-unicode-math", "lltjp-xunicode", "longmath", "lparse", "ltj-base",
-    "ltj-latex", "ltj-plain", "ltmermaid", "lua-check-hyphen", "lua-font-config", "lua-list-hyphen",
-    "lua-placeholders", "lua-regression", "lua-typo", "lua-typo-2021-04-18", "lua-typo-2023-03-08",
-    "lua-ul", "lua-unicode-math", "lua-unicode-math--amsfonts", "lua-unicode-math--amssymb",
-    "lua-visual-debug", "lua-widow-control", "lua-widow-control-2022-02-22", "luaaddplot",
-    "luabibentry", "luabidi", "luabreakurl", "luacas", "luacode", "luacomplex", "luacoolprop",
-    "luadraw", "luagcd", "luahttp", "luahyperbolic", "luahyphenrules", "luaimageembed", "luaindex",
-    "luainputenc", "luakeys", "luakeys-debug", "lualatex-math", "lualatex-truncate", "lualinalg",
-    "lualineno", "luamathaccents", "luamathalign", "luamaths", "luamesh", "luamml",
-    "luamml-patches-amsmath", "luamml-patches-kernel", "luamml-pdf", "luamodulartables", "luamplib",
-    "luanumbers", "luanumint", "luaoptions", "luaotfload", "luapackageloader", "luaplot",
-    "luaprogtable", "luaquotes", "luarandom", "luaset", "luasseq", "luatagging",
-    "luatagging-lua3keyval", "luatbls", "luatex-cn", "luatex-cn-banxin", "luatex-cn-core",
-    "luatex-cn-core-base", "luatex-cn-core-column", "luatex-cn-core-content",
-    "luatex-cn-core-document", "luatex-cn-core-export", "luatex-cn-core-metadata",
-    "luatex-cn-core-page", "luatex-cn-core-paragraph", "luatex-cn-core-punct",
-    "luatex-cn-core-section", "luatex-cn-core-settings", "luatex-cn-core-sidenote",
-    "luatex-cn-core-style", "luatex-cn-core-table", "luatex-cn-core-template",
-    "luatex-cn-core-textbox", "luatex-cn-core-textflow", "luatex-cn-debug", "luatex-cn-decorate",
-    "luatex-cn-digital", "luatex-cn-font-autodetect", "luatex-cn-footnote", "luatex-cn-gongche",
-    "luatex-cn-guji", "luatex-cn-guji-cover", "luatex-cn-guji-danye", "luatex-cn-guji-jiazhu",
-    "luatex-cn-guji-judou", "luatex-cn-guji-meipi", "luatex-cn-guji-mulu", "luatex-cn-guji-pizhu",
-    "luatex-cn-guji-titlepage", "luatex-cn-guji-yinzhang", "luatex-cn-hori", "luatex-cn-linemark",
-    "luatexbase", "luatexbase-attr", "luatexbase-cctb", "luatexbase-compat", "luatexbase-loader",
-    "luatexbase-mcb", "luatexbase-modutils", "luatexbase-regs", "luatexja", "luatexja-adjust",
-    "luatexja-ajmacros", "luatexja-compat", "luatexja-core", "luatexja-fontspec",
-    "luatexja-fontspec-29e", "luatexja-otf", "luatexja-preset", "luatexja-ruby", "luatexja-zhfonts",
-    "luatexko", "luatextra", "luatodonotes", "luatruthtable", "luavlna", "luaxml", "lum-arsenal",
-    "lum-asana", "lum-bonum", "lum-concrete", "lum-dejavu", "lum-erewhon", "lum-euler", "lum-fira",
-    "lum-garamond", "lum-gfsneohellenic", "lum-kpmath-sans", "lum-lete-sans", "lum-libertinus",
-    "lum-lmodern", "lum-luciole", "lum-newcomputermodern", "lum-newcomputermodernsans",
-    "lum-oldstandard", "lum-pagella", "lum-plex", "lum-schola", "lum-stix2", "lum-termes",
-    "lum-xcharter", "lum-xits", "lutabulartools", "luwa-ul", "lyluatex", "marginalia", "minim-doc",
-    "minim-mp", "monoref", "nodetree", "nodetree-embed", "novel-CalculateLayout",
-    "novel-ChapterScene", "novel-DropCap", "novel-FileData", "novel-Fonts", "novel-Footnotes",
-    "novel-HeadFootStyles", "novel-Images", "novel-LayoutSettings", "novel-PostLayout",
-    "novel-Sandbox", "novel-TextMacros", "novel-pdfx", "novel-xmppacket", "numodel",
-    "numodel-coach", "numodel-plot", "odsfile", "pdfextra", "penlight", "penlightplus", "pgfmolbio",
-    "pgfpages-rl", "piton", "pkgmeta", "placeat", "plantuml", "problib", "pyluatex", "robotkarol",
-    "scikgtex", "seatingchart", "selnolig", "selnolig-english-hyphex", "selnolig-english-patterns",
-    "selnolig-german-hyphex", "selnolig-german-patterns", "semesterplanner", "semesterplannerlua",
-    "showhyphenation", "showkerning", "simurgh", "simurgh-abjad", "simurgh-adadi",
-    "simurgh-algorithm", "simurgh-algorithmic", "simurgh-amsart", "simurgh-amsbook",
-    "simurgh-amsmath", "simurgh-amstext", "simurgh-amsthm", "simurgh-array", "simurgh-article",
-    "simurgh-artikel1", "simurgh-artikel2", "simurgh-artikel3", "simurgh-arydshln",
-    "simurgh-backref", "simurgh-bidi", "simurgh-boek", "simurgh-boek3", "simurgh-book",
-    "simurgh-bookest", "simurgh-caption3", "simurgh-chkeng", "simurgh-clss", "simurgh-counters",
-    "simurgh-cptns", "simurgh-empheq", "simurgh-extarticle", "simurgh-extbook", "simurgh-extletter",
-    "simurgh-extreport", "simurgh-fleqn", "simurgh-fonts", "simurgh-footnotes", "simurgh-ftnxtra",
-    "simurgh-glossaries", "simurgh-harfi", "simurgh-jalalical", "simurgh-leqno", "simurgh-letter",
-    "simurgh-lettrine", "simurgh-loader", "simurgh-ltx", "simurgh-mathdigitspec", "simurgh-memoir",
-    "simurgh-minitoc", "simurgh-natbib", "simurgh-pkgs", "simurgh-poem", "simurgh-rapport1",
-    "simurgh-rapport3", "simurgh-refrep", "simurgh-report", "simurgh-scrartcl", "simurgh-scrbook",
-    "simurgh-scrlettr", "simurgh-scrreprt", "simurgh-shellescape", "simurgh-tags",
-    "simurgh-tartibi", "simurgh-tools", "simurgh-unibidi", "spacekern", "spelling", "spotxcolor",
-    "stricttex", "tkz-fn", "truthtable", "tsvtemplate", "turkce-sayi", "typewriter", "unibidi-lua",
-    "uninormalize", "unitconv", "xdvipsk-support", "xdvipskmaps", "yamlvars",
+    "KKluaverb",
+    "SympyCalc",
+    "addliga",
+    "addtoluatexpath",
+    "animategif",
+    "arabluatex",
+    "arabluatex-patch",
+    "autopuncitems",
+    "barracuda",
+    "beamertheme-niederrhein",
+    "bezierplot",
+    "chemidentifier",
+    "chemidentifier-v1",
+    "chickenize",
+    "cloze",
+    "combofont",
+    "countwords",
+    "cstypo",
+    "ctablestack",
+    "datestamp",
+    "dichromacy",
+    "docref",
+    "docstrip-luacode",
+    "domaincoloring",
+    "ekdosis",
+    "emojicite",
+    "emojinames",
+    "farbe",
+    "fits-astro",
+    "florilegium",
+    "gitinfo-lua",
+    "hu-berlin-base",
+    "hu-berlin-bundle-style",
+    "ideavault",
+    "import-citation-cff",
+    "innerscript",
+    "interpreter",
+    "japanese-mathformulas",
+    "jsonresume",
+    "letgut-banner",
+    "letgut-lstlang",
+    "ligtype",
+    "linebreaker",
+    "lltjcore",
+    "lltjdefs",
+    "lltjext",
+    "lltjext-251101",
+    "lltjfont",
+    "lltjp-array",
+    "lltjp-atbegshi",
+    "lltjp-collcell",
+    "lltjp-everyshi",
+    "lltjp-fancyvrb",
+    "lltjp-fontspec",
+    "lltjp-footmisc",
+    "lltjp-geometry",
+    "lltjp-listings",
+    "lltjp-lua-unicode-math",
+    "lltjp-microtype",
+    "lltjp-preview",
+    "lltjp-siunitx",
+    "lltjp-stfloats",
+    "lltjp-tascmac",
+    "lltjp-unicode-math",
+    "lltjp-xunicode",
+    "longmath",
+    "lparse",
+    "ltj-base",
+    "ltj-latex",
+    "ltj-plain",
+    "ltmermaid",
+    "lua-check-hyphen",
+    "lua-font-config",
+    "lua-list-hyphen",
+    "lua-placeholders",
+    "lua-regression",
+    "lua-typo",
+    "lua-typo-2021-04-18",
+    "lua-typo-2023-03-08",
+    "lua-ul",
+    "lua-unicode-math",
+    "lua-unicode-math--amsfonts",
+    "lua-unicode-math--amssymb",
+    "lua-visual-debug",
+    "lua-widow-control",
+    "lua-widow-control-2022-02-22",
+    "luaaddplot",
+    "luabibentry",
+    "luabidi",
+    "luabreakurl",
+    "luacas",
+    "luacode",
+    "luacomplex",
+    "luacoolprop",
+    "luadraw",
+    "luagcd",
+    "luahttp",
+    "luahyperbolic",
+    "luahyphenrules",
+    "luaimageembed",
+    "luaindex",
+    "luainputenc",
+    "luakeys",
+    "luakeys-debug",
+    "lualatex-math",
+    "lualatex-truncate",
+    "lualinalg",
+    "lualineno",
+    "luamathaccents",
+    "luamathalign",
+    "luamaths",
+    "luamesh",
+    "luamml",
+    "luamml-patches-amsmath",
+    "luamml-patches-kernel",
+    "luamml-pdf",
+    "luamodulartables",
+    "luamplib",
+    "luanumbers",
+    "luanumint",
+    "luaoptions",
+    "luaotfload",
+    "luapackageloader",
+    "luaplot",
+    "luaprogtable",
+    "luaquotes",
+    "luarandom",
+    "luaset",
+    "luasseq",
+    "luatagging",
+    "luatagging-lua3keyval",
+    "luatbls",
+    "luatex-cn",
+    "luatex-cn-banxin",
+    "luatex-cn-core",
+    "luatex-cn-core-base",
+    "luatex-cn-core-column",
+    "luatex-cn-core-content",
+    "luatex-cn-core-document",
+    "luatex-cn-core-export",
+    "luatex-cn-core-metadata",
+    "luatex-cn-core-page",
+    "luatex-cn-core-paragraph",
+    "luatex-cn-core-punct",
+    "luatex-cn-core-section",
+    "luatex-cn-core-settings",
+    "luatex-cn-core-sidenote",
+    "luatex-cn-core-style",
+    "luatex-cn-core-table",
+    "luatex-cn-core-template",
+    "luatex-cn-core-textbox",
+    "luatex-cn-core-textflow",
+    "luatex-cn-debug",
+    "luatex-cn-decorate",
+    "luatex-cn-digital",
+    "luatex-cn-font-autodetect",
+    "luatex-cn-footnote",
+    "luatex-cn-gongche",
+    "luatex-cn-guji",
+    "luatex-cn-guji-cover",
+    "luatex-cn-guji-danye",
+    "luatex-cn-guji-jiazhu",
+    "luatex-cn-guji-judou",
+    "luatex-cn-guji-meipi",
+    "luatex-cn-guji-mulu",
+    "luatex-cn-guji-pizhu",
+    "luatex-cn-guji-titlepage",
+    "luatex-cn-guji-yinzhang",
+    "luatex-cn-hori",
+    "luatex-cn-linemark",
+    "luatexbase",
+    "luatexbase-attr",
+    "luatexbase-cctb",
+    "luatexbase-compat",
+    "luatexbase-loader",
+    "luatexbase-mcb",
+    "luatexbase-modutils",
+    "luatexbase-regs",
+    "luatexja",
+    "luatexja-adjust",
+    "luatexja-ajmacros",
+    "luatexja-compat",
+    "luatexja-core",
+    "luatexja-fontspec",
+    "luatexja-fontspec-29e",
+    "luatexja-otf",
+    "luatexja-preset",
+    "luatexja-ruby",
+    "luatexja-zhfonts",
+    "luatexko",
+    "luatextra",
+    "luatodonotes",
+    "luatruthtable",
+    "luavlna",
+    "luaxml",
+    "lum-arsenal",
+    "lum-asana",
+    "lum-bonum",
+    "lum-concrete",
+    "lum-dejavu",
+    "lum-erewhon",
+    "lum-euler",
+    "lum-fira",
+    "lum-garamond",
+    "lum-gfsneohellenic",
+    "lum-kpmath-sans",
+    "lum-lete-sans",
+    "lum-libertinus",
+    "lum-lmodern",
+    "lum-luciole",
+    "lum-newcomputermodern",
+    "lum-newcomputermodernsans",
+    "lum-oldstandard",
+    "lum-pagella",
+    "lum-plex",
+    "lum-schola",
+    "lum-stix2",
+    "lum-termes",
+    "lum-xcharter",
+    "lum-xits",
+    "lutabulartools",
+    "luwa-ul",
+    "lyluatex",
+    "marginalia",
+    "minim-doc",
+    "minim-mp",
+    "monoref",
+    "nodetree",
+    "nodetree-embed",
+    "novel-CalculateLayout",
+    "novel-ChapterScene",
+    "novel-DropCap",
+    "novel-FileData",
+    "novel-Fonts",
+    "novel-Footnotes",
+    "novel-HeadFootStyles",
+    "novel-Images",
+    "novel-LayoutSettings",
+    "novel-PostLayout",
+    "novel-Sandbox",
+    "novel-TextMacros",
+    "novel-pdfx",
+    "novel-xmppacket",
+    "numodel",
+    "numodel-coach",
+    "numodel-plot",
+    "odsfile",
+    "pdfextra",
+    "penlight",
+    "penlightplus",
+    "pgfmolbio",
+    "pgfpages-rl",
+    "piton",
+    "pkgmeta",
+    "placeat",
+    "plantuml",
+    "problib",
+    "pyluatex",
+    "robotkarol",
+    "scikgtex",
+    "seatingchart",
+    "selnolig",
+    "selnolig-english-hyphex",
+    "selnolig-english-patterns",
+    "selnolig-german-hyphex",
+    "selnolig-german-patterns",
+    "semesterplanner",
+    "semesterplannerlua",
+    "showhyphenation",
+    "showkerning",
+    "simurgh",
+    "simurgh-abjad",
+    "simurgh-adadi",
+    "simurgh-algorithm",
+    "simurgh-algorithmic",
+    "simurgh-amsart",
+    "simurgh-amsbook",
+    "simurgh-amsmath",
+    "simurgh-amstext",
+    "simurgh-amsthm",
+    "simurgh-array",
+    "simurgh-article",
+    "simurgh-artikel1",
+    "simurgh-artikel2",
+    "simurgh-artikel3",
+    "simurgh-arydshln",
+    "simurgh-backref",
+    "simurgh-bidi",
+    "simurgh-boek",
+    "simurgh-boek3",
+    "simurgh-book",
+    "simurgh-bookest",
+    "simurgh-caption3",
+    "simurgh-chkeng",
+    "simurgh-clss",
+    "simurgh-counters",
+    "simurgh-cptns",
+    "simurgh-empheq",
+    "simurgh-extarticle",
+    "simurgh-extbook",
+    "simurgh-extletter",
+    "simurgh-extreport",
+    "simurgh-fleqn",
+    "simurgh-fonts",
+    "simurgh-footnotes",
+    "simurgh-ftnxtra",
+    "simurgh-glossaries",
+    "simurgh-harfi",
+    "simurgh-jalalical",
+    "simurgh-leqno",
+    "simurgh-letter",
+    "simurgh-lettrine",
+    "simurgh-loader",
+    "simurgh-ltx",
+    "simurgh-mathdigitspec",
+    "simurgh-memoir",
+    "simurgh-minitoc",
+    "simurgh-natbib",
+    "simurgh-pkgs",
+    "simurgh-poem",
+    "simurgh-rapport1",
+    "simurgh-rapport3",
+    "simurgh-refrep",
+    "simurgh-report",
+    "simurgh-scrartcl",
+    "simurgh-scrbook",
+    "simurgh-scrlettr",
+    "simurgh-scrreprt",
+    "simurgh-shellescape",
+    "simurgh-tags",
+    "simurgh-tartibi",
+    "simurgh-tools",
+    "simurgh-unibidi",
+    "spacekern",
+    "spelling",
+    "spotxcolor",
+    "stricttex",
+    "tkz-fn",
+    "truthtable",
+    "tsvtemplate",
+    "turkce-sayi",
+    "typewriter",
+    "unibidi-lua",
+    "uninormalize",
+    "unitconv",
+    "xdvipsk-support",
+    "xdvipskmaps",
+    "yamlvars",
 ];
 const LUATEX_CLASSES: &[&str] = &[
-    "beamer-rl", "dfg-crc", "hu-berlin-letter", "lecturenotes", "letgut", "ltc-cn-vbook",
-    "ltc-guji", "ltc-guji-digital", "ltc-tw-vbook", "ltjarticle", "ltjbook", "ltjltxdoc",
-    "ltjreport", "ltjsarticle", "ltjsbook", "ltjskiyou", "ltjspf", "ltjsreport", "ltjtarticle",
-    "ltjtbook", "ltjtreport", "lucidcv", "novel", "pdfArticle", "sblarticle", "sblbook",
-    "sblreport", "scholatex", "simurgh-doc", "tango", "texecole",
+    "beamer-rl",
+    "dfg-crc",
+    "hu-berlin-letter",
+    "lecturenotes",
+    "letgut",
+    "ltc-cn-vbook",
+    "ltc-guji",
+    "ltc-guji-digital",
+    "ltc-tw-vbook",
+    "ltjarticle",
+    "ltjbook",
+    "ltjltxdoc",
+    "ltjreport",
+    "ltjsarticle",
+    "ltjsbook",
+    "ltjskiyou",
+    "ltjspf",
+    "ltjsreport",
+    "ltjtarticle",
+    "ltjtbook",
+    "ltjtreport",
+    "lucidcv",
+    "novel",
+    "pdfArticle",
+    "sblarticle",
+    "sblbook",
+    "sblreport",
+    "scholatex",
+    "simurgh-doc",
+    "tango",
+    "texecole",
 ];
 
 /// Without an explicit engine option, documents whose preamble needs LuaTeX
@@ -832,7 +1282,11 @@ fn read_manifest(path: &Path) -> Option<Manifest> {
     let mut lines = text.lines();
     if !matches!(
         lines.next()?,
-        "TEXMK-CACHE-1" | "TEXMK-CACHE-2" | "TEXMK-CACHE-3" | "TEXMK-CACHE-4" | "TEXMK-CACHE-5"
+        "TEXMK-CACHE-1"
+            | "TEXMK-CACHE-2"
+            | "TEXMK-CACHE-3"
+            | "TEXMK-CACHE-4"
+            | "TEXMK-CACHE-5"
             | "TEXMK-CACHE-6"
     ) {
         return None;
@@ -1061,7 +1515,10 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> std::io::Result<()> {
             hex_encode(&file.to_string_lossy())
         ));
     }
-    text.push_str(&format!("unfinished-pass\t{}\n", u8::from(manifest.unfinished_pass)));
+    text.push_str(&format!(
+        "unfinished-pass\t{}\n",
+        u8::from(manifest.unfinished_pass)
+    ));
     if text.len() as u64 > MANIFEST_MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2291,7 +2748,12 @@ impl SignalScanner {
             || message.starts_with("Underfull \\hbox")
             || message.starts_with("Overfull \\vbox")
         {
-            if !self.signals.user_warnings.iter().any(|known| known == message) {
+            if !self
+                .signals
+                .user_warnings
+                .iter()
+                .any(|known| known == message)
+            {
                 self.signals.user_warnings.push(message.to_string());
             }
         }
@@ -3180,7 +3642,9 @@ fn run_tool(
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() as u32 != parent {
-                    return Err(std::io::Error::other("texmk exited before its tool started"));
+                    return Err(std::io::Error::other(
+                        "texmk exited before its tool started",
+                    ));
                 }
                 Ok(())
             });
@@ -3228,7 +3692,10 @@ fn run_tool(
 }
 
 fn biber_file(
-    kpse: &tex_kpse::Kpse, name: &str, aux_dir: &Path, source_dir: &Path,
+    kpse: &tex_kpse::Kpse,
+    name: &str,
+    aux_dir: &Path,
+    source_dir: &Path,
 ) -> Option<PathBuf> {
     bibliography_dependency_path(kpse, aux_dir, source_dir, name, tex_kpse::Format::Bib)
         .or_else(|| extra_bibliography_dependency_path(name, tex_kpse::Format::Bib, "BIBINPUTS"))
@@ -3249,12 +3716,20 @@ fn biber_signature(bcf: &Path, source_dir: &Path) -> Option<u64> {
     let mut identity = format!("biber:{}\n", env!("CARGO_PKG_VERSION"));
     identity.push_str(&text);
     if let Some(tool) = tool_override(&["biber"]) {
-        identity.push_str(&format!("\noverride={}: {:?}", tool.display(), file_hash(&tool)));
-    } else if let Some(metadata) = std::env::current_exe().ok()
+        identity.push_str(&format!(
+            "\noverride={}: {:?}",
+            tool.display(),
+            file_hash(&tool)
+        ));
+    } else if let Some(metadata) = std::env::current_exe()
+        .ok()
         .and_then(|path| std::fs::metadata(path).ok())
     {
-        identity.push_str(&format!("\nembedded-size={}:modified={:?}",
-            metadata.len(), metadata.modified().ok()));
+        identity.push_str(&format!(
+            "\nembedded-size={}:modified={:?}",
+            metadata.len(),
+            metadata.modified().ok()
+        ));
     }
     for variable in ["TEXINPUTS", "BIBINPUTS", "TEXBIBINPUTS", HERMETIC_ENV] {
         identity.push_str(&format!("\n{variable}={:?}", std::env::var_os(variable)));
@@ -3277,7 +3752,11 @@ fn run_biber(bcf: &Path, source_dir: &Path, silent: bool) -> i32 {
     }
     if let Some(tool) = tool_override(&["biber"]) {
         return match run_tool(
-            &tool, &[bcf.to_string_lossy().into_owned()], silent, source_dir, &[],
+            &tool,
+            &[bcf.to_string_lossy().into_owned()],
+            silent,
+            source_dir,
+            &[],
         ) {
             Ok(out) if out.success => 0,
             Ok(out) => {
@@ -3291,7 +3770,8 @@ fn run_biber(bcf: &Path, source_dir: &Path, silent: bool) -> i32 {
         };
     }
     let kpse = tex_kpse::Kpse::with_roots(source_dir, &[]);
-    let find_file = |name: &str| biber_file(&kpse, name, bcf.parent().unwrap_or(source_dir), source_dir);
+    let find_file =
+        |name: &str| biber_file(&kpse, name, bcf.parent().unwrap_or(source_dir), source_dir);
     match tex_biber::run(&tex_biber::Options {
         bcf: bcf.to_path_buf(),
         output: None,
@@ -3382,7 +3862,11 @@ fn run_index_tools(
     let mut runs = 0;
     for job in embedded_index::plan(&log, aux_dir) {
         let signature = stable_hash(&embedded_index::signature_input(&job, source_dir));
-        let key = job.ind.strip_prefix(aux_dir).unwrap_or(&job.ind).to_path_buf();
+        let key = job
+            .ind
+            .strip_prefix(aux_dir)
+            .unwrap_or(&job.ind)
+            .to_path_buf();
         if job.ind.is_file() && manifest.indexes.get(&key) == Some(&signature) {
             continue;
         }
@@ -3397,7 +3881,10 @@ fn run_index_tools(
         }
         if regular_file_hash(&job.ind).is_none() {
             manifest.indexes.remove(&key);
-            eprintln!("texmk: makeindex wrote no output file {}", job.ind.display());
+            eprintln!(
+                "texmk: makeindex wrote no output file {}",
+                job.ind.display()
+            );
             return Err(1);
         }
         manifest.indexes.insert(key.clone(), signature);
@@ -3450,10 +3937,9 @@ fn convert_eps_figures(source_dir: &Path) -> EpsFigures {
                 }
                 continue;
             }
-            let is_eps = path
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("eps") || ext.eq_ignore_ascii_case("epsi"));
+            let is_eps = path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("eps") || ext.eq_ignore_ascii_case("epsi")
+            });
             if !is_eps {
                 continue;
             }
@@ -3515,7 +4001,11 @@ fn real_main() -> i32 {
         }
     }
     if opt.rebuild && opt.clean == CleanMode::None {
-        let discard = Options { clean: CleanMode::Aux, watch: false, ..opt.clone() };
+        let discard = Options {
+            clean: CleanMode::Aux,
+            watch: false,
+            ..opt.clone()
+        };
         let code = build(&discard, &mut BuildInfo::default());
         if code != 0 {
             return code;
@@ -3670,7 +4160,11 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
     maybe_gc_cache(&jobs_dir, &job_dir);
     let pdf_path = artifact_path(&output_dir, &job, ".pdf");
     let synctex_extension = synctex_extension(&opt.passthrough);
-    let synctex_path = artifact_path(&output_dir, &job, synctex_extension.unwrap_or(".synctex.gz"));
+    let synctex_path = artifact_path(
+        &output_dir,
+        &job,
+        synctex_extension.unwrap_or(".synctex.gz"),
+    );
     let mut aux_dir = explicit_aux_dir.unwrap_or_else(|| job_dir.join("aux"));
     if aux_dir.exists() {
         aux_dir = if managed_aux {
@@ -3847,10 +4341,7 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
         ),
     ];
     if let Some(dir) = font_cache_dir.filter(|dir| std::fs::create_dir_all(dir).is_ok()) {
-        engine_env.push((
-            OsString::from(TEXMK_FONT_CACHE_ENV),
-            dir.into_os_string(),
-        ));
+        engine_env.push((OsString::from(TEXMK_FONT_CACHE_ENV), dir.into_os_string()));
     }
     // Watch mode also wants the font files and failed lookups, which the
     // recorder (kept in web2c's format) does not list. The file lives with the
@@ -3960,25 +4451,27 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
         .then(|| biber_signature(&initial_bcf, &source_dir))
         .flatten();
     let initial_biber = initial_biber_signature.is_some();
-    let initial_bibliography_ready = initial_biber || (initial_bibdata
-        && bibliography_dependencies_available(initial_aux_text, &aux_dir, &source_dir));
+    let initial_bibliography_ready = initial_biber
+        || (initial_bibdata
+            && bibliography_dependencies_available(initial_aux_text, &aux_dir, &source_dir));
     if !prior_pass_unfinished
         && (initial_aux_graph.complete || initial_biber)
         && initial_bibliography_ready
     {
         prev_cites = Some(aux_citations(initial_aux_text));
-        let signature = initial_biber_signature.unwrap_or_else(|| {
-            bibliography_signature(initial_aux_text, &aux_dir, &source_dir)
-        });
-        if !initial_biber && adopt_source_bibliography(
-            &mut manifest,
-            &source_bbl,
-            &bbl_path,
-            initial_aux_text,
-            &aux_dir,
-            &source_dir,
-            signature,
-        ) {
+        let signature = initial_biber_signature
+            .unwrap_or_else(|| bibliography_signature(initial_aux_text, &aux_dir, &source_dir));
+        if !initial_biber
+            && adopt_source_bibliography(
+                &mut manifest,
+                &source_bbl,
+                &bbl_path,
+                initial_aux_text,
+                &aux_dir,
+                &source_dir,
+                signature,
+            )
+        {
             bibtex_done = true;
         }
         let bibliography_output_matches = manifest
@@ -4015,7 +4508,11 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
                     return 1;
                 };
                 bibtex_done = true;
-                if initial_biber { biber_runs += 1; } else { bibtex_runs += 1; }
+                if initial_biber {
+                    biber_runs += 1;
+                } else {
+                    bibtex_runs += 1;
+                }
                 recorded_outputs.borrow_mut().extend([
                     PathBuf::from(format!("{job}.bbl")),
                     PathBuf::from(format!("{job}.blg")),
@@ -4094,7 +4591,17 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
             eprintln!("texmk: {target_engine} pass {passes}/{MAX_PASSES}");
         }
         let _ = std::fs::remove_file(&cache_hit_marker);
-        let output = match run_tool(&engine, &args, opt.silent, &source_dir, &engine_env) {
+        let can_skip_pdf = using_embedded_engine
+            && passes < MAX_PASSES
+            && (started_from_trivial_aux || passes > 1);
+        let mut pass_env = engine_env.clone();
+        if can_skip_pdf {
+            pass_env.push((
+                OsString::from("TEX_RS_SKIP_UNCONVERGED_PDF"),
+                OsString::from("1"),
+            ));
+        }
+        let output = match run_tool(&engine, &args, opt.silent, &source_dir, &pass_env) {
             Ok(r) => r,
             Err(e) => {
                 let _ = std::fs::remove_file(&cache_hit_marker);
@@ -4204,13 +4711,13 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
         let cites = aux_citations(aux_text);
         let bibdata = aux_has_bibdata(aux_text);
         let bcf_path = aux_dir.join(format!("{job}.bcf"));
-        let use_biber = !bibdata && (bcf_path.is_file()
-            || aux_text.contains("\\abx@aux@")
-            || signals.biber_requested);
+        let use_biber = !bibdata
+            && (bcf_path.is_file() || aux_text.contains("\\abx@aux@") || signals.biber_requested);
         // A finished pass under biblatex writes a complete control file; one
         // that is missing or malformed regardless is reported, not run.
-        let complete_bcf_signature =
-            use_biber.then(|| biber_signature(&bcf_path, &source_dir)).flatten();
+        let complete_bcf_signature = use_biber
+            .then(|| biber_signature(&bcf_path, &source_dir))
+            .flatten();
         if use_biber && complete_bcf_signature.is_none() && !incomplete_bcf_reported {
             eprintln!(
                 "texmk: warning: {} is missing or incomplete; Biber was not run",
@@ -4229,17 +4736,19 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
             (bibliography_ready && aux_graph.complete)
                 .then(|| bibliography_signature(aux_text, &aux_dir, &source_dir))
         };
-        if !use_biber && bibliography_signature.is_some_and(|signature| {
-            adopt_source_bibliography(
-                &mut manifest,
-                &source_bbl,
-                &bbl_path,
-                aux_text,
-                &aux_dir,
-                &source_dir,
-                signature,
-            )
-        }) {
+        if !use_biber
+            && bibliography_signature.is_some_and(|signature| {
+                adopt_source_bibliography(
+                    &mut manifest,
+                    &source_bbl,
+                    &bbl_path,
+                    aux_text,
+                    &aux_dir,
+                    &source_dir,
+                    signature,
+                )
+            })
+        {
             bibtex_done = true;
         }
         let sig = Signals {
@@ -4303,7 +4812,11 @@ fn build(opt: &Options, info: &mut BuildInfo) -> i32 {
                     return 1;
                 };
                 bibtex_done = true;
-                if use_biber { biber_runs += 1; } else { bibtex_runs += 1; }
+                if use_biber {
+                    biber_runs += 1;
+                } else {
+                    bibtex_runs += 1;
+                }
                 recorded_outputs.borrow_mut().extend([
                     PathBuf::from(format!("{job}.bbl")),
                     PathBuf::from(format!("{job}.blg")),
@@ -4651,7 +5164,8 @@ fn watch_dependencies(
     let resolve = |path: &Path| -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| {
             match (
-                path.parent().and_then(|parent| std::fs::canonicalize(parent).ok()),
+                path.parent()
+                    .and_then(|parent| std::fs::canonicalize(parent).ok()),
                 path.file_name(),
             ) {
                 (Some(parent), Some(name)) => parent.join(name),
@@ -4705,7 +5219,14 @@ fn watch_main(opt: &Options) -> i32 {
         if watch::interrupted() {
             return 0;
         }
-        run_hooks(if code == 0 { &opt.hooks.success } else { &opt.hooks.failure }, opt);
+        run_hooks(
+            if code == 0 {
+                &opt.hooks.success
+            } else {
+                &opt.hooks.failure
+            },
+            opt,
+        );
         match &info.inputs {
             Some(inputs) => {
                 let dependencies = watch_dependencies(inputs, code != 0, &tracker);
@@ -4737,8 +5258,10 @@ fn watch_main(opt: &Options) -> i32 {
             .iter()
             .take(3)
             .map(|path| {
-                path.file_name()
-                    .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
             })
             .collect();
         if changed.len() > 3 {
@@ -4783,7 +5306,12 @@ fn run_embedded_makeindex() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cwd = Path::new(".");
     let tree = |name: &str| embedded_index::tree::style(cwd, name);
-    let host = tex_makeindex::DirHost { work_dir: cwd, output_dir: None, tree: &tree, stdin: true };
+    let host = tex_makeindex::DirHost {
+        work_dir: cwd,
+        output_dir: None,
+        tree: &tree,
+        stdin: true,
+    };
     std::process::exit(tex_makeindex::run_cli(&args, &host));
 }
 
@@ -4816,7 +5344,12 @@ fn engine_invocation(args: &[String]) -> Option<(&'static str, Vec<String>)> {
     let engine = |name: &str| ENGINE_PROGRAMS.into_iter().find(|program| *program == name);
     let rest = args.get(1..).unwrap_or_default();
     if let Some(program) = rest.first().and_then(|first| engine(first)) {
-        return Some((program, std::iter::once(program.to_string()).chain(rest[1..].iter().cloned()).collect()));
+        return Some((
+            program,
+            std::iter::once(program.to_string())
+                .chain(rest[1..].iter().cloned())
+                .collect(),
+        ));
     }
     let program = rest.iter().enumerate().find_map(|(index, arg)| {
         let name = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
@@ -4826,7 +5359,12 @@ fn engine_invocation(args: &[String]) -> Option<(&'static str, Vec<String>)> {
             _ => None,
         }
     })?;
-    Some((program, std::iter::once(program.to_string()).chain(rest.iter().cloned()).collect()))
+    Some((
+        program,
+        std::iter::once(program.to_string())
+            .chain(rest.iter().cloned())
+            .collect(),
+    ))
 }
 
 fn run_engine_pass(program: &str, argv: Vec<String>) {
@@ -5027,7 +5565,10 @@ mod io_safety_tests {
         ] {
             assert_eq!(engine_for_source(source), "pdflatex", "{source}");
         }
-        assert_eq!(engine_for_source("\\documentclass{article}\n\\def\\p{100\\%}\\usepackage{fontspec}\n"), "xelatex");
+        assert_eq!(
+            engine_for_source("\\documentclass{article}\n\\def\\p{100\\%}\\usepackage{fontspec}\n"),
+            "xelatex"
+        );
     }
 
     /// LuaTeX-ja's classes and packages need LuaTeX, also beside a package
@@ -5045,7 +5586,10 @@ mod io_safety_tests {
         ] {
             assert_eq!(engine_for_source(source), "lualatex", "{source}");
         }
-        assert_eq!(engine_for_source("\\documentclass{article}\n% \\usepackage{luatexja}\n"), "pdflatex");
+        assert_eq!(
+            engine_for_source("\\documentclass{article}\n% \\usepackage{luatexja}\n"),
+            "pdflatex"
+        );
     }
 
     #[test]
@@ -5126,7 +5670,9 @@ mod latexmk_option_tests {
     #[test]
     fn platex_and_uplatex_are_refused_with_the_migration_path() {
         for flag in ["-platex", "--platex", "-uplatex", "--uplatex"] {
-            let error = parse(&[flag, "paper.tex"]).err().unwrap_or_else(|| panic!("{flag} was accepted"));
+            let error = parse(&[flag, "paper.tex"])
+                .err()
+                .unwrap_or_else(|| panic!("{flag} was accepted"));
             assert!(error.contains("pTeX"), "{flag}: {error}");
             assert!(error.contains("LuaTeX-ja"), "{flag}: {error}");
         }
@@ -5152,11 +5698,20 @@ mod latexmk_option_tests {
             &mut hooks,
         )
         .unwrap();
-        apply_latexmk_code("$failure_cmd = ($failure_cmd ? $failure_cmd . ' & ' : '') . 'notify-send failed'", &mut hooks)
-            .unwrap();
+        apply_latexmk_code(
+            "$failure_cmd = ($failure_cmd ? $failure_cmd . ' & ' : '') . 'notify-send failed'",
+            &mut hooks,
+        )
+        .unwrap();
         assert_eq!(hooks.compiling, ["echo vimtex_compiler_callback_compiling"]);
         assert_eq!(hooks.success, ["echo vimtex_compiler_callback_success"]);
-        assert_eq!(hooks.failure, ["echo vimtex_compiler_callback_failure", "notify-send failed"]);
+        assert_eq!(
+            hooks.failure,
+            [
+                "echo vimtex_compiler_callback_failure",
+                "notify-send failed"
+            ]
+        );
         apply_latexmk_code("$success_cmd = 'zathura main.pdf';", &mut hooks).unwrap();
         assert_eq!(hooks.success, ["zathura main.pdf"]);
     }
@@ -5170,7 +5725,10 @@ mod latexmk_option_tests {
             "system('rm -rf x')",
         ] {
             let error = apply_latexmk_code(code, &mut Hooks::default()).unwrap_err();
-            assert!(error.contains("$compiling_cmd, $success_cmd and $failure_cmd"), "{error}");
+            assert!(
+                error.contains("$compiling_cmd, $success_cmd and $failure_cmd"),
+                "{error}"
+            );
         }
     }
 
@@ -5180,7 +5738,8 @@ mod latexmk_option_tests {
     #[cfg(unix)]
     #[test]
     fn hook_placeholders_are_latexmks() {
-        let hook = "echo A=%A B=%B D=%D O=%O R=%R S=%S T=%T V=%V W=%W Y=%Y Z=%Z P=%P U=%U pct=%% Q=%Q";
+        let hook =
+            "echo A=%A B=%B D=%D O=%O R=%R S=%S T=%T V=%V W=%W Y=%Y Z=%Z P=%P U=%U pct=%% Q=%Q";
         for (args, printed) in [
             (
                 &["-pvc", "main.tex"][..],
@@ -5205,7 +5764,10 @@ mod latexmk_option_tests {
         }
         // A quoted name keeps its spaces; `%` before a newline is no placeholder.
         let spaced = parse(&["-pvc", "my doc.tex"]).unwrap();
-        assert_eq!(substitute_placeholders("open %D%\n", &spaced), "open \"my doc.pdf\"%\n");
+        assert_eq!(
+            substitute_placeholders("open %D%\n", &spaced),
+            "open \"my doc.pdf\"%\n"
+        );
     }
 
     /// The latexmk command lines of vimtex (continuous mode), LaTeX
@@ -5213,9 +5775,18 @@ mod latexmk_option_tests {
     #[test]
     fn editor_command_lines_parse() {
         let vimtex = parse(&[
-            "-verbose", "-file-line-error", "-synctex=1", "-interaction=nonstopmode",
-            "-outdir=build", "-emulate-aux-dir", "-auxdir=aux", "-pvc", "-pvctimeout-",
-            "-view=none", "-e", "$success_cmd = ($success_cmd ? $success_cmd . \" ; \" : \"\") . \"echo ok\"",
+            "-verbose",
+            "-file-line-error",
+            "-synctex=1",
+            "-interaction=nonstopmode",
+            "-outdir=build",
+            "-emulate-aux-dir",
+            "-auxdir=aux",
+            "-pvc",
+            "-pvctimeout-",
+            "-view=none",
+            "-e",
+            "$success_cmd = ($success_cmd ? $success_cmd . \" ; \" : \"\") . \"echo ok\"",
             "main.tex",
         ])
         .unwrap();
@@ -5228,21 +5799,47 @@ mod latexmk_option_tests {
             ["-file-line-error", "-synctex=1", "-interaction=nonstopmode"]
         );
 
-        let workshop = parse(&["-synctex=1", "-interaction=nonstopmode", "-file-line-error", "-outdir=/tmp/out", "/tmp/doc"]).unwrap();
+        let workshop = parse(&[
+            "-synctex=1",
+            "-interaction=nonstopmode",
+            "-file-line-error",
+            "-outdir=/tmp/out",
+            "/tmp/doc",
+        ])
+        .unwrap();
         assert!(workshop.keep_logs && workshop.engine.is_none());
 
         let latextools = parse(&[
-            "-cd", "-f", "-interaction=nonstopmode", "-synctex=1", "-silent",
-            "-MSWinBackSlash", "-latexoption=-shell-escape", "-jobname=thesis", "main.tex",
+            "-cd",
+            "-f",
+            "-interaction=nonstopmode",
+            "-synctex=1",
+            "-silent",
+            "-MSWinBackSlash",
+            "-latexoption=-shell-escape",
+            "-jobname=thesis",
+            "main.tex",
         ])
         .unwrap();
         assert!(latextools.change_directory && latextools.force && latextools.keep_logs);
-        assert_eq!(latextools.passthrough, ["-interaction=nonstopmode", "-synctex=1", "-shell-escape"]);
+        assert_eq!(
+            latextools.passthrough,
+            ["-interaction=nonstopmode", "-synctex=1", "-shell-escape"]
+        );
 
         let texstudio = parse(&["-silent", "-synctex=1", "main"]).unwrap();
         assert!(texstudio.keep_logs);
 
-        let viewer = parse(&["-pv", "-new-viewer-", "-norc", "-recorder", "-bibtex", "-g", "main.tex"]).unwrap();
+        let viewer = parse(&[
+            "-pv",
+            "-new-viewer-",
+            "-norc",
+            "-recorder",
+            "-bibtex",
+            "-g",
+            "main.tex",
+        ])
+        .unwrap();
         assert!(viewer.passthrough.is_empty() && viewer.rebuild && !viewer.keep_logs);
     }
 
@@ -5253,10 +5850,15 @@ mod latexmk_option_tests {
             (&["-dvi"][..], "writes PDF directly"),
             (&["-bibtex-"][..], "whenever the document needs it"),
             (&["-r", "latexmkrc"][..], "latexmkrc"),
-            (&["-pdflatex=pdflatex -shell-escape %O %S"][..], "-latexoption"),
+            (
+                &["-pdflatex=pdflatex -shell-escape %O %S"][..],
+                "-latexoption",
+            ),
         ] {
             let argv: Vec<&str> = args.iter().copied().chain(["main.tex"]).collect();
-            let error = parse(&argv).err().unwrap_or_else(|| panic!("{args:?} was accepted"));
+            let error = parse(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} was accepted"));
             assert!(error.contains(reason), "{args:?}: {error}");
         }
     }
@@ -5267,7 +5869,10 @@ mod engine_invocation_tests {
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
-        std::iter::once("texres").chain(list.iter().copied()).map(str::to_string).collect()
+        std::iter::once("texres")
+            .chain(list.iter().copied())
+            .map(str::to_string)
+            .collect()
     }
 
     fn strings(list: &[&str]) -> Vec<String> {
@@ -5291,7 +5896,10 @@ mod engine_invocation_tests {
     #[test]
     fn progname_selects_the_engine() {
         for (given, engine) in [
-            (&["-progname=pdflatex", "-ini", "&pdflatex", "pre.tex"][..], "pdflatex"),
+            (
+                &["-progname=pdflatex", "-ini", "&pdflatex", "pre.tex"][..],
+                "pdflatex",
+            ),
             (&["--progname=xelatex", "doc.tex"][..], "xelatex"),
             (&["-progname", "lualatex", "doc.tex"][..], "lualatex"),
             (&["-ini", "-progname=pdflatex", "pre.tex"][..], "pdflatex"),

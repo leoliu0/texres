@@ -46,6 +46,9 @@ pub struct LuaFile {
     /// not yet consumed.
     rbuf: Vec<u8>,
     rpos: usize,
+    /// File offset at the end of `rbuf` for read-only `Stream::File` handles,
+    /// allowing within-buffer `seek` without OS `lseek` or buffer eviction.
+    rbuf_end_pos: Option<u64>,
     /// Bytes written but not yet handed to the stream.
     wbuf: Vec<u8>,
     mode: BufMode,
@@ -131,7 +134,10 @@ fn c_error(kind: io::ErrorKind, code: i32, text: &'static str) -> io::Error {
 #[cfg(not(unix))]
 fn c_errno(error: &io::Error) -> Option<(i32, &'static str)> {
     use io::ErrorKind as K;
-    if let Some(custom) = error.get_ref().and_then(|inner| inner.downcast_ref::<CError>()) {
+    if let Some(custom) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CError>())
+    {
         return Some((custom.0, custom.1));
     }
     Some(match error.kind() {
@@ -193,7 +199,8 @@ pub(crate) fn error_message(error: &io::Error) -> String {
     match error.raw_os_error() {
         Some(code) => {
             let suffix = format!(" (os error {code})");
-            text.strip_suffix(suffix.as_str()).map_or(text.clone(), str::to_owned)
+            text.strip_suffix(suffix.as_str())
+                .map_or(text.clone(), str::to_owned)
         }
         None => text,
     }
@@ -224,12 +231,14 @@ pub(crate) fn valid_open_mode(mode: &[u8]) -> bool {
 
 impl LuaFile {
     fn with_stream(stream: Stream, readable: bool, writable: bool, mode: BufMode) -> Self {
+        let rbuf_end_pos = (!writable && matches!(stream, Stream::File(_))).then_some(0);
         LuaFile {
             stream: Some(stream),
             readable,
             writable,
             rbuf: Vec::new(),
             rpos: 0,
+            rbuf_end_pos,
             wbuf: Vec::new(),
             mode,
             bufsize: BUFFER_SIZE,
@@ -279,7 +288,11 @@ impl LuaFile {
     /// `fopen(path, mode)`; `mode` must satisfy [`valid_open_mode`].
     pub(crate) fn open(path: &[u8], mode: &[u8]) -> io::Result<Self> {
         let result = Self::open_unobserved(path, mode);
-        crate::host_access::notify(&crate::host_access::HostAccess::Open { path, mode, ok: result.is_ok() });
+        crate::host_access::notify(&crate::host_access::HostAccess::Open {
+            path,
+            mode,
+            ok: result.is_ok(),
+        });
         result
     }
 
@@ -301,11 +314,18 @@ impl LuaFile {
             }
         };
         #[cfg(unix)]
-        let path = std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path));
+        let path = std::path::Path::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+        );
         #[cfg(not(unix))]
         let path = String::from_utf8_lossy(path).into_owned();
         let file = options.open(path)?;
-        Ok(Self::with_stream(Stream::File(file), readable, writable, BufMode::Full))
+        Ok(Self::with_stream(
+            Stream::File(file),
+            readable,
+            writable,
+            BufMode::Full,
+        ))
     }
 
     /// `tmpfile()`: an anonymous read/write file removed when closed.
@@ -327,7 +347,12 @@ impl LuaFile {
             {
                 Ok(file) => {
                     let _ = std::fs::remove_file(&path);
-                    return Ok(Self::with_stream(Stream::File(file), true, true, BufMode::Full));
+                    return Ok(Self::with_stream(
+                        Stream::File(file),
+                        true,
+                        true,
+                        BufMode::Full,
+                    ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 100 => {
                     attempt += 1;
@@ -359,11 +384,21 @@ impl LuaFile {
         if write {
             let mut child = cmd.stdin(Stdio::piped()).spawn()?;
             let stdin = child.stdin.take().expect("piped stdin");
-            Ok(Self::with_stream(Stream::PipeWrite(child, stdin), false, true, BufMode::Full))
+            Ok(Self::with_stream(
+                Stream::PipeWrite(child, stdin),
+                false,
+                true,
+                BufMode::Full,
+            ))
         } else {
             let mut child = cmd.stdout(Stdio::piped()).spawn()?;
             let stdout = child.stdout.take().expect("piped stdout");
-            Ok(Self::with_stream(Stream::PipeRead(child, stdout), true, false, BufMode::Full))
+            Ok(Self::with_stream(
+                Stream::PipeRead(child, stdout),
+                true,
+                false,
+                BufMode::Full,
+            ))
         }
     }
 
@@ -373,11 +408,11 @@ impl LuaFile {
     }
 
     /// Borrow the reusable result buffer (give it back with `put_scratch`).
-    pub(crate) fn take_scratch(&mut self) -> Vec<u8> {
+    pub fn take_scratch(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.scratch)
     }
 
-    pub(crate) fn put_scratch(&mut self, mut buffer: Vec<u8>) {
+    pub fn put_scratch(&mut self, mut buffer: Vec<u8>) {
         if buffer.capacity() <= BUFFER_SIZE {
             buffer.clear();
             self.scratch = buffer;
@@ -490,6 +525,7 @@ impl LuaFile {
         let unread = self.rbuf.len() - self.rpos;
         self.rbuf.clear();
         self.rpos = 0;
+        self.rbuf_end_pos = None;
         if unread > 0 {
             self.raw_seek(SeekFrom::Current(-(unread as i64)))?;
         }
@@ -517,6 +553,14 @@ impl LuaFile {
         buf.clear();
         buf.resize(self.bufsize.max(1), 0);
         let result = self.raw_read(&mut buf);
+        match &result {
+            Ok(read) => {
+                if let Some(pos) = &mut self.rbuf_end_pos {
+                    *pos += *read as u64;
+                }
+            }
+            Err(_) => self.rbuf_end_pos = None,
+        }
         let n = *result.as_ref().unwrap_or(&0);
         buf.truncate(n);
         self.rbuf = buf;
@@ -544,7 +588,7 @@ impl LuaFile {
 
     /// Append the next line to `out`; returns whether a '\n' ended it.
     /// The '\n' itself is appended only when `keep_newline` is set.
-    pub(crate) fn read_line(&mut self, out: &mut Vec<u8>, keep_newline: bool) -> io::Result<bool> {
+    pub fn read_line(&mut self, out: &mut Vec<u8>, keep_newline: bool) -> io::Result<bool> {
         loop {
             if self.rpos == self.rbuf.len() && !self.fill()? {
                 return Ok(false);
@@ -561,7 +605,29 @@ impl LuaFile {
     }
 
     /// `fread` of up to `n` bytes, appended to `out`.
-    pub(crate) fn read_chars(&mut self, out: &mut Vec<u8>, n: usize) -> io::Result<()> {
+    /// Read up to `out.len()` bytes directly into `out`, returning the count read.
+    #[inline]
+    pub fn read_exact_or_eof(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = out.len();
+        if self.rbuf.len() - self.rpos >= n {
+            out.copy_from_slice(&self.rbuf[self.rpos..self.rpos + n]);
+            self.rpos += n;
+            return Ok(n);
+        }
+        let mut total = 0;
+        while total < n {
+            if self.rpos == self.rbuf.len() && !self.fill()? {
+                break;
+            }
+            let take = (n - total).min(self.rbuf.len() - self.rpos);
+            out[total..total + take].copy_from_slice(&self.rbuf[self.rpos..self.rpos + take]);
+            self.rpos += take;
+            total += take;
+        }
+        Ok(total)
+    }
+
+    pub fn read_chars(&mut self, out: &mut Vec<u8>, n: usize) -> io::Result<()> {
         let mut remaining = n;
         while remaining > 0 {
             if self.rpos == self.rbuf.len() {
@@ -574,6 +640,14 @@ impl LuaFile {
                     let start = out.len();
                     out.resize(start + remaining.min(1 << 20), 0);
                     let result = self.raw_read(&mut out[start..]);
+                    match &result {
+                        Ok(got) => {
+                            if let Some(pos) = &mut self.rbuf_end_pos {
+                                *pos += *got as u64;
+                            }
+                        }
+                        Err(_) => self.rbuf_end_pos = None,
+                    }
                     let got = *result.as_ref().unwrap_or(&0);
                     out.truncate(start + got);
                     if result? == 0 {
@@ -598,6 +672,7 @@ impl LuaFile {
     pub(crate) fn read_all(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         out.extend_from_slice(&self.rbuf[self.rpos..]);
         self.rpos = self.rbuf.len();
+        self.rbuf_end_pos = None;
         if !self.readable {
             return Err(ebadf());
         }
@@ -668,17 +743,51 @@ impl LuaFile {
     }
 
     /// `fseek` followed by `ftell`.
-    pub(crate) fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    pub fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        if self.wbuf.is_empty()
+            && let Some(end_pos) = self.rbuf_end_pos
+            && !self.rbuf.is_empty()
+        {
+            let buf_start = end_pos - self.rbuf.len() as u64;
+            match pos {
+                SeekFrom::Start(target) if target >= buf_start && target <= end_pos => {
+                    self.rpos = (target - buf_start) as usize;
+                    return Ok(target);
+                }
+                SeekFrom::Current(offset) => {
+                    let cur = buf_start + self.rpos as u64;
+                    if let Some(target) = cur.checked_add_signed(offset)
+                        && target >= buf_start
+                        && target <= end_pos
+                    {
+                        self.rpos = (target - buf_start) as usize;
+                        return Ok(target);
+                    }
+                }
+                _ => {}
+            }
+        }
         self.flush_write_buffer()?;
         let unread = (self.rbuf.len() - self.rpos) as i64;
         let pos = match pos {
             SeekFrom::Current(offset) => SeekFrom::Current(offset - unread),
             other => other,
         };
-        let result = self.raw_seek(pos)?;
-        self.rbuf.clear();
-        self.rpos = 0;
-        Ok(result)
+        let result = self.raw_seek(pos);
+        match result {
+            Ok(offset) => {
+                self.rbuf.clear();
+                self.rpos = 0;
+                self.rbuf_end_pos = (!self.writable
+                    && matches!(self.stream, Some(Stream::File(_))))
+                .then_some(offset);
+                Ok(offset)
+            }
+            Err(err) => {
+                // Note: raw_seek failed without moving OS offset; keep buffer intact unless Current failed.
+                Err(err)
+            }
+        }
     }
 
     /// `setvbuf`.
@@ -694,6 +803,7 @@ impl LuaFile {
         let flushed = self.flush_write_buffer();
         self.rbuf = Vec::new();
         self.rpos = 0;
+        self.rbuf_end_pos = None;
         self.wbuf = Vec::new();
         match self.stream.take() {
             #[cfg(not(target_arch = "wasm32"))]

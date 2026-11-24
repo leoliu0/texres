@@ -35,6 +35,7 @@ const TEXMK_CACHE_HIT_MARKER_ENV: &str = "TEX_RS_CACHE_HIT_MARKER";
 const TEXMK_PUBLISHED_OUTPUT_ENV: &str = "TEX_RS_TEXMK_PUBLISHED_OUTPUT";
 const TEXMK_WATCH_DEPENDENCIES_ENV: &str = "TEX_RS_TEXMK_WATCH_DEPENDENCIES";
 const TEXMK_FONT_CACHE_ENV: &str = "TEX_RS_TEXMK_FONT_CACHE";
+const TEXMK_SKIP_UNCONVERGED_PDF_ENV: &str = "TEX_RS_SKIP_UNCONVERGED_PDF";
 const DEPCACHE_END_DOMAIN: &[u8] = b"TEX-DEPCACHE-7-END";
 
 use tex_kpse::platform_cache_dir;
@@ -1038,6 +1039,17 @@ fn snapshot_aux_state(job: &str, out_dir: &str) -> Vec<(std::path::PathBuf, u64,
         .collect()
 }
 
+fn snapshot_extra_pass_aux_state(job: &str, out_dir: &str) -> Vec<(std::path::PathBuf, u64, u64)> {
+    ["bcf", "idx"]
+        .iter()
+        .map(|ext| {
+            let p = std::path::PathBuf::from(format!("{}{}.{}", out_dir, job, ext));
+            let entry = content_digest(&p).unwrap_or((u64::MAX, 0));
+            (p, entry.0, entry.1)
+        })
+        .collect()
+}
+
 fn aux_state_is_unchanged(snapshot: &[(std::path::PathBuf, u64, u64)]) -> bool {
     snapshot
         .iter()
@@ -1139,9 +1151,10 @@ fn vanished_shell_outputs(
 ) -> std::collections::BTreeSet<std::path::PathBuf> {
     let reads = inputs.reads_after_shell_escape.clone();
     let sizes = inputs.sizes_after_shell_escape.clone();
-    let (Some(reads_after), Some(sizes_after)) =
-        (inputs.reads.get(reads.clone()), inputs.sizes.get(sizes.clone()))
-    else {
+    let (Some(reads_after), Some(sizes_after)) = (
+        inputs.reads.get(reads.clone()),
+        inputs.sizes.get(sizes.clone()),
+    ) else {
         return Default::default();
     };
     if reads_after.is_empty() && sizes_after.is_empty() {
@@ -1151,14 +1164,20 @@ fn vanished_shell_outputs(
         .iter()
         .chain(&inputs.reads[reads.end..])
         .map(|(path, _, _)| anchored_path(path))
-        .chain(inputs.sizes[..sizes.start].iter().map(|(path, _)| anchored_path(path)))
+        .chain(
+            inputs.sizes[..sizes.start]
+                .iter()
+                .map(|(path, _)| anchored_path(path)),
+        )
         .collect();
     reads_after
         .iter()
         .map(|(path, _, _)| path)
         .chain(sizes_after.iter().map(|(path, _)| path))
         .map(|path| anchored_path(path))
-        .filter(|path| !observed_otherwise.contains(path) && std::fs::symlink_metadata(path).is_err())
+        .filter(|path| {
+            !observed_otherwise.contains(path) && std::fs::symlink_metadata(path).is_err()
+        })
         .collect()
 }
 
@@ -1434,7 +1453,12 @@ fn write_depcache(cache_path: &std::path::Path, inputs: DepcacheInputs<'_>) {
         if !link_unchanged(path, target) {
             return;
         }
-        let _ = writeln!(out, "LINK\t{}\t{}", encode_record_path(path), encode_record_path(target));
+        let _ = writeln!(
+            out,
+            "LINK\t{}\t{}",
+            encode_record_path(path),
+            encode_record_path(target)
+        );
         if out.len() as u64 > DEPCACHE_RECORD_MAX_BYTES {
             return;
         }
@@ -1454,7 +1478,10 @@ fn write_depcache(cache_path: &std::path::Path, inputs: DepcacheInputs<'_>) {
             Some(value) => format!("={}", encode_record_path(std::path::Path::new(value))),
             None => "-".to_string(),
         };
-        out.push_str(&format!("ENV\t{}\t{value}\n", encode_record_path(std::path::Path::new(name))));
+        out.push_str(&format!(
+            "ENV\t{}\t{value}\n",
+            encode_record_path(std::path::Path::new(name))
+        ));
         if out.len() as u64 > DEPCACHE_RECORD_MAX_BYTES {
             return;
         }
@@ -1523,10 +1550,12 @@ fn write_depcache(cache_path: &std::path::Path, inputs: DepcacheInputs<'_>) {
     }) && missing_file_paths.iter().all(|path| !path.is_file())
         && missing_directory_paths.iter().all(|path| !path.is_dir())
         && present_directories.iter().all(|path| path.is_dir())
-        && links.iter().all(|(path, target)| link_unchanged(path, target))
-        && mod_dates
+        && links
             .iter()
-            .all(|(path, date)| tex_core::expand::disk_file_mod_date(path).as_deref() == Some(*date));
+            .all(|(path, target)| link_unchanged(path, target))
+        && mod_dates.iter().all(|(path, date)| {
+            tex_core::expand::disk_file_mod_date(path).as_deref() == Some(*date)
+        });
     if written.is_ok() && inputs_unchanged {
         let _ = replace_file(&temporary, cache_path);
     }
@@ -1814,7 +1843,10 @@ fn required_value<'a>(
     opt: &'a str,
     name: &str,
 ) -> Option<&'a str> {
-    if let Some(value) = opt.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')) {
+    if let Some(value) = opt
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('='))
+    {
         return Some(value);
     }
     if opt != name {
@@ -1845,7 +1877,11 @@ fn lua_locate_format(
     let default = with_ext(default_name);
     let ask = |eng: &mut Engine, name: &str| match eng.lua_find_format_file(name) {
         None => None,
-        Some(found) => Some(found.map(std::path::PathBuf::from).filter(|p| std::fs::File::open(p).is_ok())),
+        Some(found) => Some(
+            found
+                .map(std::path::PathBuf::from)
+                .filter(|p| std::fs::File::open(p).is_ok()),
+        ),
     };
     let mut result = ask(eng, &default)?;
     if ampersand && result.is_none() {
@@ -1856,7 +1892,10 @@ fn lua_locate_format(
         result = ask(eng, &default)?;
     }
     if result.is_none() {
-        emit_cli_message(interaction_mode, format_args!("I can't find the format file `{default}'!"));
+        emit_cli_message(
+            interaction_mode,
+            format_args!("I can't find the format file `{default}'!"),
+        );
         std::process::exit(1);
     }
     result
@@ -1969,10 +2008,14 @@ fn load_tcx(name: &str) -> Option<tex_core::tex_bytes::Tcx> {
     if let Some(tcx) = tex_core::tex_bytes::Tcx::builtin(name) {
         return Some(tcx);
     }
-    ["/usr/share/texmf-dist/web2c", "/usr/share/texlive/texmf-dist/web2c", "/usr/local/share/texmf-dist/web2c"]
-        .iter()
-        .find_map(|dir| std::fs::read(std::path::Path::new(dir).join(name)).ok())
-        .and_then(|text| tex_core::tex_bytes::Tcx::parse(&String::from_utf8_lossy(&text)).ok())
+    [
+        "/usr/share/texmf-dist/web2c",
+        "/usr/share/texlive/texmf-dist/web2c",
+        "/usr/local/share/texmf-dist/web2c",
+    ]
+    .iter()
+    .find_map(|dir| std::fs::read(std::path::Path::new(dir).join(name)).ok())
+    .and_then(|text| tex_core::tex_bytes::Tcx::parse(&String::from_utf8_lossy(&text)).ok())
 }
 
 /// kpathsea `-cnf-line` (kpathsea_cnf_line_env_progname): a texmf.cnf line
@@ -2073,7 +2116,8 @@ fn write_recorder(engine: &Engine, aux_dir: &str, job: &str, log_path: &str) {
 /// build would read if they appeared.
 fn write_watch_dependencies(engine: &Engine) {
     use std::fmt::Write;
-    let Some(destination) = std::env::var_os(TEXMK_WATCH_DEPENDENCIES_ENV).filter(|value| !value.is_empty())
+    let Some(destination) =
+        std::env::var_os(TEXMK_WATCH_DEPENDENCIES_ENV).filter(|value| !value.is_empty())
     else {
         return;
     };
@@ -2374,7 +2418,12 @@ fn internal_command(words: &[String], output_dir: Option<&std::path::Path>) -> O
     }
     let cwd = std::path::Path::new(".");
     let tree = |name: &str| index_tree::style(cwd, name);
-    let host = tex_makeindex::DirHost { work_dir: cwd, output_dir, tree: &tree, stdin: false };
+    let host = tex_makeindex::DirHost {
+        work_dir: cwd,
+        output_dir,
+        tree: &tree,
+        stdin: false,
+    };
     Some(tex_makeindex::run_cli(args, &host))
 }
 
@@ -2583,7 +2632,10 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
                 "-mltex" => "MLTeX extensions (\\charsubdef)",
                 _ => "DVI output to a socket",
             };
-            usage_error(&program, &format!("{opt} is not supported: TeXres has no {feature}"));
+            usage_error(
+                &program,
+                &format!("{opt} is not supported: TeXres has no {feature}"),
+            );
         } else if opt == "-optimize-pdf-size" || opt == "-optimize=size" {
             optimize_pdf_size = true;
         } else if opt == "-optimize=speed" {
@@ -2814,6 +2866,9 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             .unwrap_or_else(|| "texput".to_string())
     });
     let aux_start = snapshot_aux_state(&job, &aux_dir);
+    let extra_pass_aux_start = (std::env::var_os(TEXMK_SKIP_UNCONVERGED_PDF_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("1")))
+    .then(|| snapshot_extra_pass_aux_state(&job, &aux_dir));
     let cache_root = requested_cache_dir.unwrap_or_else(platform_cache_dir);
     tex_core::set_cache_dir(absolute_path(&cache_root));
     // The build driver shares one font database between its jobs.
@@ -2888,7 +2943,13 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
     let mut eng = Engine::new_with_kind(engine_kind, ini || !plain);
     eng.init_primitives();
     eng.allow_missing_main_aux = !plain && !ini;
-    configure_engine(&mut eng, halt_on_error, file_line_error, interaction_mode, max_errors);
+    configure_engine(
+        &mut eng,
+        halt_on_error,
+        file_line_error,
+        interaction_mode,
+        max_errors,
+    );
     phase_timer.mark("startup");
     eng.out_dir = out_dir.clone();
     eng.aux_dir = requested_aux_dir.clone();
@@ -2940,7 +3001,10 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
         }
         let cand_paths = match &custom_format {
             Some(path) => [Some(path.clone()), None],
-            None => [Some(std::path::PathBuf::from(fmt_file_name)), exe_fmt.clone()],
+            None => [
+                Some(std::path::PathBuf::from(fmt_file_name)),
+                exe_fmt.clone(),
+            ],
         };
         let mut loaded = false;
         for cand in cand_paths.into_iter().flatten() {
@@ -3009,7 +3073,10 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             // ("Fatal format file error"); only the built-in one falls back.
             emit_cli_message(
                 interaction_mode,
-                format_args!("{program}: fatal format file error: cannot load {}", path.display()),
+                format_args!(
+                    "{program}: fatal format file error: cannot load {}",
+                    path.display()
+                ),
             );
             std::process::exit(1);
         }
@@ -3107,7 +3174,13 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             }
         }
         tex_core::driver::prepare_latex_job(&mut eng);
-        configure_engine(&mut eng, halt_on_error, file_line_error, interaction_mode, max_errors);
+        configure_engine(
+            &mut eng,
+            halt_on_error,
+            file_line_error,
+            interaction_mode,
+            max_errors,
+        );
         if ini {
             // INITEX goes on from the loaded format; \dump writes JOBNAME.fmt.
             eng.ini_mode = true;
@@ -3285,10 +3358,26 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
     }
     if eng.pdf_draft_mode() && !eng.pdf_doc.pages.is_empty() {
         // pdfTeX draft mode still writes SyncTeX, but no PDF.
-        publish_synctex(&mut eng, &log_path, synctex_mode, expected_synctex.as_deref());
+        publish_synctex(
+            &mut eng,
+            &log_path,
+            synctex_mode,
+            expected_synctex.as_deref(),
+        );
         std::process::exit(if eng.error_count > 0 { 1 } else { 0 });
     }
     if !eng.pdf_doc.pages.is_empty() || eng.pdf_force_file() {
+        let aux_unchanged = aux_state_is_unchanged(&aux_start);
+        if eng.error_count == 0
+            && !plain
+            && !ini
+            && extra_pass_aux_start
+                .as_ref()
+                .is_some_and(|extra| !aux_unchanged || !aux_state_is_unchanged(extra))
+        {
+            phase_timer.mark("finish");
+            std::process::exit(0);
+        }
         let pages = eng.pdf_doc.pages.len();
         let pdf = match tex_core::driver::finish_pdf(&mut eng, optimize_pdf_size) {
             Ok(pdf) => pdf,
@@ -3312,7 +3401,12 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
         }
         // Publish SyncTeX before the PDF: viewers reload on a PDF change and
         // read the SyncTeX file at that moment, so it must already match.
-        publish_synctex(&mut eng, &log_path, synctex_mode, expected_synctex.as_deref());
+        publish_synctex(
+            &mut eng,
+            &log_path,
+            synctex_mode,
+            expected_synctex.as_deref(),
+        );
         if let Err(error) = atomic_write_file(std::path::Path::new(&out), &pdf) {
             fail_after_transcript(
                 &mut eng,
@@ -3329,7 +3423,7 @@ pub(crate) fn main_with_args(args_os: Vec<std::ffi::OsString>) {
             && !plain
             && !ini
             && eng.font_loader.dependency_tracking_complete
-            && aux_state_is_unchanged(&aux_start)
+            && aux_unchanged
         {
             let (reads_after_shell_escape, sizes_after_shell_escape) = eng
                 .observations_before_shell_escape

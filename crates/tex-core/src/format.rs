@@ -288,7 +288,10 @@ impl<'a> R<'a> {
         Ok(())
     }
     /// Inverse of `W::padded`.
-    fn padded<T: Copy>(&mut self, read: impl Fn(&mut R<'a>) -> io::Result<T>) -> io::Result<Vec<T>> {
+    fn padded<T: Copy>(
+        &mut self,
+        read: impl Fn(&mut R<'a>) -> io::Result<T>,
+    ) -> io::Result<Vec<T>> {
         const MAX_PADDED: usize = 1 << 20;
         let len = self.u32()? as usize;
         let fill = read(self)?;
@@ -572,11 +575,33 @@ pub fn save_format_with_encoding(
 
     // registers: only the entries that differ from a fresh engine's
     // (zero/empty value at level one); nearly all 32768 are untouched
-    write_sparse(&mut w, &q.count, &q.count_levels, |v| *v == 0, |w, v| w.i32(*v));
-    write_sparse(&mut w, &q.dimen, &q.dimen_levels, |v| *v == 0, |w, v| w.i32(*v));
-    write_sparse(&mut w, &q.skip, &q.skip_levels, is_zero_glue, |w, g| w.glue(g));
-    write_sparse(&mut w, &q.muskip, &q.muskip_levels, is_zero_glue, |w, g| w.glue(g));
-    write_sparse(&mut w, &q.toks, &q.toks_levels, |t| t.is_empty(), |w, t| w.toks(t));
+    write_sparse(
+        &mut w,
+        &q.count,
+        &q.count_levels,
+        |v| *v == 0,
+        |w, v| w.i32(*v),
+    );
+    write_sparse(
+        &mut w,
+        &q.dimen,
+        &q.dimen_levels,
+        |v| *v == 0,
+        |w, v| w.i32(*v),
+    );
+    write_sparse(&mut w, &q.skip, &q.skip_levels, is_zero_glue, |w, g| {
+        w.glue(g)
+    });
+    write_sparse(&mut w, &q.muskip, &q.muskip_levels, is_zero_glue, |w, g| {
+        w.glue(g)
+    });
+    write_sparse(
+        &mut w,
+        &q.toks,
+        &q.toks_levels,
+        |t| t.is_empty(),
+        |w, t| w.toks(t),
+    );
     // box registers: dumpability guarantees all void
     write_sparse(&mut w, &q.box_levels, &q.box_levels, |_| true, |_, _| {});
 
@@ -753,7 +778,10 @@ pub fn save_format_with_encoding(
     // dumps end before this trailer and were all built with cp227.tcx.
     w.u8(TCX_TRAILER);
     for bits in eng.xprn.chunks(8) {
-        w.u8(bits.iter().enumerate().fold(0u8, |acc, (i, &on)| acc | (u8::from(on) << i)));
+        w.u8(bits
+            .iter()
+            .enumerate()
+            .fold(0u8, |acc, (i, &on)| acc | (u8::from(on) << i)));
     }
     match &eng.tcx {
         None => w.u8(0),
@@ -837,8 +865,16 @@ fn write_font_expand(
     // links (a LuaTeX font never has both)
     w.i32(if x.step != 0 { x.step } else { x.lua_step });
     w.u8(x.auto_expand as u8);
-    w.u16(if x.stretch != 0 { x.stretch } else { x.lua_stretch as u16 });
-    w.u16(if x.shrink != 0 { x.shrink } else { x.lua_shrink as u16 });
+    w.u16(if x.stretch != 0 {
+        x.stretch
+    } else {
+        x.lua_stretch as u16
+    });
+    w.u16(if x.shrink != 0 {
+        x.shrink
+    } else {
+        x.lua_shrink as u16
+    });
     w.u16(x.elink);
     w.u16(x.blink);
     w.i32(x.ratio);
@@ -893,7 +929,8 @@ fn read_font_expand(
     x.blink = r.u16()?;
     x.ratio = r.i32()?;
     if lua {
-        (x.lua_step, x.lua_stretch, x.lua_shrink) = (x.step, i32::from(x.stretch), i32::from(x.shrink));
+        (x.lua_step, x.lua_stretch, x.lua_shrink) =
+            (x.step, i32::from(x.stretch), i32::from(x.shrink));
         (x.step, x.stretch, x.shrink) = (0, 0, 0);
     }
     let slots = [
@@ -1005,8 +1042,16 @@ fn write_trie(w: &mut W, t: &Trie) {
     for (i, node) in t.nodes.iter().enumerate() {
         let i = i as u32;
         w.u8(node.byte);
-        w.varint(if node.child == NO_LINK { 0 } else { node.child - i });
-        w.varint(if node.sibling == NO_LINK { 0 } else { i - node.sibling });
+        w.varint(if node.child == NO_LINK {
+            0
+        } else {
+            node.child - i
+        });
+        w.varint(if node.sibling == NO_LINK {
+            0
+        } else {
+            i - node.sibling
+        });
         let mut chain = Vec::new();
         let mut link = node.value;
         while link != NO_LINK {
@@ -1179,7 +1224,9 @@ fn indexed_format_frames(data: &[u8]) -> Option<Result<Vec<(&[u8], usize)>, Stri
         return None;
     }
     let index_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    let entries = data.get(8..8 + index_len)?.strip_prefix(FRAME_INDEX_TAG.as_slice())?;
+    let entries = data
+        .get(8..8 + index_len)?
+        .strip_prefix(FRAME_INDEX_TAG.as_slice())?;
     let word = |at: usize| {
         entries
             .get(at..at + 4)
@@ -1212,11 +1259,15 @@ fn indexed_format_frames(data: &[u8]) -> Option<Result<Vec<(&[u8], usize)>, Stri
 /// Decode the frames of an indexed format into one buffer, on as many
 /// threads as the process may run on.
 fn decode_format_frames(frames: &[(&[u8], usize)]) -> Result<Vec<u8>, String> {
-    fn decode((input, target): (&[u8], &mut [u8])) -> bool {
+    fn decode_lane(jobs: Vec<(&[u8], &mut [u8])>) -> bool {
         let mut decoder = ruzstd::decoding::FrameDecoder::new();
         decoder.set_max_window_size(MAX_FORMAT_BYTES as u64);
-        // Fails with `TargetTooSmall` when the frame holds more than indexed.
-        matches!(decoder.decode_all(input, target), Ok(n) if n == target.len())
+        for (input, target) in jobs {
+            if !matches!(decoder.decode_all(input, target), Ok(n) if n == target.len()) {
+                return false;
+            }
+        }
+        true
     }
     let mut out = vec![0u8; frames.iter().map(|f| f.1).sum()];
     let mut jobs = Vec::with_capacity(frames.len());
@@ -1234,7 +1285,7 @@ fn decode_format_frames(frames: &[(&[u8], usize)]) -> Result<Vec<u8>, String> {
     #[cfg(target_arch = "wasm32")]
     let threads = 1;
     let ok = if threads <= 1 {
-        jobs.into_iter().all(decode)
+        decode_lane(jobs)
     } else {
         // Lane `k` takes frames k, k + threads, ...; this thread runs lane 0.
         let mut lanes: Vec<Vec<(&[u8], &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
@@ -1245,9 +1296,9 @@ fn decode_format_frames(frames: &[(&[u8], usize)]) -> Result<Vec<u8>, String> {
         let own = lanes.next().unwrap_or_default();
         std::thread::scope(|scope| {
             let workers: Vec<_> = lanes
-                .map(|lane| scope.spawn(move || lane.into_iter().all(decode)))
+                .map(|lane| scope.spawn(move || decode_lane(lane)))
                 .collect();
-            let mine = own.into_iter().all(decode);
+            let mine = decode_lane(own);
             workers
                 .into_iter()
                 .fold(mine, |ok, worker| worker.join().unwrap_or(false) && ok)
@@ -1397,7 +1448,8 @@ pub fn load_format_bytes_into(data: &[u8], eng: &mut Engine) -> Result<(), Strin
     eng.format_done = scratch.format_done;
     eng.ini_mode = scratch.ini_mode;
     // \interactionmode reflects the caller's runtime mode, not the dump's
-    eng.eqtb.set_runtime_interaction_mode(eng.interaction_mode.number());
+    eng.eqtb
+        .set_runtime_interaction_mode(eng.interaction_mode.number());
     eng.engine_kind = scratch.engine_kind;
     // llualib.c undump_luac_registers: bytecode registers and chunk names
     // are part of the format.
@@ -1512,9 +1564,13 @@ fn load_state(r: &mut R, eng: &mut Engine) -> io::Result<()> {
     read_sparse(r, &mut q.dimen, &mut q.dimen_levels, |r| r.i32())?;
     read_sparse(r, &mut q.skip, &mut q.skip_levels, |r| r.glue())?;
     read_sparse(r, &mut q.muskip, &mut q.muskip_levels, |r| r.glue())?;
-    read_sparse(r, &mut q.toks, &mut q.toks_levels, |r| Ok(Rc::new(r.toks()?)))?;
+    read_sparse(r, &mut q.toks, &mut q.toks_levels, |r| {
+        Ok(Rc::new(r.toks()?))
+    })?;
     let mut box_levels = std::mem::take(&mut q.box_levels);
-    read_sparse(r, &mut vec![(); box_levels.len()], &mut box_levels, |_| Ok(()))?;
+    read_sparse(r, &mut vec![(); box_levels.len()], &mut box_levels, |_| {
+        Ok(())
+    })?;
     q.box_levels = box_levels;
 
     // code tables
@@ -1550,7 +1606,11 @@ fn load_state(r: &mut R, eng: &mut Engine) -> io::Result<()> {
         q.skew_char.push(r.i32()?);
         q.skew_char_levels.push(r.u16()?);
         q.font_cs.push(r.u32()?);
-        q.expand.push(read_font_expand(r, &mut expand_pool, eng.engine_kind == crate::engine::EngineKind::LuaTeX)?);
+        q.expand.push(read_font_expand(
+            r,
+            &mut expand_pool,
+            eng.engine_kind == crate::engine::EngineKind::LuaTeX,
+        )?);
     }
 
     // hyphenation
@@ -1784,7 +1844,11 @@ fn write_xetex_state(w: &mut W, q: &crate::eqtb::Eqtb) {
         w.u32(key);
         w.u16(class);
     }
-    let mut lists: Vec<_> = q.inter_char_toks.iter().filter(|(_, (t, _))| !t.is_empty()).collect();
+    let mut lists: Vec<_> = q
+        .inter_char_toks
+        .iter()
+        .filter(|(_, (t, _))| !t.is_empty())
+        .collect();
     lists.sort_unstable_by_key(|(key, _)| **key);
     w.u32(lists.len() as u32);
     for (&key, (toks, _)) in lists {
@@ -1806,7 +1870,10 @@ fn read_xetex_state(r: &mut R, q: &mut crate::eqtb::Eqtb) -> io::Result<()> {
     for _ in 0..r.count()? {
         let key = r.u32()?;
         let toks = r.toks()?;
-        if q.inter_char_toks.insert(key, (Rc::new(toks), crate::eqtb::LEVEL_ONE)).is_some() {
+        if q.inter_char_toks
+            .insert(key, (Rc::new(toks), crate::eqtb::LEVEL_ONE))
+            .is_some()
+        {
             return Err(bad("duplicate inter-character token list"));
         }
     }
@@ -1898,7 +1965,10 @@ fn read_font(r: &mut R) -> io::Result<Font> {
     }
     // parse_tfm: a first lig/kern step with skip 255 names the right
     // boundary character
-    let bchar = lig_kern.first().filter(|step| step.skip == 255).map(|step| step.next_char);
+    let bchar = lig_kern
+        .first()
+        .filter(|step| step.skip == 255)
+        .map(|step| step.next_char);
     let kerns = r.vec_i32()?;
     let n = r.count()?;
     let mut ext = Vec::with_capacity(n);
@@ -1963,7 +2033,10 @@ fn read_trie(r: &mut R) -> io::Result<Trie> {
         let byte = r.u8()?;
         let child = match r.varint()? {
             0 => NO_LINK,
-            d => i.checked_add(d).filter(|&c| (c as usize) < n).ok_or_else(|| bad("trie link"))?,
+            d => i
+                .checked_add(d)
+                .filter(|&c| (c as usize) < n)
+                .ok_or_else(|| bad("trie link"))?,
         };
         let sibling = match r.varint()? {
             0 => NO_LINK,
@@ -1974,8 +2047,16 @@ fn read_trie(r: &mut R) -> io::Result<Trie> {
         for j in 0..k {
             let pos = r.varint()?;
             let v = r.u8()?;
-            let next = if j + 1 == k { NO_LINK } else { values.len() as u32 + 1 };
-            values.push(TrieValue { pos, value: v, next });
+            let next = if j + 1 == k {
+                NO_LINK
+            } else {
+                values.len() as u32 + 1
+            };
+            values.push(TrieValue {
+                pos,
+                value: v,
+                next,
+            });
         }
         nodes.push(TrieNode {
             byte,
@@ -2061,11 +2142,7 @@ mod tests {
         eng.eqtb.assign_count(7, -123456, true);
         eng.eqtb.assign_count(32_767, 7654321, true);
         eng.eqtb.assign_dimen(3, 65536 * 12, true);
-        eng.eqtb.assign_skip(
-            5,
-            Glue::spec(10, -3, 2, 7, 1),
-            true,
-        );
+        eng.eqtb.assign_skip(5, Glue::spec(10, -3, 2, 7, 1), true);
         eng.eqtb.assign_muskip(1, Glue::fil(3, 5), true);
         eng.eqtb
             .assign_toks_reg(9, Rc::new(vec![Token::letter(b'z')]), true);
@@ -2226,7 +2303,10 @@ mod tests {
         codes_sorted.sort_unstable_by_key(|(language, _)| *language);
         s.push_str(&format!(
             "trie_trans={:?}\ntrie_vals={:?}\nhyphen_tries={:?}\nhyphen_codes={:?}\n",
-            trie_shape(&eng.hyphen_trie), "", tries_sorted, codes_sorted
+            trie_shape(&eng.hyphen_trie),
+            "",
+            tries_sorted,
+            codes_sorted
         ));
         s.push_str(&format!(
             "hyexc={:?}\nparshape={:?}\npenaltyshapes={:?}\n",
@@ -2408,7 +2488,10 @@ mod tests {
             Some(crate::boxes::Node::Rule {
                 width: 10,
                 height: 2,
-                depth: 1, subtype: crate::boxes::RULE_NORMAL, index: 0, attr: crate::boxes::Attr::NONE,
+                depth: 1,
+                subtype: crate::boxes::RULE_NORMAL,
+                index: 0,
+                attr: crate::boxes::Attr::NONE,
             }),
             true,
         );
@@ -2426,7 +2509,11 @@ mod tests {
         save_format(&eng, &path).expect("save");
         let data = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
-        assert!(load_format_from(&data).expect("complete format loads").format_done);
+        assert!(
+            load_format_from(&data)
+                .expect("complete format loads")
+                .format_done
+        );
         // every truncation is an error, never a panic; a dump cut exactly
         // before the translation-table trailer (34 bytes) is a valid older dump
         for cut in (0..data.len()).step_by(97).chain([data.len() - 1]) {
@@ -2441,7 +2528,10 @@ mod tests {
         // a format from an older wire version is refused, not misread
         let mut older = data.clone();
         older[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(VERSION - 1).to_le_bytes());
-        assert_eq!(load_format_from(&older).err().unwrap(), "format version mismatch");
+        assert_eq!(
+            load_format_from(&older).err().unwrap(),
+            "format version mismatch"
+        );
     }
 
     #[test]
@@ -2455,7 +2545,10 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let loaded = load_format_from(&data).unwrap();
-        assert_eq!(loaded.xprn, crate::tex_bytes::Tcx::builtin("cp8bit.tcx").unwrap().xprn);
+        assert_eq!(
+            loaded.xprn,
+            crate::tex_bytes::Tcx::builtin("cp8bit.tcx").unwrap().xprn
+        );
         // without either trailer, as written before the tables were dumped:
         // the TCX trailer (tag, 32 xprn bytes, table flag) and the PDF object
         // reservations (tag, next and last object, count, numbers)
@@ -2624,7 +2717,9 @@ mod tests {
             ruzstd::encoding::compress_to_vec(chunk, ruzstd::encoding::CompressionLevel::Fastest)
         };
         let packed = compress_format_frames(&raw, compress);
-        let frames = indexed_format_frames(&packed).expect("indexed").expect("valid index");
+        let frames = indexed_format_frames(&packed)
+            .expect("indexed")
+            .expect("valid index");
         assert_eq!(frames.len(), 3);
         assert_eq!(decode_format_frames(&frames).unwrap(), raw);
         // A frame that holds more than its indexed length is refused.

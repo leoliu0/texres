@@ -19,18 +19,17 @@
 ----------------------------------------------------------------------*/
 
 use crate::{
-    Instruction, LUA_MASKCALL, LUA_MASKLINE, LUA_MASKRET, LuaResult, LuaState,
-    LuaValue, OpCode,
+    Instruction, LUA_MASKCALL, LUA_MASKLINE, LUA_MASKRET, LuaResult, LuaState, LuaValue, OpCode,
     lua_value::{BIT_ISCOLLECTABLE, LuaProto},
     lua_vm::{
         LuaError, StkId, TmKind,
         call_info::call_status::{CIST_C, CIST_CLSRET, CIST_PENDING_FINISH},
         execute::{
             arith::{
-                self, lua_fmod, lua_fmod53, lua_idiv, lua_imod, lua_shiftl, lua_shiftr, luai_numpow,
-                luai_numpow53,
+                self, lua_fmod, lua_fmod53, lua_idiv, lua_imod, lua_shiftl, lua_shiftr,
+                luai_numpow, luai_numpow53,
             },
-            call::{insert_table_call_mm, poscall, precall, pretailcall},
+            call::{call_c_function, insert_table_call_mm, poscall, precall, pretailcall},
             closure::push_closure,
             concat::{concat, try_concat_pair_utf8},
             helper::{
@@ -460,7 +459,13 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                         &mut pc,
                         instr,
                         lua_imod,
-                        |a, b| if lua53 { lua_fmod53(a, b) } else { lua_fmod(a, b) },
+                        |a, b| {
+                            if lua53 {
+                                lua_fmod53(a, b)
+                            } else {
+                                lua_fmod(a, b)
+                            }
+                        },
                         error_mod_by_zero,
                     )?;
                 }
@@ -510,7 +515,13 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                         instr,
                         constants,
                         lua_imod,
-                        |a, b| if lua53 { lua_fmod53(a, b) } else { lua_fmod(a, b) },
+                        |a, b| {
+                            if lua53 {
+                                lua_fmod53(a, b)
+                            } else {
+                                lua_fmod(a, b)
+                            }
+                        },
                         error_mod_by_zero,
                     )?;
                 }
@@ -538,61 +549,28 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     )?;
                 }
                 OpCode::BAndK => {
-                    arith::op_bitwise_k(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        constants,
-                        lua53,
-                        |i1, i2| i1 & i2,
-                    );
+                    arith::op_bitwise_k(base_stk, &mut pc, instr, constants, lua53, |i1, i2| {
+                        i1 & i2
+                    });
                 }
                 OpCode::BOrK => {
-                    arith::op_bitwise_k(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        constants,
-                        lua53,
-                        |i1, i2| i1 | i2,
-                    );
+                    arith::op_bitwise_k(base_stk, &mut pc, instr, constants, lua53, |i1, i2| {
+                        i1 | i2
+                    });
                 }
                 OpCode::BXorK => {
-                    arith::op_bitwise_k(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        constants,
-                        lua53,
-                        |i1, i2| i1 ^ i2,
-                    );
+                    arith::op_bitwise_k(base_stk, &mut pc, instr, constants, lua53, |i1, i2| {
+                        i1 ^ i2
+                    });
                 }
                 OpCode::BAnd => {
-                    arith::op_bitwise(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        lua53,
-                        |i1, i2| i1 & i2,
-                    );
+                    arith::op_bitwise(base_stk, &mut pc, instr, lua53, |i1, i2| i1 & i2);
                 }
                 OpCode::BOr => {
-                    arith::op_bitwise(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        lua53,
-                        |i1, i2| i1 | i2,
-                    );
+                    arith::op_bitwise(base_stk, &mut pc, instr, lua53, |i1, i2| i1 | i2);
                 }
                 OpCode::BXor => {
-                    arith::op_bitwise(
-                        base_stk,
-                        &mut pc,
-                        instr,
-                        lua53,
-                        |i1, i2| i1 ^ i2,
-                    );
+                    arith::op_bitwise(base_stk, &mut pc, instr, lua53, |i1, i2| i1 ^ i2);
                 }
                 OpCode::Shl => {
                     arith::op_bitwise(base_stk, &mut pc, instr, lua53, lua_shiftl);
@@ -1244,9 +1222,11 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                         continue;
                     }
 
-                    // Generic path: C function or metamethod
+                    // Fast C-callable path, else cold __call metamethod path
                     ci.save_pc(pc);
-                    if precall(lua_state, func_idx, nargs, nresults)? {
+                    if func.is_c_callable() {
+                        call_c_function(lua_state, func_idx, nargs, nresults)?;
+                    } else if precall(lua_state, func_idx, nargs, nresults)? {
                         if ccmt_depth > 0 {
                             unsafe {
                                 (*lua_state.current_ci_ptr()).call_status |=
@@ -1429,8 +1409,7 @@ pub fn lua_execute(lua_state: &mut LuaState, target_depth: usize) -> LuaResult<(
                     // (wrapping) and lets FORLOOP decide whether to run at all.
                     if initial_slot.is_integer()
                         && step_slot.is_integer()
-                        && let Some((limit, stop_now)) =
-                            for_limit53(limit_slot, step_slot.ivalue())
+                        && let Some((limit, stop_now)) = for_limit53(limit_slot, step_slot.ivalue())
                     {
                         let step = step_slot.ivalue();
                         let initial = if stop_now { 0 } else { initial_slot.ivalue() };

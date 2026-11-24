@@ -13,7 +13,9 @@ fn local_name_matches(name: &std::ffi::OsStr, wanted: &std::ffi::OsStr) -> bool 
     let (name_bytes, wanted_bytes) = (name.as_encoded_bytes(), wanted.as_encoded_bytes());
     name_bytes.eq_ignore_ascii_case(wanted_bytes)
         || (!(name_bytes.is_ascii() && wanted_bytes.is_ascii())
-            && name.to_string_lossy().eq_ignore_ascii_case(&wanted.to_string_lossy()))
+            && name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&wanted.to_string_lossy()))
 }
 
 /// Metadata for an embedded OpenType or TrueType font face discovered at build time.
@@ -76,9 +78,8 @@ fn embedded_font_entry(path: &str) -> Option<[u32; 5]> {
         return None;
     }
     let entry = embedded_tree::path_file_entry(path)?;
-    let position = PACKAGE_FONT_INFO.binary_search_by(|[member, _, _, _, _]| {
-        (member as usize).cmp(&entry)
-    })?;
+    let position =
+        PACKAGE_FONT_INFO.binary_search_by(|[member, _, _, _, _]| (member as usize).cmp(&entry))?;
     PACKAGE_FONT_INFO.get(position)
 }
 
@@ -179,7 +180,10 @@ pub fn platform_cache_dir() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home).join("Library").join("Caches").join("tex-rs");
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Caches")
+            .join("tex-rs");
     }
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir).join("tex-rs");
@@ -247,7 +251,10 @@ struct ChunkCache {
 
 impl ChunkCache {
     fn get(&mut self, chunk_index: usize) -> Option<std::sync::Arc<[u8]>> {
-        let position = self.entries.iter().position(|(index, _)| *index == chunk_index)?;
+        let position = self
+            .entries
+            .iter()
+            .position(|(index, _)| *index == chunk_index)?;
         let entry = self.entries.remove(position)?;
         let bytes = entry.1.clone();
         self.entries.push_back(entry);
@@ -273,17 +280,24 @@ impl ChunkCache {
 static CHUNK_CACHE: std::sync::Mutex<Option<ChunkCache>> = std::sync::Mutex::new(None);
 const MAX_PACKAGE_CHUNK_BYTES: usize = 128 * 1024 * 1024;
 
+thread_local! {
+    static PACKAGE_CHUNK_DECODER: std::cell::RefCell<ruzstd::decoding::FrameDecoder> =
+        std::cell::RefCell::new({
+            let mut dec = ruzstd::decoding::FrameDecoder::new();
+            dec.set_max_window_size(MAX_PACKAGE_CHUNK_BYTES as u64);
+            dec
+        });
+}
+
 fn decode_package_chunk(compressed: &[u8], expected_len: usize) -> Option<Vec<u8>> {
     if expected_len > MAX_PACKAGE_CHUNK_BYTES {
         return None;
     }
-    let mut decoder = ruzstd::decoding::FrameDecoder::new();
-    // The build-time encoder declares its fixed match window (128 KiB), which
-    // can exceed a short chunk's length; the output itself is bounded below.
-    decoder.set_max_window_size(MAX_PACKAGE_CHUNK_BYTES as u64);
     let mut decoded = vec![0; expected_len];
-    // Fails with `TargetTooSmall` when the frame holds more than expected.
-    let written = decoder.decode_all(compressed, &mut decoded).ok()?;
+    let written = PACKAGE_CHUNK_DECODER.with(|cell| {
+        let mut decoder = cell.borrow_mut();
+        decoder.decode_all(compressed, &mut decoded).ok()
+    })?;
     (written == expected_len).then_some(decoded)
 }
 
@@ -300,7 +314,10 @@ fn package_entry(filename: &str) -> Option<usize> {
     if is_explicit_path(filename) {
         return None;
     }
-    let name = Path::new(filename).file_name().and_then(|s| s.to_str()).unwrap_or(filename);
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
     PACKAGE_INDEX
         .binary_search_by(|entry| package_name(entry).cmp(name.as_bytes()))
         .or_else(|| {
@@ -460,7 +477,10 @@ fn embedded_tex_input(name: &str, tex_tree_only: bool) -> Option<(String, Vec<u8
     if is_explicit_path(name) || !fs::embedded_allowed() {
         return None;
     }
-    let clean = Path::new(name).file_name().and_then(|value| value.to_str()).unwrap_or(name);
+    let clean = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
     Kpse::candidates(clean, Format::Tex)
         .into_iter()
         .find_map(|candidate| {
@@ -484,9 +504,9 @@ const WALK_BUDGET: usize = 100_000;
 /// File format categories, each with its own TDS search subdirectories.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Format {
-    Tex, // .tex .ltx .cls .sty .clo .fd .dfu .cfg .def .ldf
-    Tfm, // .tfm
-    Vf,  // .vf (virtual font: char packets mapping into base fonts)
+    Tex,   // .tex .ltx .cls .sty .clo .fd .dfu .cfg .def .ldf
+    Tfm,   // .tfm
+    Vf,    // .vf (virtual font: char packets mapping into base fonts)
     Type1, // .pfb .pfa
     Truetype,
     Enc, // .enc (glyph encoding files)
@@ -1031,7 +1051,9 @@ impl Kpse {
                 }
                 let element = search_element(element);
                 for format in formats {
-                    m.entry(*format).or_insert_with(Vec::new).push(element.clone());
+                    m.entry(*format)
+                        .or_insert_with(Vec::new)
+                        .push(element.clone());
                 }
             }
         }
@@ -1847,7 +1869,10 @@ fn search_element(element: PathBuf) -> (PathBuf, bool) {
     match element.to_str().and_then(|text| text.strip_suffix("//")) {
         Some(base) => {
             let base = base.trim_end_matches('/');
-            (PathBuf::from(if base.is_empty() { "/" } else { base }), true)
+            (
+                PathBuf::from(if base.is_empty() { "/" } else { base }),
+                true,
+            )
         }
         None => (element, false),
     }
@@ -2144,7 +2169,10 @@ mod tests {
         let mut readers: Vec<(Box<dyn Read>, usize)> = Vec::new();
         let supplement = assets.join("packages-supplement.tar.zst");
         if supplement.exists() {
-            readers.push((Box::new(std::fs::File::open(supplement).unwrap()), usize::MAX));
+            readers.push((
+                Box::new(std::fs::File::open(supplement).unwrap()),
+                usize::MAX,
+            ));
         }
         let mut chained: Box<dyn Read> = Box::new(std::io::empty());
         for p in part_paths {
@@ -2192,7 +2220,10 @@ mod tests {
         assert!(get_embedded_package("example-image-a.pdf").is_some());
         assert!(has_embedded_package("zplb.pfb") && has_embedded_package("zplmi.vf"));
         let map = String::from_utf8(get_embedded_package("pdftex.map").unwrap()).unwrap();
-        let record = map.lines().find(|line| line.starts_with("zpl-Bold-tlf-t1 ")).unwrap();
+        let record = map
+            .lines()
+            .find(|line| line.starts_with("zpl-Bold-tlf-t1 "))
+            .unwrap();
         assert!(record.ends_with("<zplb.pfb"), "{record}");
         // The consolidated map keeps the main archive's records.
         assert!(map.lines().any(|line| line.starts_with("cmr10 ")));
@@ -2229,7 +2260,10 @@ mod tests {
             assert!(has_embedded_package(name), "{name} is embedded");
             assert!(get_embedded_tex_tree_input(name).is_none(), "{name}");
         }
-        assert_eq!(get_embedded_tex_tree_input("article.cls").unwrap().0, "article.cls");
+        assert_eq!(
+            get_embedded_tex_tree_input("article.cls").unwrap().0,
+            "article.cls"
+        );
     }
 
     #[test]
@@ -2281,7 +2315,10 @@ mod tests {
         // Both ends of the embedded archive decode, so it is neither
         // truncated nor shifted relative to the chunk table. The shortest
         // chunk is smaller than the window its frame header declares.
-        let shortest = *chunks.iter().min_by_key(|[_, _, decoded]| *decoded).unwrap();
+        let shortest = *chunks
+            .iter()
+            .min_by_key(|[_, _, decoded]| *decoded)
+            .unwrap();
         for [offset, length, decoded] in [chunks[0], chunks[chunks.len() - 1], shortest] {
             let compressed = &PACKAGES[offset as usize..(offset + length) as usize];
             assert!(decode_package_chunk(compressed, decoded as usize).is_some());
@@ -2302,7 +2339,10 @@ mod tests {
             sequential.extend(decode_package_chunk(frame, decoded as usize).unwrap());
             chunk += 1;
         }
-        assert!(chunk - first as usize > 1, "the largest member spans several frames");
+        assert!(
+            chunk - first as usize > 1,
+            "the largest member spans several frames"
+        );
         assert_eq!(read_package_entry(index).unwrap(), sequential);
     }
 
@@ -2315,7 +2355,10 @@ mod tests {
         for index in 0..64 {
             cache.insert(index, chunk(LARGEST_CACHED / 3));
             assert!(cache.bytes <= CHUNK_CACHE_BYTES);
-            assert_eq!(cache.bytes, cache.entries.iter().map(|(_, c)| c.len()).sum::<usize>());
+            assert_eq!(
+                cache.bytes,
+                cache.entries.iter().map(|(_, c)| c.len()).sum::<usize>()
+            );
         }
         // Least recently used goes first; a lookup refreshes an entry.
         let oldest = cache.entries.front().unwrap().0;
@@ -2329,7 +2372,11 @@ mod tests {
     fn explicit_paths_never_resolve_to_bundled_files() {
         assert!(get_embedded_package("article.cls").is_some());
         assert!(get_embedded_package("base/article.cls").is_some());
-        for name in ["./article.cls", "../article.cls", "/no/such/dir/article.cls"] {
+        for name in [
+            "./article.cls",
+            "../article.cls",
+            "/no/such/dir/article.cls",
+        ] {
             assert!(!has_embedded_package(name), "{name}");
             assert!(get_embedded_package(name).is_none(), "{name}");
         }
@@ -2365,19 +2412,25 @@ mod tests {
         tmp.write("project/shared.sty", "% project copy");
         let selected = tmp.write("styles/deep/er/shared.sty", "% styles copy");
         let mut kpse = Kpse::explicit(&cwd, Vec::new());
-        kpse.extra_paths.insert(Format::Tex, vec![(styles.clone(), true)]);
+        kpse.extra_paths
+            .insert(Format::Tex, vec![(styles.clone(), true)]);
 
         assert_eq!(kpse.find("shared.sty", Format::Tex), Some(selected.clone()));
         assert_eq!(
             kpse.explain_lookup("shared.sty", Format::Tex).source_kind,
             Some(LookupSourceKind::EnvironmentPath)
         );
-        assert_eq!(kpse.read("shared.sty", Format::Tex).unwrap(), b"% styles copy");
+        assert_eq!(
+            kpse.read("shared.sty", Format::Tex).unwrap(),
+            b"% styles copy"
+        );
         let (present, directories, _, _, _, complete) =
             kpse.lookup_dependencies("shared.sty", Format::Tex, Some(&selected));
         assert!(complete);
         assert!(present.contains(&selected));
-        assert!(directories.iter().any(|(path, _)| path == &styles.join("deep")));
+        assert!(directories
+            .iter()
+            .any(|(path, _)| path == &styles.join("deep")));
         // A nested name matches by path suffix within the subtree.
         assert_eq!(kpse.find("er/shared.sty", Format::Tex), Some(selected));
     }
@@ -2387,8 +2440,14 @@ mod tests {
         let tmp = TempDir::new("walk-budget");
         tmp.write("tree/a/b/c/other.sty", "");
         let starts = [(tmp.path().join("tree"), true)];
-        assert_eq!(walk_find_impl(&starts, "absent.sty", 2, |_, _| {}), (None, false));
-        assert_eq!(walk_find_impl(&starts, "absent.sty", 100, |_, _| {}), (None, true));
+        assert_eq!(
+            walk_find_impl(&starts, "absent.sty", 2, |_, _| {}),
+            (None, false)
+        );
+        assert_eq!(
+            walk_find_impl(&starts, "absent.sty", 100, |_, _| {}),
+            (None, true)
+        );
     }
 
     #[cfg(unix)]
@@ -2524,9 +2583,7 @@ mod tests {
         // newtx math metrics fd resolves as-is.
         let mi = kpse.find("omlntxmi.fd", Format::Tex).expect("omlntxmi.fd");
         assert!(mi.is_file());
-        let tlf = kpse
-            .find("t1ntxtlf.fd", Format::Tex)
-            .expect("t1ntxtlf.fd");
+        let tlf = kpse.find("t1ntxtlf.fd", Format::Tex).expect("t1ntxtlf.fd");
         assert!(tlf.is_file());
     }
 

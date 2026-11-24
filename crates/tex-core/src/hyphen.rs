@@ -249,13 +249,21 @@ impl Trie {
                 .filter(|&k| k >= left && k + right <= n)
                 .collect();
         }
-        // text = '.' + word + '.'; vals[i] applies before text[i]
-        let mut text = Vec::with_capacity(n + 2);
-        text.push(b'.');
-        text.extend_from_slice(word);
-        text.push(b'.');
-        let m = text.len();
-        let mut vals = vec![0u8; m + 1];
+        let m = n + 2;
+        let mut text_stack = [0u8; 132];
+        let mut vals_stack = [0u8; 132];
+        let mut text_heap;
+        let mut vals_heap;
+        let (text, vals): (&mut [u8], &mut [u8]) = if m + 1 <= 132 {
+            (&mut text_stack[..m], &mut vals_stack[..m + 1])
+        } else {
+            text_heap = vec![0u8; m];
+            vals_heap = vec![0u8; m + 1];
+            (&mut text_heap[..], &mut vals_heap[..])
+        };
+        text[0] = b'.';
+        text[1..1 + n].copy_from_slice(word);
+        text[1 + n] = b'.';
         for start in 0..m {
             let mut node = 0u32;
             for &byte in &text[start..] {
@@ -429,7 +437,12 @@ impl Trie {
         Some(
             points
                 .iter()
-                .map(|&k| key[..k.min(key.len())].iter().filter(|&&b| (b & 0xC0) != 0x80).count())
+                .map(|&k| {
+                    key[..k.min(key.len())]
+                        .iter()
+                        .filter(|&&b| (b & 0xC0) != 0x80)
+                        .count()
+                })
                 .collect(),
         )
     }
@@ -543,6 +556,68 @@ impl Trie {
     /// the `j`-th of the characters `hc`, which are scalars or UTF-16 code
     /// units and never 0.
     pub(crate) fn xe_gap_values(&self, hc: &[u32], hyf: &mut [u8]) {
+        let mut text_stack = [0u8; 260];
+        let mut gap_stack = [0usize; 66];
+        let mut vals_stack = [0u8; 264];
+        if hc.len() <= 64 {
+            let mut tlen = 1usize;
+            for (idx, &c) in hc.iter().enumerate() {
+                gap_stack[idx] = tlen;
+                match c {
+                    0..=0x7F => {
+                        text_stack[tlen] = c as u8;
+                        tlen += 1;
+                    }
+                    0x80..=0x7FF => {
+                        text_stack[tlen] = 0xC0 | (c >> 6) as u8;
+                        text_stack[tlen + 1] = 0x80 | (c & 0x3F) as u8;
+                        tlen += 2;
+                    }
+                    0x800..=0xFFFF => {
+                        text_stack[tlen] = 0xE0 | (c >> 12) as u8;
+                        text_stack[tlen + 1] = 0x80 | ((c >> 6) & 0x3F) as u8;
+                        text_stack[tlen + 2] = 0x80 | (c & 0x3F) as u8;
+                        tlen += 3;
+                    }
+                    _ => {
+                        text_stack[tlen] = 0xF0 | ((c >> 18) & 0x07) as u8;
+                        text_stack[tlen + 1] = 0x80 | ((c >> 12) & 0x3F) as u8;
+                        text_stack[tlen + 2] = 0x80 | ((c >> 6) & 0x3F) as u8;
+                        text_stack[tlen + 3] = 0x80 | (c & 0x3F) as u8;
+                        tlen += 4;
+                    }
+                }
+            }
+            gap_stack[hc.len()] = tlen;
+            text_stack[tlen] = 0;
+            tlen += 1;
+            let text = &text_stack[..tlen];
+            let vals = &mut vals_stack[..tlen + 1];
+            for start in 0..tlen {
+                if text[start] & 0xC0 == 0x80 {
+                    continue;
+                }
+                let mut node = 0u32;
+                for &byte in &text[start..] {
+                    let Some(next) = self.child(node, byte) else {
+                        break;
+                    };
+                    node = next;
+                    let mut link = self.nodes[node as usize].value;
+                    while link != NO_LINK {
+                        let entry = self.values[link as usize];
+                        let slot = &mut vals[start + entry.pos as usize];
+                        *slot = (*slot).max(entry.value);
+                        link = entry.next;
+                    }
+                }
+            }
+            for (j, &at) in gap_stack[..=hc.len()].iter().enumerate() {
+                hyf[j] = vals[at];
+            }
+            return;
+        }
+
         let mut text: Vec<u8> = Vec::with_capacity(hc.len() * 2 + 2);
         let mut gap_at: Vec<usize> = Vec::with_capacity(hc.len() + 1);
         text.push(0);
@@ -605,31 +680,45 @@ impl Trie {
     /// character any pattern of this language contains (at least 256, TeX's
     /// initial value).
     pub(crate) fn xe_max_pattern_char(&self) -> u32 {
-        // Depth-first over the nodes, decoding the generalized UTF-8 key
-        // bytes of the path on the way down: `rem` continuation bytes of the
-        // character in `accum` are still to come (a node inside a character
-        // counts it with the missing bits zero, never more than the whole
-        // character its descendants complete).
-        let mut max = 256u32;
-        let mut stack: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
-        while let Some((node, accum, rem)) = stack.pop() {
-            max = max.max(accum << (6 * rem));
-            let mut child = self.nodes[node as usize].child;
-            while child != NO_LINK {
-                let b = u32::from(self.nodes[child as usize].byte);
-                let next = if rem > 0 {
-                    ((accum << 6) | (b & 0x3F), rem - 1)
-                } else {
-                    match b {
-                        0..=0x7F => (b, 0),
-                        0xC0..=0xDF => (b & 0x1F, 1),
-                        0xE0..=0xEF => (b & 0x0F, 2),
-                        _ => (b & 0x07, 3),
-                    }
-                };
-                stack.push((child, next.0, next.1));
-                child = self.nodes[child as usize].sibling;
+        // In `xe_push_key`'s generalized UTF-8:
+        // - continuation bytes are `0x80..=0xBF`
+        // - characters `<= 255` only ever emit bytes `< 0xC4`
+        // - every character `>= 256` starts at a node with lead byte `>= 0xC4`,
+        //   followed by 1..=3 continuation-byte child levels.
+        fn descend_max(nodes: &[TrieNode], node: u32, accum: u32, rem: u32, max: &mut u32) {
+            if rem == 0 {
+                *max = (*max).max(accum);
+                return;
             }
+            if (accum << (6 * rem)) | ((1u32 << (6 * rem)) - 1) <= *max {
+                return;
+            }
+            let mut child = nodes[node as usize].child;
+            if child == NO_LINK {
+                *max = (*max).max(accum << (6 * rem));
+                return;
+            }
+            while child != NO_LINK {
+                let b = u32::from(nodes[child as usize].byte);
+                descend_max(nodes, child, (accum << 6) | (b & 0x3F), rem - 1, max);
+                child = nodes[child as usize].sibling;
+            }
+        }
+
+        let nodes = &self.nodes;
+        let mut max = 256u32;
+        for idx in 1..nodes.len() {
+            let b = nodes[idx].byte;
+            if b < 0xC4 {
+                continue;
+            }
+            let b32 = u32::from(b);
+            let (accum, rem) = match b {
+                0xC4..=0xDF => (b32 & 0x1F, 1u32),
+                0xE0..=0xEF => (b32 & 0x0F, 2u32),
+                _ => (b32 & 0x07, 3u32),
+            };
+            descend_max(nodes, idx as u32, accum, rem, &mut max);
         }
         max
     }
@@ -749,7 +838,10 @@ impl Engine {
                 // repeat get_token until cur_cmd=right_brace
                 loop {
                     let t = self.get_token();
-                    if t == crate::input::EOF_MARKER || (t.is_char() && t.cc() == 2) || self.stopped_on_error {
+                    if t == crate::input::EOF_MARKER
+                        || (t.is_char() && t.cc() == 2)
+                        || self.stopped_on_error
+                    {
                         return;
                     }
                 }
@@ -827,12 +919,18 @@ impl Engine {
                         if hc[hc.len() - 1] == 0 {
                             *hyf.last_mut().expect("hyf[k]") = 0;
                         }
-                        if self.trie_for_language_mut(lang).xe_insert_pattern(&hc, &hyf) {
+                        if self
+                            .trie_for_language_mut(lang)
+                            .xe_insert_pattern(&hc, &hyf)
+                        {
                             self.error("Duplicate pattern");
                         }
                     }
                     if matches!(tok, HyphToken::RightBrace) {
-                        if self.eqtb.int_params[crate::prim::IntParam::SavingHyphCodes.idx() as usize] > 0 {
+                        if self.eqtb.int_params
+                            [crate::prim::IntParam::SavingHyphCodes.idx() as usize]
+                            > 0
+                        {
                             let mut table = Box::new([0u16; 256]);
                             for (c, slot) in table.iter_mut().enumerate() {
                                 *slot = self.eqtb.case_code(c as u32, false) as u16;

@@ -1,150 +1,41 @@
 -- Reading files of the embedded archive through the standard `io` and
 -- `loadfile` functions. Paths below `/<embedded>/` (what `kpse.find_file`
 -- reports for bundled files) denote a read-only virtual TDS tree; the
--- handles returned for them behave like read-only `io.open` handles of
--- an ordinary file (so `fio`, `lfs.lock`, ... accept them).
+-- handles returned for them are native `EmbeddedFile` userdata with the
+-- `FILE*` method surface so `fio`, `lfs`, and `io` work without Lua-table overhead.
 local S = __texres_sys
-local type, tostring, error, setmetatable, getmetatable, select, load =
-  type, tostring, error, setmetatable, getmetatable, select, load
+local type, error, load = type, error, load
 local sub, find, match, byte = string.sub, string.find, string.match, string.byte
-local tointeger = math.tointeger
 
 local is_path, read_file = S.embedded_is_path, S.embedded_read
-local open_buffer, close_buffer = S.embedded_open, S.embedded_close
-local slice_buffer, newline_buffer = S.embedded_slice, S.embedded_newline
-local number_prefix = S.embedded_number_prefix
+local open_embedded = S.embedded_open
+local vfile_type, vfile_is_closed = S.vfile_type, S.vfile_is_closed
+local vfile_read, vfile_seek, vfile_close = S.vfile_read, S.vfile_seek, S.vfile_close
 local real_open, real_lines, real_type, real_close = io.open, io.lines, io.type, io.close
 local real_loadfile, real_dofile = loadfile, dofile
 
-local ENOENT, EBADF, EISDIR, EROFS = 2, 9, 21, 30
+local ENOENT, EROFS = 2, 30
 local function failure(message, errno) return nil, message, errno end
 
 local vfile = { __name = "FILE*" }
-local methods = {}
+local methods = {
+  read = vfile_read,
+  seek = vfile_seek,
+  close = vfile_close,
+  write = S.vfile_write,
+  flush = S.vfile_flush,
+  setvbuf = S.vfile_setvbuf,
+}
 vfile.__index = methods
-
-local function check(f, name)
-  if getmetatable(f) ~= vfile then
-    error("bad argument #1 to '" .. name .. "' (FILE* expected, got " .. type(f) .. ")", 3)
-  end
-  if f.closed then error("attempt to use a closed file", 3) end
-  return f
-end
-
-local handles = 0
-vfile.__tostring = function(f)
-  if f.closed then return "file (closed)" end
-  if not f.id then
-    handles = handles + 1
-    f.id = handles
-  end
-  return string.format("file (0x%08x)", f.id)
-end
-
--- the Lua `read` formats over the in-memory contents
-local function read_number(f)
-  local data, pos = number_prefix(f.buffer, f.pos + 1), 1
-  local _, after = find(data, "^%s*", pos)
-  pos = after + 1
-  local text = match(data, "^[+-]?0[xX]%x*%.?%x*[pP][+-]?%d+", pos)
-    or match(data, "^[+-]?0[xX]%x*%.?%x*", pos)
-    or match(data, "^[+-]?%d*%.?%d*[eE][+-]?%d+", pos)
-    or match(data, "^[+-]?%d*%.?%d*", pos)
-  f.pos = f.pos + pos - 1 + #(text or "")
-  return text and tonumber(text) or nil
-end
-
-local function read_one(f, fmt)
-  local size, pos = f.size, f.pos
-  if type(fmt) == "number" then
-    local n = tointeger(fmt) or error("bad argument to 'read' (number has no integer representation)", 3)
-    if pos >= size then return nil end
-    f.pos = pos + n
-    if f.pos > size then f.pos = size end
-    return slice_buffer(f.buffer, pos + 1, pos + n)
-  end
-  if type(fmt) ~= "string" then error("bad argument to 'read' (invalid format)", 3) end
-  local what = match(fmt, "^%*?(.)")
-  if what == "n" then return read_number(f) end
-  if what == "a" then
-    f.pos = size
-    return slice_buffer(f.buffer, pos + 1, size)
-  end
-  if what == "l" or what == "L" then
-    if pos >= size then return nil end
-    local stop = newline_buffer(f.buffer, pos + 1)
-    if stop == nil then
-      f.pos = size
-      return slice_buffer(f.buffer, pos + 1, size)
-    end
-    f.pos = stop
-    return slice_buffer(f.buffer, pos + 1, what == "L" and stop or stop - 1)
-  end
-  error("bad argument to 'read' (invalid format)", 3)
-end
-
-function methods.read(f, ...)
-  check(f, "read")
-  if f.directory then return failure("Is a directory", EISDIR) end
-  local n = select("#", ...)
-  if n == 0 then return read_one(f, "l") end
-  local results = {}
-  for i = 1, n do
-    local value = read_one(f, (select(i, ...)))
-    results[i] = value
-    if value == nil then return table.unpack(results, 1, i) end
-  end
-  return table.unpack(results, 1, n)
-end
+vfile.__close = S.vfile_close_silent
 
 function methods.lines(f, ...)
-  check(f, "lines")
+  if vfile_is_closed(f) then error("attempt to use a closed file", 2) end
   local formats = table.pack(...)
   return function()
-    if f.closed then error("file is already closed", 2) end
-    return methods.read(f, table.unpack(formats, 1, formats.n))
+    if vfile_is_closed(f) then error("file is already closed", 2) end
+    return vfile_read(f, table.unpack(formats, 1, formats.n))
   end
-end
-
-function methods.seek(f, whence, offset)
-  check(f, "seek")
-  whence = whence or "cur"
-  offset = offset or 0
-  local base
-  if whence == "set" then base = 0
-  elseif whence == "cur" then base = f.pos
-  elseif whence == "end" then base = f.size
-  else error("bad argument #1 to 'seek' (invalid option '" .. tostring(whence) .. "')", 2) end
-  local target = base + (tointeger(offset) or error("bad argument #2 to 'seek' (number has no integer representation)", 2))
-  if target < 0 then return failure("Invalid argument", 22) end
-  f.pos = target
-  return target
-end
-
-function methods.close(f)
-  check(f, "close")
-  f.closed = true
-  if f.buffer then close_buffer(f.buffer) f.buffer = nil end
-  return true
-end
-
-function methods.write(f)
-  check(f, "write")
-  return failure("Bad file descriptor", EBADF)
-end
-
-function methods.flush(f)
-  check(f, "flush")
-  return f
-end
-
-function methods.setvbuf(f)
-  check(f, "setvbuf")
-  return true
-end
-
-vfile.__close = function(f)
-  if not f.closed then methods.close(f) end
 end
 
 local function open_virtual(name, mode)
@@ -153,10 +44,10 @@ local function open_virtual(name, mode)
     error("bad argument #2 to 'open' (invalid mode)", 3)
   end
   if find(mode, "[wa+]") then return failure(name .. ": Read-only file system", EROFS) end
-  local buffer, size = open_buffer(name)
-  if buffer then return setmetatable({ buffer = buffer, size = size, pos = 0, name = name }, vfile) end
+  local f = open_embedded(name, vfile, false)
+  if f then return f end
   if lfs.attributes(name, "mode") == "directory" then
-    return setmetatable({ size = 0, pos = 0, name = name, directory = true }, vfile)
+    return open_embedded(name, vfile, true)
   end
   return failure(name .. ": No such file or directory", ENOENT)
 end
@@ -167,12 +58,11 @@ function io.open(name, mode)
 end
 
 function io.type(f)
-  if getmetatable(f) == vfile then return f.closed and "closed file" or "file" end
-  return real_type(f)
+  return vfile_type(f) or real_type(f)
 end
 
 function io.close(f)
-  if getmetatable(f) == vfile then return methods.close(f) end
+  if vfile_type(f) ~= nil then return vfile_close(f) end
   return real_close(f)
 end
 
@@ -182,9 +72,9 @@ function io.lines(name, ...)
     if not f then error(message, 2) end
     local formats = table.pack(...)
     return function()
-      if f.closed then error("file is already closed", 2) end
-      local results = table.pack(methods.read(f, table.unpack(formats, 1, formats.n)))
-      if results[1] == nil then methods.close(f) end
+      if vfile_is_closed(f) then error("file is already closed", 2) end
+      local results = table.pack(vfile_read(f, table.unpack(formats, 1, formats.n)))
+      if results[1] == nil then vfile_close(f) end
       return table.unpack(results, 1, results.n)
     end
   end

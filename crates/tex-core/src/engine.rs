@@ -669,6 +669,7 @@ pub struct Engine {
     /// XeTeX OpenType math state (`cur_f`, font and glyph caches)
     pub(crate) xe_math: crate::math_xetex::XeMathState,
     pub(crate) token_vec_pool: Vec<Vec<crate::token::Token>>,
+    pub(crate) csname_pool: Vec<Vec<u8>>,
     /// The previous line buffer of a file source, reused for the next line.
     pub(crate) spare_line_buf: Vec<u8>,
     /// Unicode engines spell control-sequence names here before interning.
@@ -885,7 +886,11 @@ impl Engine {
                 }
             }
             Self::append_transcript_bounded(&mut self.term, text);
-            self.term_offset = crate::tex_print::advance_offset(self.term_offset, text, crate::tex_bytes::is_unicode_xprn(&self.xprn));
+            self.term_offset = crate::tex_print::advance_offset(
+                self.term_offset,
+                text,
+                crate::tex_bytes::is_unicode_xprn(&self.xprn),
+            );
         }
     }
 
@@ -909,7 +914,11 @@ impl Engine {
             }
         }
         Self::append_transcript_bounded(&mut self.log, text);
-        self.file_offset = crate::tex_print::advance_offset(self.file_offset, text, crate::tex_bytes::is_unicode_xprn(&self.xprn));
+        self.file_offset = crate::tex_print::advance_offset(
+            self.file_offset,
+            text,
+            crate::tex_bytes::is_unicode_xprn(&self.xprn),
+        );
     }
 
     /// The exact bytes of the transcript (the `.log` file).
@@ -925,9 +934,9 @@ impl Engine {
     fn external_bytes<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, [u8]> {
         let bytes = crate::tex_bytes::text_to_bytes(text);
         match &self.tcx {
-            Some(tcx) => std::borrow::Cow::Owned(
-                bytes.iter().map(|&b| tcx.xchr[usize::from(b)]).collect(),
-            ),
+            Some(tcx) => {
+                std::borrow::Cow::Owned(bytes.iter().map(|&b| tcx.xchr[usize::from(b)]).collect())
+            }
             None => bytes,
         }
     }
@@ -1235,6 +1244,7 @@ impl Engine {
             recent_pushed: None,
             skipped_level: None,
             token_vec_pool: Vec::with_capacity(512),
+            csname_pool: Vec::with_capacity(16),
             spare_line_buf: Vec::new(),
             cs_name_scratch: Vec::new(),
             pdf_creation_date: None,
@@ -1669,8 +1679,14 @@ impl Engine {
             (b"pdfmovechars", IntParam::PdfMoveChars),
             (b"pdfimageresolution", IntParam::PdfImageResolution),
             (b"pdfuniqueresname", IntParam::PdfUniqueResname),
-            (b"pdfoptionalwaysusepdfpagebox", IntParam::PdfOptionAlwaysUsePdfPagebox),
-            (b"pdfoptionpdfinclusionerrorlevel", IntParam::PdfOptionPdfInclusionErrorlevel),
+            (
+                b"pdfoptionalwaysusepdfpagebox",
+                IntParam::PdfOptionAlwaysUsePdfPagebox,
+            ),
+            (
+                b"pdfoptionpdfinclusionerrorlevel",
+                IntParam::PdfOptionPdfInclusionErrorlevel,
+            ),
             (b"pdfforcepagebox", IntParam::PdfForcePagebox),
             (b"pdfpagebox", IntParam::PdfPagebox),
             (b"pdfinclusionerrorlevel", IntParam::PdfInclusionErrorlevel),
@@ -1679,8 +1695,14 @@ impl Engine {
             (b"pdfimagehicolor", IntParam::PdfImageHicolor),
             (b"pdfimageapplygamma", IntParam::PdfImageApplyGamma),
             (b"pdfinclusioncopyfonts", IntParam::PdfInclusionCopyFonts),
-            (b"pdfsuppresswarningdupdest", IntParam::PdfSuppressWarningDupDest),
-            (b"pdfsuppresswarningdupmap", IntParam::PdfSuppressWarningDupMap),
+            (
+                b"pdfsuppresswarningdupdest",
+                IntParam::PdfSuppressWarningDupDest,
+            ),
+            (
+                b"pdfsuppresswarningdupmap",
+                IntParam::PdfSuppressWarningDupMap,
+            ),
             (b"pdfomitcharset", IntParam::PdfOmitCharset),
             (b"pdfomitinfodict", IntParam::PdfOmitInfoDict),
             (b"pdfomitprocset", IntParam::PdfOmitProcset),
@@ -2066,7 +2088,10 @@ impl Engine {
         }
         // TeX82 defaults (tex.web §25 / plain.tex)
         for (param, glue) in [
-            (GlueParam::ParFillSkip, crate::boxes::Glue::fil(crate::boxes::GLUE_FIL, 0)),
+            (
+                GlueParam::ParFillSkip,
+                crate::boxes::Glue::fil(crate::boxes::GLUE_FIL, 0),
+            ),
             (GlueParam::BaselineSkip, crate::boxes::Glue::new(12 * 65536)),
             (GlueParam::LineSkip, crate::boxes::Glue::new(65536)),
             // plain.tex / fontmath.ltx: \thinmuskip=3mu, \medmuskip=4mu plus
@@ -2179,8 +2204,11 @@ impl Engine {
             def(name, DimP(p), eng);
         }
         // pdftex.web frozen_primitive: the internal \pdfprimitive marker
-        eng.eqtb
-            .assign(eng.ids.frozen_primitive, Equiv::Prim(PdfPrimitiveExec), true);
+        eng.eqtb.assign(
+            eng.ids.frozen_primitive,
+            Equiv::Prim(PdfPrimitiveExec),
+            true,
+        );
         // pdftex.web prim_lookup table: every primitive name registered
         let mut table = crate::FxHashMap::default();
         for id in eng.cs.all_ids() {
@@ -2208,7 +2236,11 @@ impl Engine {
         // e-TeX group_warning needs the closing group's identity, which
         // unsave is about to forget
         let closing_boundary = self.eqtb.cur_boundary();
-        let closing = if self.file_nests.last().map_or(false, |n| n.boundary == closing_boundary) {
+        let closing = if self
+            .file_nests
+            .last()
+            .map_or(false, |n| n.boundary == closing_boundary)
+        {
             self.eqtb.groups.last().map(|group| {
                 (
                     self.eqtb.outer_boundary(),
@@ -2795,8 +2827,10 @@ mod capacity_tests {
     fn page_list_limit_aborts() {
         let mut eng = Engine::new(true);
         eng.init_primitives();
-        eng.page_list
-            .resize(MAIN_MEMORY_WORDS + 1, crate::boxes::Node::Penalty(0, crate::boxes::Attr::NONE));
+        eng.page_list.resize(
+            MAIN_MEMORY_WORDS + 1,
+            crate::boxes::Node::Penalty(0, crate::boxes::Attr::NONE),
+        );
         assert!(eng.capacity_exceeded());
         assert!(eng.end_occurred);
     }

@@ -18,8 +18,12 @@ use tex_lua::{Lua, LuaApi, LuaString, LuaTable};
 /// Register a native primitive in a table.
 macro_rules! sys_reg {
     ($lua:expr, $tbl:expr, $name:literal, $f:expr) => {
-        $tbl.set($name, $lua.create_function($f).map_err(|e| format!("{}: {e:?}", $name))?)
-            .map_err(|e| format!("{}: {e:?}", $name))?
+        $tbl.set(
+            $name,
+            $lua.create_function($f)
+                .map_err(|e| format!("{}: {e:?}", $name))?,
+        )
+        .map_err(|e| format!("{}: {e:?}", $name))?
     };
 }
 pub(crate) use sys_reg;
@@ -228,7 +232,10 @@ impl tex_lua::UserDataTrait for HandleUd {
     }
 
     fn get_field(&self, key: &str) -> Option<tex_lua::UdValue> {
-        (key == "id").then(|| self.0.map_or(tex_lua::UdValue::Nil, tex_lua::UdValue::Integer))
+        (key == "id").then(|| {
+            self.0
+                .map_or(tex_lua::UdValue::Nil, tex_lua::UdValue::Integer)
+        })
     }
 
     fn set_field(&mut self, key: &str, value: tex_lua::UdValue) -> Option<Result<(), String>> {
@@ -273,7 +280,9 @@ fn register_handles(lua: &mut Lua, sys: &LuaTable) -> Result<(), String> {
     let address = lua
         .create_callback(|cb| {
             let value: tex_lua::Value = cb.arg(1)?;
-            let text = value.to_pointer().map_or_else(String::new, |p| format!("{:#x}", p as usize));
+            let text = value
+                .to_pointer()
+                .map_or_else(String::new, |p| format!("{:#x}", p as usize));
             cb.push(text)
         })
         .map_err(|e| format!("{e:?}"))?;
@@ -288,6 +297,7 @@ pub(crate) fn install(lua: &mut Lua) -> Result<(), String> {
     register_handles(lua, &sys)?;
     crate::lua_sys_embedded::register(lua, &sys)?;
     crate::lua_sys_lfs::register(lua, &sys)?;
+    crate::lua_sys_fio::register(lua, &sys)?;
     crate::lua_sys_hash::register(lua, &sys)?;
     crate::lua_sys_zlib::register(lua, &sys)?;
     crate::lua_sys_unicode::register(lua, &sys)?;
@@ -295,7 +305,8 @@ pub(crate) fn install(lua: &mut Lua) -> Result<(), String> {
     crate::lua_sys_status::register(lua, &sys)?;
     crate::lua_sys_kpse::register(lua, &sys)?;
     crate::lua_sys_os::register(lua, &sys)?;
-    lua.set_global("__texres_sys", sys).map_err(|e| format!("{e:?}"))?;
+    lua.set_global("__texres_sys", sys)
+        .map_err(|e| format!("{e:?}"))?;
     for (name, code) in [
         ("embedded", crate::lua_sys_embedded::PRELUDE),
         ("lfs", crate::lua_sys_lfs::PRELUDE),
@@ -311,9 +322,15 @@ pub(crate) fn install(lua: &mut Lua) -> Result<(), String> {
         lua.load(code)
             .set_name(&format!("=[texres {name}]"))
             .exec()
-            .map_err(|e| format!("lua_sys {name} prelude: {}", lua.get_error_message(e).message()))?;
+            .map_err(|e| {
+                format!(
+                    "lua_sys {name} prelude: {}",
+                    lua.get_error_message(e).message()
+                )
+            })?;
     }
-    lua.execute("__texres_sys = nil").map_err(|e| format!("{e:?}"))?;
+    lua.execute("__texres_sys = nil")
+        .map_err(|e| format!("{e:?}"))?;
     Ok(())
 }
 
@@ -323,8 +340,14 @@ mod tests {
 
     #[test]
     fn windows_paths_reach_lua_with_forward_slashes() {
-        assert_eq!(normalize_windows_path(r"C:\Users\RUNNER~1\cache\texmf-var"), "C:/Users/RUNNER~1/cache/texmf-var");
+        assert_eq!(
+            normalize_windows_path(r"C:\Users\RUNNER~1\cache\texmf-var"),
+            "C:/Users/RUNNER~1/cache/texmf-var"
+        );
         assert_eq!(normalize_windows_path(r"\\?\C:\a\b/c"), "C:/a/b/c");
-        assert_eq!(normalize_windows_path(r"\\?\UNC\host\share\x"), "//host/share/x");
+        assert_eq!(
+            normalize_windows_path(r"\\?\UNC\host\share\x"),
+            "//host/share/x"
+        );
     }
 }

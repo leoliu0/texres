@@ -236,18 +236,28 @@ pub(crate) fn row_delimiter(t: Token, eqtb: &crate::eqtb::Eqtb) -> Option<RowDel
 
 /// Whether `t` is a row delimiter (see `row_delimiter`). Inlined into the
 /// token fetch of an alignment entry, where nearly every token is a macro:
-/// one load of the meaning's tag rejects it.
+/// one byte load from `eqtb.cs_flags` rejects it without touching `EqEntry`.
 #[inline(always)]
 pub(crate) fn is_row_delimiter(t: Token, eqtb: &crate::eqtb::Eqtb) -> bool {
     if t.is_char() {
         return t.cc() == 4;
     }
-    t.is_cs()
-        && match eqtb.resolve(t.cs_id()) {
-            Some(Equiv::CharTok(raw)) => Token(*raw).cc() == 4,
-            Some(Equiv::Prim(p)) => matches!(p, Prim::Cr | Prim::CrCr),
-            _ => false,
-        }
+    if !t.is_cs() {
+        return false;
+    }
+    let id = t.cs_id();
+    let flags = eqtb.cs_flags_of(id);
+    if flags & (crate::eqtb::CS_FLAG_ROW_DELIM | crate::eqtb::CS_FLAG_ALIAS) == 0 {
+        return false;
+    }
+    if flags & crate::eqtb::CS_FLAG_ALIAS == 0 {
+        return true;
+    }
+    match eqtb.resolve(id) {
+        Some(Equiv::CharTok(raw)) => Token(*raw).cc() == 4,
+        Some(Equiv::Prim(p)) => matches!(p, Prim::Cr | Prim::CrCr),
+        _ => false,
+    }
 }
 
 impl Engine {
@@ -599,9 +609,11 @@ impl Engine {
         let mut depth = 0i32;
         let mut loop_seen = false;
         // tex.web §777: scanner_status:=aligning, warning_index:=\halign.
-        let owner = self
-            .cs
-            .lookup(if self.align_is_valign { b"valign" } else { b"halign" });
+        let owner = self.cs.lookup(if self.align_is_valign {
+            b"valign"
+        } else {
+            b"halign"
+        });
         let saved_outer_scan = self
             .outer_scan
             .replace((crate::expand::OuterScan::Preamble, owner));
@@ -1219,7 +1231,10 @@ impl Engine {
         // internal vertical mode for \halign and restricted horizontal mode
         // for \valign
         if self.align_is_valign {
-            self.align_push_cell_group(Mode::RestrictedHorizontal, crate::eqtb::group_code::NO_ALIGN);
+            self.align_push_cell_group(
+                Mode::RestrictedHorizontal,
+                crate::eqtb::group_code::NO_ALIGN,
+            );
             self.space_factor = 1000;
         } else {
             self.align_push_cell_group(Mode::InternalVertical, crate::eqtb::group_code::NO_ALIGN);
@@ -1241,7 +1256,10 @@ impl Engine {
             }
         });
         // with Lua shaping the rows the depth comes from what it left
-        self.prev_depth = self.lua_align_noalign_depth().or(tex_depth).unwrap_or(outer_pd);
+        self.prev_depth = self
+            .lua_align_noalign_depth()
+            .or(tex_depth)
+            .unwrap_or(outer_pd);
         self.align_pushed_base = self.pushed.len();
         // The consumed `{` is the no_align_group itself: its `}` is routed
         // to align_finish_noalign_now by align_close_noalign_brace.
@@ -1376,7 +1394,9 @@ impl Engine {
                 glue_order: 0,
                 glue_set: 0.0,
                 lr: 0,
-                dir: 0, attr: self.eqtb.cur_attr, subtype: 0,
+                dir: 0,
+                attr: self.eqtb.cur_attr,
+                subtype: 0,
             };
             self.align_rows.push(vec![Cell {
                 packed: Some(node),
@@ -1607,7 +1627,11 @@ impl Engine {
         // \overfullrule is suppressed for this pack.
         let cur_attr = self.eqtb.cur_attr;
         let column = |w: i32| Node::Box {
-            kind: if valign { crate::boxes::VBOX } else { crate::boxes::HBOX },
+            kind: if valign {
+                crate::boxes::VBOX
+            } else {
+                crate::boxes::HBOX
+            },
             w: if valign { 0 } else { w },
             h: if valign { w } else { 0 },
             d: 0,
@@ -1618,7 +1642,8 @@ impl Engine {
             glue_set: 0.0,
             lr: 0,
             dir: 0,
-            attr: cur_attr, subtype: 0,
+            attr: cur_attr,
+            subtype: 0,
         };
         let mut preamble: NodeList = Vec::with_capacity(2 * ncols + 1);
         preamble.push(Node::Glue(t0, self.eqtb.cur_attr));
@@ -1633,7 +1658,8 @@ impl Engine {
         // luatex fin_align: the preamble of a `\valign` goes through
         // `filtered_vpackage(..., preamble_group, ...)`
         if valign && self.engine_kind == crate::engine::EngineKind::LuaTeX {
-            preamble = self.lua_preamble_filter(preamble, dim.unwrap_or(0), dim.is_some() && !spread);
+            preamble =
+                self.lua_preamble_filter(preamble, dim.unwrap_or(0), dim.is_some() && !spread);
         }
         let preamble_len = preamble.len();
         let mut res = if valign {
@@ -1655,7 +1681,9 @@ impl Engine {
         let origin = self.align_origin.clone();
         // tex.web §804: `pack_begin_line:=-mode_line` while the preamble
         // is packaged ("in alignment at lines a--b")
-        let align_line = origin.as_ref().map_or(0, |mark| mark.to_context().line as i32);
+        let align_line = origin
+            .as_ref()
+            .map_or(0, |mark| mark.to_context().line as i32);
         let saved_begin = std::mem::replace(&mut self.pack_begin_line, -align_line);
         self.report_pack_warnings_at(&mut res, origin);
         self.pack_begin_line = saved_begin;
@@ -1667,7 +1695,12 @@ impl Engine {
                 glue_order,
                 glue_set,
                 ..
-            } => (if valign { *h } else { *w }, *glue_sign, *glue_order, *glue_set),
+            } => (
+                if valign { *h } else { *w },
+                *glue_sign,
+                *glue_order,
+                *glue_set,
+            ),
             _ => (0, 0, 0, 0.0),
         };
         // the amount a tabskip glue contributes under the preamble setting
@@ -1715,7 +1748,9 @@ impl Engine {
         };
         // luatex: with `append_to_vlist_filter` registered the callback, not
         // `append_to_vlist`, decides about glue and `prev_depth`
-        let any_handled = rows_in.iter().any(|r| r.first().is_some_and(|c| c.ctl.handled));
+        let any_handled = rows_in
+            .iter()
+            .any(|r| r.first().is_some_and(|c| c.ctl.handled));
         let mut cb_depth: Option<i32> = None;
         // luatex `fin_align` divides integers when it sets the glue of a
         // `\valign` cell (the `\halign` branch casts to double)
@@ -1725,7 +1760,13 @@ impl Engine {
         // alignment's boundaries; in a display it is boxed and shifted like
         // a row
         let fix_rule = |mut n: Node| -> Node {
-            if let Node::Rule { width, height, depth, .. } = &mut n {
+            if let Node::Rule {
+                width,
+                height,
+                depth,
+                ..
+            } = &mut n
+            {
                 if valign {
                     if *height == crate::build::RULE_FILL {
                         *height = p_size;
@@ -1737,7 +1778,8 @@ impl Engine {
                     *width = p_size;
                 }
                 if o != 0 {
-                    let mut b = crate::boxes::hpack(vec![n], None, crate::boxes::HBOX, &self.eqtb).node;
+                    let mut b =
+                        crate::boxes::hpack(vec![n], None, crate::boxes::HBOX, &self.eqtb).node;
                     if let Node::Box { shift, .. } = &mut b {
                         *shift = o;
                     }
@@ -1778,8 +1820,11 @@ impl Engine {
         let mut bad_box = false;
         for (mut row, adj) in rows_in.into_iter().zip(row_adj) {
             if row.len() == 1 && row[0].span == NOALIGN_SPAN {
-                if let Some(Node::Box { list, shift: end_pd, .. }) =
-                    row.into_iter().next().and_then(|c| c.packed)
+                if let Some(Node::Box {
+                    list,
+                    shift: end_pd,
+                    ..
+                }) = row.into_iter().next().and_then(|c| c.packed)
                 {
                     if !valign {
                         prev = (end_pd > self.ignore_depth()).then_some(end_pd);
@@ -1792,7 +1837,9 @@ impl Engine {
                 }
                 continue;
             }
-            let mut ctl = row.first_mut().map_or_else(RowCtl::default, |c| std::mem::take(&mut c.ctl));
+            let mut ctl = row
+                .first_mut()
+                .map_or_else(RowCtl::default, |c| std::mem::take(&mut c.ctl));
             // the unset row's other dimensions: fin_row's natural pack
             let (row_a, row_b) = match &ctl.repl {
                 Some(repl) => repl
@@ -1822,7 +1869,8 @@ impl Engine {
                     match item {
                         RowItem::Node(n) => nodes.push(fix_rule(n)),
                         RowItem::Row(body) => {
-                            let mut line: NodeList = Vec::with_capacity(body.list.len() + 2 * ncols);
+                            let mut line: NodeList =
+                                Vec::with_capacity(body.list.len() + 2 * ncols);
                             let mut entries = body.list.into_iter().peekable();
                             // the node in front of the first cell stays; the
                             // first cell has to be unset (fin_align "bad box")
@@ -1832,7 +1880,9 @@ impl Engine {
                                     RowEntry::Unset(u) => u.node,
                                 });
                             }
-                            bad_box |= !entries.peek().is_some_and(|e| matches!(e, RowEntry::Unset(_)));
+                            bad_box |= !entries
+                                .peek()
+                                .is_some_and(|e| matches!(e, RowEntry::Unset(_)));
                             let mut col = 0;
                             while let Some(entry) = entries.next() {
                                 match entry {
@@ -1844,8 +1894,15 @@ impl Engine {
                                             usize::from(u.shrink_order),
                                             u.shrink,
                                         );
-                                        let end =
-                                            set_cell(&mut u.node, col, u.span, Some(totals), row_a, row_b, &mut covered);
+                                        let end = set_cell(
+                                            &mut u.node,
+                                            col,
+                                            u.span,
+                                            Some(totals),
+                                            row_a,
+                                            row_b,
+                                            &mut covered,
+                                        );
                                         line.push(u.node);
                                         line.extend(covered);
                                         // the node after the cell is its tabskip glue
@@ -1862,7 +1919,11 @@ impl Engine {
                                 }
                             }
                             nodes.push(Node::Box {
-                                kind: if valign { crate::boxes::VBOX } else { crate::boxes::HBOX },
+                                kind: if valign {
+                                    crate::boxes::VBOX
+                                } else {
+                                    crate::boxes::HBOX
+                                },
                                 w: if valign { row_a } else { p_size },
                                 h: if valign { p_size } else { row_a },
                                 d: row_b,
@@ -1871,7 +1932,11 @@ impl Engine {
                                 glue_sign: p_sign,
                                 glue_order: p_order,
                                 glue_set: p_set,
-                                lr: if display { crate::boxes::BOX_LR_DLIST } else { 0 },
+                                lr: if display {
+                                    crate::boxes::BOX_LR_DLIST
+                                } else {
+                                    0
+                                },
                                 dir: 0,
                                 attr: cur_attr,
                                 subtype: crate::boxes::list_subtype::ALIGNMENT,
@@ -1885,15 +1950,29 @@ impl Engine {
                 line.push(Node::Glue(t0, cur_attr));
                 for (c, cell) in row.into_iter().enumerate() {
                     // grid slots covered by an earlier spanning cell
-                    let Some(mut cell_box) = cell.packed else { continue };
+                    let Some(mut cell_box) = cell.packed else {
+                        continue;
+                    };
                     let mut covered = NodeList::new();
-                    let end = set_cell(&mut cell_box, c, cell.span, None, row_a, row_b, &mut covered);
+                    let end = set_cell(
+                        &mut cell_box,
+                        c,
+                        cell.span,
+                        None,
+                        row_a,
+                        row_b,
+                        &mut covered,
+                    );
                     line.push(cell_box);
                     line.extend(covered);
                     line.push(Node::Glue(tabs[end], cur_attr));
                 }
                 vec![Node::Box {
-                    kind: if valign { crate::boxes::VBOX } else { crate::boxes::HBOX },
+                    kind: if valign {
+                        crate::boxes::VBOX
+                    } else {
+                        crate::boxes::HBOX
+                    },
                     w: if valign { row_a } else { p_size },
                     h: if valign { p_size } else { row_a },
                     d: if valign { 0 } else { row_b },
@@ -1902,7 +1981,11 @@ impl Engine {
                     glue_sign: p_sign,
                     glue_order: p_order,
                     glue_set: p_set,
-                    lr: if display { crate::boxes::BOX_LR_DLIST } else { 0 },
+                    lr: if display {
+                        crate::boxes::BOX_LR_DLIST
+                    } else {
+                        0
+                    },
                     dir: 0,
                     attr: cur_attr,
                     subtype: crate::boxes::list_subtype::ALIGNMENT,
@@ -1921,15 +2004,18 @@ impl Engine {
                 let (lead, trail) = self.interline_extents(row_a, row_b);
                 if let Some(pd) = prev {
                     let gap = bs.width as i64 - pd as i64 - lead as i64;
-                    rows.push(Node::Glue(if gap < lsl as i64 {
-                        ls.param(crate::boxes::glue_subtype::LINE_SKIP)
-                    } else {
-                        Glue {
-                            width: gap as i32,
-                            subtype: crate::boxes::glue_subtype::BASELINE_SKIP,
-                            ..bs.fresh()
-                        }
-                    }, cur_attr));
+                    rows.push(Node::Glue(
+                        if gap < lsl as i64 {
+                            ls.param(crate::boxes::glue_subtype::LINE_SKIP)
+                        } else {
+                            Glue {
+                                width: gap as i32,
+                                subtype: crate::boxes::glue_subtype::BASELINE_SKIP,
+                                ..bs.fresh()
+                            }
+                        },
+                        cur_attr,
+                    ));
                 }
                 prev = Some(trail);
             }
@@ -2098,7 +2184,10 @@ fn set_unset_cell(
         Some(totals) => totals,
         None => {
             let (stretch, shrink) = crate::boxes::glue_sums(list);
-            let (so, ho) = (crate::boxes::highest_glue_order(&stretch), crate::boxes::highest_glue_order(&shrink));
+            let (so, ho) = (
+                crate::boxes::highest_glue_order(&stretch),
+                crate::boxes::highest_glue_order(&shrink),
+            );
             (so, stretch[so], ho, shrink[ho])
         }
     };
@@ -2367,7 +2456,12 @@ mod tests {
         let r = row_of(&list[0]);
         // tex.web §809: the spanned cell is a box of its first column's
         // width, followed by tabskip glue and an empty box per covered column
-        assert_eq!(r.len(), 7, "T_0, cell, tabskip, span cell, tabskip, empty, T_n: {:?}", r);
+        assert_eq!(
+            r.len(),
+            7,
+            "T_0, cell, tabskip, span cell, tabskip, empty, T_n: {:?}",
+            r
+        );
         assert_eq!(box_w(&r[3]), w1);
         assert_eq!(box_w(&r[5]), w2);
         assert_eq!(w, box_w(&r[1]) + w1 + w2);
@@ -2761,7 +2855,9 @@ mod tests {
         // row boxes must not contain the adjustment node
         for r in [0usize, 3] {
             assert!(
-                row_of(&l[r]).iter().all(|n| !matches!(n, Node::VAdjust(_, _))),
+                row_of(&l[r])
+                    .iter()
+                    .all(|n| !matches!(n, Node::VAdjust(_, _))),
                 "vadjust stuck in row {r}"
             );
         }
@@ -3156,9 +3252,24 @@ mod tests {
                 "40.30554pt",
                 "1.94444pt",
             ),
-            (r"\vbox to 60pt{\halign{#\cr a\cr}\vfil\hbox{y}}", "5.2778pt", "60.0pt", "1.94444pt"),
-            (r"\vbox{\tabskip=5pt\halign{#&#&#&#\cr a&b\span c&d\cr}}", "40.5556pt", "6.94444pt", "0pt"),
-            (r"\vbox{\tabskip=5pt\halign{#&#&#\cr a\cr}}", "15.00002pt", "4.30554pt", "0pt"),
+            (
+                r"\vbox to 60pt{\halign{#\cr a\cr}\vfil\hbox{y}}",
+                "5.2778pt",
+                "60.0pt",
+                "1.94444pt",
+            ),
+            (
+                r"\vbox{\tabskip=5pt\halign{#&#&#&#\cr a&b\span c&d\cr}}",
+                "40.5556pt",
+                "6.94444pt",
+                "0pt",
+            ),
+            (
+                r"\vbox{\tabskip=5pt\halign{#&#&#\cr a\cr}}",
+                "15.00002pt",
+                "4.30554pt",
+                "0pt",
+            ),
             (
                 r"\vbox{\tabskip=1pt\halign{#&#&#\cr aaaa\cr x\span y\span\cr a&\omit\span\omit wwwwwwwwww\cr}}",
                 "95.22235pt",
@@ -3208,12 +3319,10 @@ mod tests {
     /// Live 2026 (cmr10): the row's natural width is 16.11116pt.
     #[test]
     fn span_takes_omit_status_of_the_absorbed_column() {
-        let e = run(
-            "\\font\\cmr=cmr10 \\cmr \
+        let e = run("\\font\\cmr=cmr10 \\cmr \
              \\setbox1\\vbox{\\halign{#&&[#]\\cr a\\span\\omit\\span b\\cr}}\
              \\setbox2\\vbox{\\unvbox1 \\setbox3\\lastbox\\global\\setbox4\\hbox{\\unhbox3}}\
-             \\ifdim\\wd4=16.11116pt\\else\\errmessage{wd \\the\\wd4}\\fi",
-        );
+             \\ifdim\\wd4=16.11116pt\\else\\errmessage{wd \\the\\wd4}\\fi");
         assert_eq!(e.error_count, 0, "{}", e.diagnostic_output);
     }
 }

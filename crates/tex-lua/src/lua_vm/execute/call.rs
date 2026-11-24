@@ -278,17 +278,16 @@ pub fn call_c_function(
         return Ok(());
     }
 
-    let ci_idx = lua_state.call_depth() - 1;
-    let frame_top = lua_state.get_call_info(ci_idx).top as usize;
+    let caller_ci = unsafe { &mut *lua_state.current_ci_ptr() };
+    let frame_top = caller_ci.top as usize;
     if nresults >= 0 {
         // Fixed results: restore caller's frame top
         lua_state.set_top_raw(frame_top);
     } else {
         // MULTRET: top = func_idx + n
         let new_top = func_idx + n;
-        let ci_top = lua_state.get_call_info(ci_idx).top as usize;
-        if ci_top < new_top {
-            lua_state.get_call_info_mut(ci_idx).top = new_top as u32;
+        if frame_top < new_top {
+            caller_ci.top = new_top as u32;
         }
         lua_state.set_top_raw(new_top);
     }
