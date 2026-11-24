@@ -130,52 +130,133 @@ def cpu_slots(jobs, per_job, allow_unpinned=False):
 # ---------------------------------------------------------------- one tool
 
 
-def ensure_tl_hyphenation(root: Path) -> dict:
-    """If host TeX Live's language.dat lacks non-English hyphenation patterns,
-    extract tex/generic/ from the bundled archive and dump xelatex.fmt so TL
-    polyglossia/babel runs use the same hyphenation patterns as TeX Live 2026."""
-    kpse = B.TL_BIN / "kpsewhich"
-    if kpse.exists():
-        r = B.sh([str(kpse), "language.dat"])
-        ldat = Path(r.stdout.strip()) if r.stdout.strip() else None
-        if ldat and ldat.is_file() and any(l.strip().startswith("french") for l in ldat.read_text(errors="ignore").splitlines()):
-            return {}
+def _host_tl_matches_locked(tl_texmf_check_bin: Path) -> bool:
+    """True when host TeX Live has both non-English hyphenation patterns and
+    the same LaTeX2e / L3 kernel dates as the bundled locked payload."""
+    kpse = tl_texmf_check_bin / "kpsewhich"
+    if not kpse.exists():
+        return False
+    r = B.sh([str(kpse), "language.dat"], env=B.make_env())
+    ldat = Path(r.stdout.strip()) if r.stdout.strip() else None
+    if not (ldat and ldat.is_file() and any(l.strip().startswith("french") for l in ldat.read_text(errors="ignore").splitlines())):
+        return False
+    return True
+
+
+def ensure_tl_reference_env(root: Path, pin_locked: bool = False) -> dict:
+    """Align host TeX Live's macro/font/format tree with the locked TeX Live
+    2026 payload bundled inside TeXres when gating (or when the host lacks
+    non-English hyphenation patterns or runs a different LaTeX2e release).
+
+    Host TeX Live's genuine pdftex/xetex/luahbtex/latexmk/bibtex/biber binaries
+    still execute everything; only the input tree (via ls-R-indexed TEXMFLOCAL),
+    freshly dumped host formats (TEXFORMATS), and fontconfig paths are aligned
+    so parity checks compare engines rather than drifting CTAN snapshots."""
     import glob
-    import io
-    import tarfile
+
     assets = HERE.parent / "crates" / "tex-kpse" / "assets"
     parts = sorted(glob.glob(str(assets / "packages.tar.zst.*")))
     supp_path = assets / "packages-supplement.tar.zst"
     if not parts or not supp_path.is_file():
         return {}
+
+    if not pin_locked and _host_tl_matches_locked(B.TL_BIN):
+        # Also verify host pdflatex's LaTeX2e date matches the locked payload.
+        probe = root / "probe_tl"
+        probe.mkdir(parents=True, exist_ok=True)
+        r = B.sh(
+            [str(B.TL_BIN / "pdflatex"), "-interaction=nonstopmode", "\\stop"],
+            cwd=probe,
+            env=B.make_env(),
+        )
+        shutil.rmtree(probe, ignore_errors=True)
+        if "LaTeX2e <2025-11-01>" in r.stdout and "L3 programming layer <2026-01-19>" in r.stdout:
+            return {}
+
     tl_texmf = root / "tl_texmf"
-    web2c = tl_texmf / "web2c"
-    if not (web2c / "xelatex.fmt").is_file():
-        cat = subprocess.Popen(["cat", *parts], stdout=subprocess.PIPE)
-        zst = subprocess.Popen(["zstd", "-dc"], stdin=cat.stdout, stdout=subprocess.PIPE)
-        with tarfile.open(fileobj=zst.stdout, mode="r|*") as tar:
-            for m in tar:
-                if m.isfile() and m.name.startswith("tex/generic/"):
-                    dst = tl_texmf / m.name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(tar.extractfile(m).read())
-        supp = subprocess.run(["zstd", "-dc", str(supp_path)], stdout=subprocess.PIPE, check=True).stdout
-        with tarfile.open(fileobj=io.BytesIO(supp), mode="r:") as tar:
-            for m in tar.getmembers():
-                if m.isfile() and m.name.startswith("tex/generic/"):
-                    dst = tl_texmf / m.name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(tar.extractfile(m).read())
-        web2c.mkdir(parents=True, exist_ok=True)
-        env = {**B.make_env(), "TEXINPUTS": f".:{tl_texmf / 'tex'}//:", "TEXFORMATS": f"{web2c}:"}
-        xetex = B.TL_BIN / "xetex"
-        if xetex.is_file():
-            subprocess.run([str(xetex), "-ini", "-interaction=nonstopmode", "-etex", "xelatex.ini"],
-                           cwd=web2c, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    tl_var = root / "tl_texmf_var"
+    tl_home = root / "tl_texmf_home"
+    tl_cfg = root / "tl_texmf_config"
+    fc_cache = root / "tl_fc_cache"
+    fc_conf = root / "tl_fonts.conf"
+    web2c = tl_var / "web2c"
+
+    if not (web2c / "pdftex" / "pdflatex.fmt").is_file() or not (web2c / "xetex" / "xelatex.fmt").is_file() or not (web2c / "luahbtex" / "lualatex.fmt").is_file():
+        log("preparing locked TeX Live reference overlay (TEXMFLOCAL + host formats)")
+        for d in (tl_texmf, tl_var, tl_home, tl_cfg, fc_cache, web2c / "pdftex", web2c / "xetex", web2c / "luahbtex"):
+            d.mkdir(parents=True, exist_ok=True)
+
+        p1 = subprocess.Popen(["cat", *parts], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["zstd", "-dc"], stdin=p1.stdout, stdout=subprocess.PIPE)
+        p3 = subprocess.Popen(["tar", "-x", "-C", str(tl_texmf)], stdin=p2.stdout)
+        p1.stdout.close()
+        p2.stdout.close()
+        if p3.wait() != 0 or p2.wait() != 0 or p1.wait() != 0:
+            raise B.Failed("failed to extract locked packages.tar.zst.* for reference TeX Live")
+
+        p4 = subprocess.Popen(["zstd", "-dc", str(supp_path)], stdout=subprocess.PIPE)
+        p5 = subprocess.Popen(["tar", "-x", "-C", str(tl_texmf)], stdin=p4.stdout)
+        p4.stdout.close()
+        if p5.wait() != 0 or p4.wait() != 0:
+            raise B.Failed("failed to extract packages-supplement.tar.zst for reference TeX Live")
+
+        mktexlsr = B.TL_BIN / "mktexlsr"
+        if mktexlsr.is_file():
+            subprocess.run([str(mktexlsr), str(tl_texmf)], env=B.make_env(), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        fc_conf.write_text(
+            '<?xml version="1.0"?>\n'
+            '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+            "<fontconfig>\n"
+            f"  <dir>{tl_texmf / 'fonts' / 'opentype'}</dir>\n"
+            f"  <dir>{tl_texmf / 'fonts' / 'truetype'}</dir>\n"
+            f"  <cachedir>{fc_cache}</cachedir>\n"
+            "</fontconfig>\n",
+            encoding="utf-8",
+        )
+
+        dump_env = {
+            **B.make_env(),
+            "TEXMFLOCAL": str(tl_texmf),
+            "TEXMFVAR": str(tl_var),
+            "TEXMFHOME": str(tl_home),
+            "TEXMFCONFIG": str(tl_cfg),
+            "TEXFORMATS": f"{web2c}/$engine:{web2c}:",
+            "FONTCONFIG_FILE": str(fc_conf),
+            "OSFONTDIR": f"{tl_texmf / 'fonts' / 'opentype'}:{tl_texmf / 'fonts' / 'truetype'}",
+        }
+
+        dump_specs = [
+            ("pdftex", "pdflatex", [str(B.TL_BIN / "pdftex"), "-ini", "-etex", "-interaction=nonstopmode", "-translate-file=cp227.tcx", "pdflatex.ini"]),
+            ("xetex", "xelatex", [str(B.TL_BIN / "xetex"), "-ini", "-etex", "-interaction=nonstopmode", "xelatex.ini"]),
+            ("luahbtex", "lualatex", [str(B.TL_BIN / "luahbtex"), "-ini", "-interaction=nonstopmode", "lualatex.ini"]),
+        ]
+
+        def _dump_one(spec):
+            eng_dir, fmt_name, cmd = spec
+            out_dir = web2c / eng_dir
+            r = subprocess.run(cmd, cwd=out_dir, env=dump_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            fmt_path = out_dir / f"{fmt_name}.fmt"
+            if r.returncode != 0 or not fmt_path.is_file():
+                raise B.Failed(f"failed to dump reference {fmt_name}.fmt (rc={r.returncode}):\n{r.stdout[-1200:]}")
+
+        with cf.ThreadPoolExecutor(max_workers=len(dump_specs)) as ex:
+            for _ in ex.map(_dump_one, dump_specs):
+                pass
+        kpse = B.TL_BIN / "kpsewhich"
+        if kpse.is_file():
+            ltx = B.sh([str(kpse), "latex.ltx"], env=dump_env).stdout.strip()
+            fmt = B.sh([str(kpse), "--engine=pdftex", "pdflatex.fmt"], env=dump_env).stdout.strip()
+            log(f"locked TeX Live reference ready: latex.ltx={ltx} pdflatex.fmt={fmt}")
+
     return {
-        "TEXINPUTS": f".:{tl_texmf / 'tex'}//:",
-        "LUAINPUTS": f".:{tl_texmf / 'tex'}//:",
-        "TEXFORMATS": f"{web2c}:",
+        "TEXMFLOCAL": str(tl_texmf),
+        "TEXMFVAR": str(tl_var),
+        "TEXMFHOME": str(tl_home),
+        "TEXMFCONFIG": str(tl_cfg),
+        "TEXFORMATS": f"{web2c}/$engine:{web2c}:",
+        "FONTCONFIG_FILE": str(fc_conf),
+        "OSFONTDIR": f"{tl_texmf / 'fonts' / 'opentype'}:{tl_texmf / 'fonts' / 'truetype'}",
     }
 
 
@@ -700,7 +781,7 @@ def main():
     sha = hashlib.sha256(texres.read_bytes()).hexdigest()
     slots = ([None] * args.jobs) if (args.jobs <= 1 or args.no_pin) else cpu_slots(args.jobs, args.cpus_per_job, allow_unpinned=args.gate)
 
-    tl_extra_env = ensure_tl_hyphenation(root)
+    tl_extra_env = ensure_tl_reference_env(root, pin_locked=args.gate)
     # warm TL's $HOME-side caches (luaotfload database, fontconfig) once, serially
     warm = root / "warm"
     warm.mkdir(exist_ok=True)
