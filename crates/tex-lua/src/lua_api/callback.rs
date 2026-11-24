@@ -261,6 +261,7 @@ impl CallbackLua<'_> {
                 self.state
                     .gc_barrier_obj(crate::gc::GcObjectPtr::from(ptr), meta_ptr);
             }
+            self.state.global_state_mut().gc.check_finalizer(&value);
         }
         Ok(1)
     }
@@ -621,5 +622,112 @@ mod tests {
             .eval()
             .unwrap();
         assert!(ok);
+    }
+
+    #[test]
+    fn push_userdata_registers_gc_finalizer_from_metatable() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FinalizedUd;
+        impl UserDataTrait for FinalizedUd {
+            fn type_name(&self) -> &'static str {
+                "FinalizedUd"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn metatable_name(&self) -> Option<&'static str> {
+                Some("FinalizedUd.mt")
+            }
+        }
+
+        let mut lua = lua();
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let finalized_cb = Arc::clone(&finalized);
+
+        let mt = lua.create_table().unwrap();
+        mt.set(
+            "__gc",
+            lua.create_callback(move |_| {
+                finalized_cb.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        lua.registry_set("FinalizedUd.mt", mt).unwrap();
+
+        let make = lua
+            .create_c_callback(|cx| cx.push_userdata(FinalizedUd))
+            .unwrap();
+        lua.set_global("make_ud", make).unwrap();
+
+        lua.load("local u = make_ud(); u = nil").exec().unwrap();
+        lua.collect_garbage().unwrap();
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn with_raw_rejects_reentrant_vm_mutation_and_defers_drop() {
+        let mut lua = lua();
+        let t1 = lua.create_table_from([("k", "hello")]).unwrap();
+        let t2 = lua.create_table_from([("x", 1_i64)]).unwrap();
+
+        // Nested immutable `with_raw` borrows are allowed.
+        let nested = t1
+            .with_raw(|r1| {
+                let s = r1.get_str("k").and_then(|v| v.as_bytes()).unwrap();
+                let x = t2
+                    .with_raw(|r2| r2.get_str("x").and_then(|v| v.as_integer()).unwrap())
+                    .unwrap();
+                (s.to_vec(), x)
+            })
+            .unwrap();
+        assert_eq!(nested, (b"hello".to_vec(), 1));
+
+        // Mutating via table handle inside `with_raw` panics cleanly.
+        let mut_via_handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = t1.with_raw(|r1| {
+                let _s = r1.get_str("k").and_then(|v| v.as_bytes());
+                let _ = t1.set("k2", "boom");
+            });
+        }));
+        assert!(mut_via_handle.is_err());
+
+        // Mutating via `&mut Lua` inside `with_raw` panics cleanly.
+        let mut_via_lua = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = t1.with_raw(|r1| {
+                let _s = r1.get_str("k").and_then(|v| v.as_bytes());
+                let _ = lua.collect_garbage();
+            });
+        }));
+        assert!(mut_via_lua.is_err());
+
+        // Dropping a LuaTable handle inside `with_raw` (including during panic
+        // unwind) defers unref without mutating the VM or double-panicking.
+        let temp = lua.create_table().unwrap();
+        t1.with_raw(|r1| {
+            let s = r1.get_str("k").and_then(|v| v.as_bytes()).unwrap();
+            drop(temp);
+            assert_eq!(s, b"hello");
+        })
+        .unwrap();
+
+        let temp_unwind = lua.create_table().unwrap();
+        let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = t1.with_raw(|_r1| {
+                let _owned = temp_unwind;
+                panic!("unwind with owned handle");
+            });
+        }));
+        assert!(unwind_res.is_err());
+
+        // After all guards exit, the VM is mutable again.
+        t1.set("after", 42_i64).unwrap();
+        assert_eq!(t1.get::<i64>("after").unwrap(), 42);
     }
 }

@@ -1018,19 +1018,19 @@ impl GC {
 
     // ============ Core GC Implementation ============
 
-    /// Main GC step function (like luaC_step in Lua 5.5)
-    /// Actions are accumulated in pending_actions, retrieve with take_pending_actions()
-    pub fn step(&mut self, l: &mut LuaState) {
+    /// Main GC step function (like luaC_step in Lua 5.5).
+    /// Returns `true` when an incremental cycle finished and transitioned to `Pause`.
+    pub fn step(&mut self, l: &mut LuaState) -> bool {
         // Check if GC is stopped by user (unless forced)
         if self.gc_stopped {
             self.set_debt(20000);
-            return;
+            return false;
         }
 
         // BUG FIX: Prevent GC reentrancy during finalization or single_step.
         if self.gc_stopem {
             self.set_debt(20000);
-            return;
+            return false;
         }
 
         // Dispatch based on GC mode (like Lua 5.5 luaC_step)
@@ -1041,6 +1041,7 @@ impl GC {
                 if self.gc_kind == GcKind::GenMinor {
                     self.set_minor_debt();
                 }
+                false
             }
         }
     }
@@ -1094,7 +1095,7 @@ impl GC {
     ///     luaE_setdebt(g, stepsize);
     /// }
     /// ```
-    fn inc_step(&mut self, l: &mut LuaState) {
+    fn inc_step(&mut self, l: &mut LuaState) -> bool {
         // l_mem stepsize = applygcparam(g, STEPSIZE, 100);
         let stepsize = self.apply_param(STEPSIZE, 100).max(1);
         // Pay for allocations accumulated past the trigger threshold (e.g.,
@@ -1121,7 +1122,7 @@ impl GC {
             match stres {
                 StepResult::Step2Minor => {
                     // Returned to minor collections
-                    return;
+                    return false;
                 }
                 StepResult::Step2Pause => {
                     // End of cycle (step2pause in Lua)
@@ -1151,8 +1152,7 @@ impl GC {
 
         if self.gc_state == GcState::Pause {
             self.set_pause();
-            l.global_state_mut().object_allocator.trim_after_full_gc();
-            self.trim_after_full_gc();
+            true
         } else if atomic_break && work2do > 0 && overdue > 0 && total_work > 0 {
             // Preserve unpaid overdue debt across AtomicStep so a large burst
             // allocation sweeps promptly on the next allocation instead of
@@ -1160,10 +1160,12 @@ impl GC {
             let unpaid_overdue =
                 ((overdue as i128 * work2do as i128) / total_work as i128) as isize;
             self.set_debt(stepsize.saturating_sub(unpaid_overdue));
+            false
         } else {
             // Lua 5.5: luaE_setdebt(g, stepsize);
             // Set positive debt = buffer before next GC
             self.set_debt(stepsize);
+            false
         }
     }
 

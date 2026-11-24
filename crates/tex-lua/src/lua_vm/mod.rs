@@ -341,9 +341,19 @@ pub struct GlobalState {
     /// Liveness record shared with host handles (see [`lua_ref::StateLiveness`]).
     pub(crate) liveness: Rc<lua_ref::StateLiveness>,
 
+    /// Number of active immutable raw-table borrows (`LuaTable::with_raw`).
+    /// Checked on mutable VM entry points to prevent aliasing or GC UAF.
+    pub(crate) raw_borrows: std::cell::Cell<usize>,
+
     /// Values held by native code across calls into Lua (e.g. `table.sort`'s
     /// buffer), marked as GC roots. Users push, then truncate back (LIFO).
     pub(crate) rust_roots: Vec<LuaValue>,
+}
+
+#[cold]
+#[inline(never)]
+fn panic_raw_borrow() -> ! {
+    panic!("cannot mutably access Lua VM while a RawTable borrow (LuaTable::with_raw) is active")
 }
 
 impl GlobalState {
@@ -397,6 +407,7 @@ impl GlobalState {
             #[cfg(not(target_arch = "wasm32"))]
             native_libraries: Vec::new(),
             liveness: lua_ref::StateLiveness::new(),
+            raw_borrows: std::cell::Cell::new(0),
             rust_roots: Vec::new(),
         });
 
@@ -434,7 +445,15 @@ impl GlobalState {
         inner
     }
 
+    #[inline(always)]
+    pub(crate) fn assert_not_raw_borrowed(&self) {
+        if self.raw_borrows.get() != 0 {
+            panic_raw_borrow();
+        }
+    }
+
     pub(crate) fn main_state(&mut self) -> &mut LuaState {
+        self.assert_not_raw_borrowed();
         &mut self.main_state.as_mut_ref().data
     }
 
@@ -1309,7 +1328,10 @@ impl GlobalState {
     #[inline(always)]
     fn check_gc(&mut self, l: &mut LuaState) -> bool {
         if self.gc.gc_debt <= 0 {
-            self.gc.step(l);
+            if self.gc.step(l) {
+                self.object_allocator.trim_after_full_gc();
+                self.gc.trim_after_full_gc();
+            }
             return true;
         }
 
@@ -1455,7 +1477,9 @@ impl GlobalStateHandle {
         unsafe { self.0.as_ref() }
     }
 
+    #[inline(always)]
     pub(crate) fn as_mut<'a>(mut self) -> &'a mut GlobalState {
+        self.as_ref().assert_not_raw_borrowed();
         unsafe { self.0.as_mut() }
     }
 
@@ -1520,7 +1544,12 @@ impl GlobalStateHandle {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn gc_step(self, state: *mut LuaState, kibibytes: i32) -> bool {
         let global = self.as_mut();
-        global.gc.api_step(unsafe { &mut *state }, kibibytes)
+        let complete = global.gc.api_step(unsafe { &mut *state }, kibibytes);
+        if complete {
+            global.object_allocator.trim_after_full_gc();
+            global.gc.trim_after_full_gc();
+        }
+        complete
     }
 
     pub(crate) fn take_finalizer_error(self) -> Option<String> {

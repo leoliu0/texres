@@ -54,12 +54,12 @@ impl FrameStack {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        if self.heap.is_empty() { self.len } else { self.heap.len() }
+        if self.heap.capacity() == 0 { self.len } else { self.heap.len() }
     }
 
     #[inline(always)]
     fn push(&mut self, frame: Frame) {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             if self.len < INLINE_FRAMES {
                 self.inline[self.len].write(frame);
                 self.len += 1;
@@ -72,6 +72,7 @@ impl FrameStack {
             };
             heap.extend_from_slice(slice);
             heap.push(frame);
+            self.len = 0;
             self.heap = heap;
         } else {
             self.heap.push(frame);
@@ -80,7 +81,7 @@ impl FrameStack {
 
     #[inline(always)]
     fn pop(&mut self) -> Option<Frame> {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             if self.len == 0 {
                 None
             } else {
@@ -95,7 +96,7 @@ impl FrameStack {
 
     #[inline(always)]
     fn last_mut(&mut self) -> Option<&mut Frame> {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             if self.len == 0 {
                 None
             } else {
@@ -126,7 +127,7 @@ impl SmallCaps {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[Cap] {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             // SAFETY: `self.inline[..self.len]` are initialized `Copy` `Cap`s.
             unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast::<Cap>(), self.len) }
         } else {
@@ -136,7 +137,7 @@ impl SmallCaps {
 
     #[inline(always)]
     fn as_mut_slice(&mut self) -> &mut [Cap] {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             // SAFETY: `self.inline[..self.len]` are initialized `Copy` `Cap`s.
             unsafe {
                 std::slice::from_raw_parts_mut(self.inline.as_mut_ptr().cast::<Cap>(), self.len)
@@ -148,12 +149,12 @@ impl SmallCaps {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        if self.heap.is_empty() { self.len } else { self.heap.len() }
+        if self.heap.capacity() == 0 { self.len } else { self.heap.len() }
     }
 
     #[inline(always)]
     fn push(&mut self, cap: Cap) {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             if self.len < INLINE_CAPS {
                 self.inline[self.len].write(cap);
                 self.len += 1;
@@ -165,6 +166,7 @@ impl SmallCaps {
             };
             heap.extend_from_slice(slice);
             heap.push(cap);
+            self.len = 0;
             self.heap = heap;
         } else {
             self.heap.push(cap);
@@ -173,7 +175,7 @@ impl SmallCaps {
 
     #[inline(always)]
     fn truncate(&mut self, new_len: usize) {
-        if self.heap.is_empty() {
+        if self.heap.capacity() == 0 {
             if new_len < self.len {
                 self.len = new_len;
             }
@@ -452,4 +454,54 @@ pub fn run(code: &[u32], init: usize, m: &MatchArgs<'_>, env: &mut dyn Env) -> L
 #[inline]
 fn set_has(code: &[u32], at: usize, c: u8) -> bool {
     code[at + (c >> 5) as usize] >> (c & 31) & 1 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_stack_spill_and_drain_does_not_resurrect_inline_frames() {
+        let mut stack = FrameStack::new();
+        let total = INLINE_FRAMES + 8;
+        for i in 0..total {
+            stack.push(Frame { s: i, p: i * 10, caplevel: i });
+        }
+        assert_eq!(stack.len(), total);
+        for i in (0..total).rev() {
+            let f = stack.pop().unwrap();
+            assert_eq!((f.s, f.p, f.caplevel), (i, i * 10, i));
+        }
+        assert_eq!(stack.len(), 0);
+        assert!(stack.pop().is_none());
+        assert!(stack.last_mut().is_none());
+
+        // Subsequent pushes after draining must stay coherent on heap.
+        stack.push(Frame { s: 99, p: 100, caplevel: 1 });
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.last_mut().unwrap().s, 99);
+        let f = stack.pop().unwrap();
+        assert_eq!(f.s, 99);
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn small_caps_spill_and_truncate_zero_does_not_resurrect_inline_caps() {
+        let mut caps = SmallCaps::new();
+        let total = INLINE_CAPS + 8;
+        for i in 0..total {
+            caps.push(Cap { s: i, idx: i as u16, kind: CSIMPLE, siz: 1 });
+        }
+        assert_eq!(caps.len(), total);
+        assert_eq!(caps.as_slice().len(), total);
+
+        caps.truncate(0);
+        assert_eq!(caps.len(), 0);
+        assert!(caps.as_slice().is_empty());
+        assert!(caps.as_mut_slice().is_empty());
+
+        caps.push(Cap { s: 77, idx: 3, kind: CSIMPLE, siz: 1 });
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps.as_slice()[0].s, 77);
+    }
 }

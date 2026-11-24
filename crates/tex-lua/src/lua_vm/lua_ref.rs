@@ -67,6 +67,8 @@ impl std::fmt::Debug for LuaRefValue {
 pub(crate) struct StateLiveness {
     state: Cell<Option<NonNull<GlobalState>>>,
     pinned: RefCell<Vec<LuaValue>>,
+    raw_borrows: Cell<usize>,
+    deferred_unrefs: RefCell<Vec<RefId>>,
 }
 
 impl StateLiveness {
@@ -74,6 +76,8 @@ impl StateLiveness {
         Rc::new(StateLiveness {
             state: Cell::new(None),
             pinned: RefCell::new(Vec::new()),
+            raw_borrows: Cell::new(0),
+            deferred_unrefs: RefCell::new(Vec::new()),
         })
     }
 
@@ -93,7 +97,12 @@ impl StateLiveness {
 
     /// True while a host borrow guard points into GC memory.
     pub(crate) fn has_pins(&self) -> bool {
-        !self.pinned.borrow().is_empty()
+        !self.pinned.borrow().is_empty() || self.raw_borrows.get() > 0
+    }
+
+    #[inline(always)]
+    fn is_raw_borrowed(&self) -> bool {
+        self.raw_borrows.get() > 0
     }
 
     pub(crate) fn pinned_len(&self) -> usize {
@@ -102,6 +111,62 @@ impl StateLiveness {
 
     pub(crate) fn pinned_at(&self, index: usize) -> LuaValue {
         self.pinned.borrow()[index]
+    }
+}
+
+/// RAII guard active for the duration of [`LuaTableRef::with_raw`].
+///
+/// While at least one guard is live, any re-entrant mutable access to the VM
+/// panics instead of mutating or collecting borrowed table/string memory, and
+/// `Drop` of host handles defers `release_ref_id` until the outermost guard
+/// exits so unwinding inside `with_raw` never double-panics.
+struct RawBorrowGuard {
+    liveness: Rc<StateLiveness>,
+}
+
+impl RawBorrowGuard {
+    #[inline]
+    fn new(liveness: &Rc<StateLiveness>) -> Self {
+        let next = liveness
+            .raw_borrows
+            .get()
+            .checked_add(1)
+            .expect("raw borrow count overflow");
+        liveness.raw_borrows.set(next);
+        if let Some(handle) = liveness.handle() {
+            handle.as_ref().raw_borrows.set(next);
+        }
+        Self {
+            liveness: Rc::clone(liveness),
+        }
+    }
+}
+
+impl Drop for RawBorrowGuard {
+    fn drop(&mut self) {
+        let prev = self.liveness.raw_borrows.get();
+        debug_assert!(prev > 0);
+        let next = prev - 1;
+        self.liveness.raw_borrows.set(next);
+        if let Some(handle) = self.liveness.handle() {
+            handle.as_ref().raw_borrows.set(next);
+            if next == 0 {
+                let ids = {
+                    let mut deferred = self.liveness.deferred_unrefs.borrow_mut();
+                    if deferred.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut *deferred)
+                    }
+                };
+                if !ids.is_empty() {
+                    let gs = handle.as_mut();
+                    for ref_id in ids {
+                        gs.release_ref_id(ref_id);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -203,10 +268,12 @@ impl RefInner {
     }
 
     fn dispose(&mut self) {
-        if self.ref_id > 0
-            && let Some(global_state) = self.liveness.handle()
-        {
-            global_state.as_mut().release_ref_id(self.ref_id);
+        if self.ref_id > 0 {
+            if self.liveness.is_raw_borrowed() {
+                self.liveness.deferred_unrefs.borrow_mut().push(self.ref_id);
+            } else if let Some(global_state) = self.liveness.handle() {
+                global_state.as_mut().release_ref_id(self.ref_id);
+            }
         }
         self.ref_id = LUA_NOREF; // Mark as released
     }
@@ -701,6 +768,7 @@ impl LuaTableRef {
         let Some(tbl) = table.as_table() else {
             return Err(LuaError::RuntimeError);
         };
+        let _guard = RawBorrowGuard::new(&self.inner.liveness);
         Ok(f(&tbl.impl_table, vm.object_allocator.strings()))
     }
 

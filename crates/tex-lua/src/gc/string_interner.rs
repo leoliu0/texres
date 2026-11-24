@@ -395,13 +395,16 @@ impl StringInterner {
                 Ok(index) | Err(index) => index,
             },
         };
+        // Register with GC before publishing `ptr` into `self.slots`: if
+        // `trace_object` returns OutOfMemory, `gc_string` is dropped here and
+        // must not leave a dangling pointer in the intern table.
+        gc.trace_object(gc_string)?;
         if matches!(self.slots[slot], StringSlot::Tombstone) {
             self.ndead -= 1;
         }
         self.slots[slot] = StringSlot::Occupied(ptr);
         self.nuse += 1;
 
-        gc.trace_object(gc_string)?;
         Ok(LuaValue::shortstring(ptr))
     }
 
@@ -667,5 +670,32 @@ mod tests {
         assert!(share_lua_value(&mut shared_value));
 
         assert_eq!(shared_value.as_bytes(), local_value.as_bytes());
+    }
+
+    #[test]
+    fn create_short_string_oom_does_not_leave_dangling_slot() {
+        let mut interner = StringInterner::new();
+        let mut string_pool = PagedPool::<GcString>::default();
+        let mut gc = GC::new(SafeOption::default());
+
+        let _seed = interner.intern("seed", &mut gc, &mut string_pool).unwrap();
+        let before = interner.nuse;
+
+        // Force trace_object to fail with OutOfMemory.
+        gc.set_temporary_memory_limit(0);
+        let err = interner.intern("oom_short_key", &mut gc, &mut string_pool);
+        assert!(err.is_err());
+        assert_eq!(interner.nuse, before);
+        assert!(interner.lookup_short(b"oom_short_key").is_none());
+
+        // Restore limit and ensure subsequent lookup/intern/shrink are healthy.
+        gc.clear_temporary_memory_limit();
+        let ok = interner
+            .intern("oom_short_key", &mut gc, &mut string_pool)
+            .unwrap();
+        assert_eq!(ok.as_bytes(), Some(b"oom_short_key".as_slice()));
+        interner.check_shrink();
+        let found = interner.lookup_short(b"oom_short_key").unwrap();
+        assert_eq!(found.as_bytes(), Some(b"oom_short_key".as_slice()));
     }
 }

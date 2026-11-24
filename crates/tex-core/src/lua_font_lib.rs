@@ -1268,9 +1268,13 @@ pub(crate) fn font_from_lua(eng: &mut Engine, f: FontId, t: &LuaTable) -> Result
             // parameters
             let mut params = vec![0i32; 7];
             if let Some(pt) = raw.get_str("parameters").and_then(RawValue::as_table) {
+                const MAX_FONT_PARAM_INDEX: i64 = 1_048_576;
                 let mut n = 7usize;
                 let _ = pt.try_for_each::<()>(|k, _| {
-                    if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
+                    if let Some(i) = k
+                        .as_number()
+                        .filter(|x| x.is_finite() && x.fract() == 0.0 && *x >= 1.0 && *x <= MAX_FONT_PARAM_INDEX as f64)
+                    {
                         n = n.max(i as i64 as usize);
                     }
                     Ok(())
@@ -1283,11 +1287,12 @@ pub(crate) fn font_from_lua(eng: &mut Engine, f: FontId, t: &LuaTable) -> Result
                 }
                 let _ = pt.try_for_each::<()>(|k, v| {
                     let value = raw_value_number(v).map_or(0, round);
-                    if let Some(i) = k.as_number().filter(|x| x.fract() == 0.0) {
-                        let i = i as i64;
-                        if i >= 8 {
-                            params[i as usize - 1] = if v.as_number().is_some() { value } else { 0 };
-                        }
+                    if let Some(i) = k
+                        .as_number()
+                        .filter(|x| x.is_finite() && x.fract() == 0.0 && *x >= 8.0 && *x <= MAX_FONT_PARAM_INDEX as f64)
+                    {
+                        let idx = i as i64 as usize;
+                        params[idx - 1] = if v.as_number().is_some() { value } else { 0 };
                     } else if let Some(s) = k.as_bytes() {
                         let idx = match s {
                             b"slant" => 1,
@@ -2543,4 +2548,48 @@ fn install_vf(lua: &mut Lua) -> Result<(), String> {
         Ok(0)
     });
     lua.set_global("vf", vf).map_err(|e| format!("{e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::{Engine, EngineKind};
+
+    #[test]
+    fn font_parameters_ignores_negative_and_out_of_range_keys() {
+        let mut e = Engine::new_with_kind(EngineKind::LuaTeX, true);
+        e.init_primitives();
+        let _nullfont = e.lua_new_font();
+        e.eqtb.cat[b'{' as usize] = 1;
+        e.eqtb.cat[b'}' as usize] = 2;
+        e.eqtb.cat[b' ' as usize] = 10;
+        e.eqtb.cat[b'\n' as usize] = 5;
+        let src = br#"\directlua{
+            local id = font.define({
+                name = "negparamtest",
+                designsize = 655360,
+                size = 655360,
+                parameters = {
+                    [-1] = 999,
+                    [0] = 888,
+                    [1] = 10,
+                    [8] = 42,
+                    [1e20] = 7,
+                    slant = 5,
+                },
+                characters = {
+                    [65] = { width = 655360 },
+                },
+            })
+            assert(id > 0, "expected valid font id")
+            local p = font.getparameters(id)
+            assert(p.slant == 5, "slant mismatch")
+            assert(p[8] == 42, "param 8 mismatch")
+            assert(p[9] == nil and p[-1] == nil and p[0] == nil, "unexpected extra params")
+        }
+        \end
+        "#;
+        e.input.push_file("negparam.tex".to_string(), src.to_vec());
+        e.run();
+        assert_eq!(e.error_count, 0, "unexpected errors: {:?}", e.diagnostics);
+    }
 }

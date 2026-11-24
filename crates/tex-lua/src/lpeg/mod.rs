@@ -949,4 +949,40 @@ mod tests {
             .unwrap();
         assert_eq!(pos, 4);
     }
+
+    #[test]
+    fn deep_backtrack_and_captures_past_inline_limits() {
+        let mut lua = Lua::new(SafeOption::default());
+        lua.open_stdlib(Stdlib::All).unwrap();
+        install(&mut lua).unwrap();
+        // Force >32 backtrack frames (recursive choices) and >16 captures in the
+        // first branch, then fail so LPeg backtracks all the way to 0 captures
+        // and base frame before matching the fallback branch.
+        let res: String = lua
+            .load(
+                r#"
+                local P, C, V = lpeg.P, lpeg.C, lpeg.V
+                local cap20 = P(true)
+                for _ = 1, 20 do
+                    cap20 = cap20 * C(P("a"))
+                end
+                local deep = P({
+                    "entry",
+                    entry = (V("nest") * P("Z")) + C(P("a")^1),
+                    nest = (P("a") * (V("nest") + P("X"))) + P("Y"),
+                })
+                local s = string.rep("a", 40)
+                local first = (cap20 * P("Z")) + deep
+                -- First branch pushes 20 captures then fails back to 0;
+                -- second branch pushes >40 backtrack frames then fails back to 0
+                -- and succeeds on the fallback C(P("a")^1).
+                local a, b = first:match(s)
+                assert(b == nil, "stale captures resurrected after backtrack")
+                return a
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(res, "a".repeat(40));
+    }
 }
