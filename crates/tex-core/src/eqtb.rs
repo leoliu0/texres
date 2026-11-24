@@ -778,46 +778,7 @@ fn compute_cs_flags(equiv: Option<&Equiv>) -> u8 {
     }
 }
 
-#[derive(Clone)]
-struct EqEntry {
-    equiv: Option<Equiv>,
-    level: u16,
-    /// The meaning is an \outer macro (tex.web's eq_type `outer_call`):
-    /// argument and text scanners test every token for it without loading
-    /// the macro.
-    outer: bool,
-}
-
-impl EqEntry {
-    const UNDEFINED: EqEntry = EqEntry {
-        equiv: None,
-        level: LEVEL_ONE,
-        outer: false,
-    };
-
-    /// Install `equiv` as the meaning, returning the previous one and updating
-    /// `flags_slot` + `outer_entries`.
-    #[inline]
-    fn set(
-        &mut self,
-        equiv: Option<Equiv>,
-        flags_slot: &mut u8,
-        outer_entries: &mut u32,
-    ) -> Option<Equiv> {
-        let flags = compute_cs_flags(equiv.as_ref());
-        *flags_slot = flags;
-        let outer = (flags & CS_FLAG_OUTER) != 0;
-        if outer != self.outer {
-            if outer {
-                *outer_entries += 1;
-            } else {
-                *outer_entries -= 1;
-            }
-            self.outer = outer;
-        }
-        std::mem::replace(&mut self.equiv, equiv)
-    }
-}
+const _: () = assert!(std::mem::size_of::<Option<Equiv>>() == 16);
 
 /// Deduplicated LuaTeX attribute lists: `Attr(n)` names the n-th distinct
 /// list of sorted `(attribute number, value)` pairs, `Attr::NONE` the empty
@@ -868,9 +829,11 @@ impl AttrLists {
     }
 }
 
+#[repr(C)]
 pub struct Eqtb {
-    entries: Vec<EqEntry>,
+    entries: Vec<Option<Equiv>>,
     cs_flags: Vec<u8>,
+    entry_levels: Vec<u16>,
     pub save_stack: Vec<SaveItem>,
     pub cur_level: u16,
     group_level_capacity_exceeded: bool,
@@ -1226,6 +1189,7 @@ impl Eqtb {
         Eqtb {
             entries: Vec::new(),
             cs_flags: Vec::new(),
+            entry_levels: Vec::new(),
             save_stack: Vec::new(),
             cur_level: LEVEL_ONE,
             group_level_capacity_exceeded: false,
@@ -1304,13 +1268,27 @@ impl Eqtb {
     // ---------- cs equivalents ----------
 
     #[inline(always)]
-    fn ensure_entry(&mut self, id: CsId) -> &mut EqEntry {
+    fn ensure_entry(&mut self, id: CsId) {
         let idx = id as usize;
         if idx >= self.entries.len() {
-            self.entries.resize(idx + 1, EqEntry::UNDEFINED);
+            self.entries.resize(idx + 1, None);
             self.cs_flags.resize(idx + 1, 0);
+            self.entry_levels.resize(idx + 1, LEVEL_ONE);
         }
-        &mut self.entries[idx]
+    }
+
+    /// Install `equiv` at slot `idx`, updating `cs_flags[idx]` and
+    /// `outer_entries` and returning the previous meaning.
+    #[inline(always)]
+    fn set_entry_slot(&mut self, idx: usize, equiv: Option<Equiv>) -> Option<Equiv> {
+        let new_flags = compute_cs_flags(equiv.as_ref());
+        let old_flags = std::mem::replace(&mut self.cs_flags[idx], new_flags);
+        let outer_delta =
+            i32::from(new_flags & CS_FLAG_OUTER) - i32::from(old_flags & CS_FLAG_OUTER);
+        if outer_delta != 0 {
+            self.outer_entries = self.outer_entries.wrapping_add_signed(outer_delta);
+        }
+        std::mem::replace(&mut self.entries[idx], equiv)
     }
 
     #[inline(always)]
@@ -1354,26 +1332,21 @@ impl Eqtb {
     }
     #[inline(always)]
     pub fn get(&self, id: CsId) -> Option<&Equiv> {
-        self.entries.get(id as usize).and_then(|e| e.equiv.as_ref())
+        self.entries.get(id as usize).and_then(Option::as_ref)
     }
     #[inline(always)]
     pub(crate) fn definition_level(&self, id: CsId) -> Option<u16> {
-        self.entries.get(id as usize).map(|e| e.level)
+        self.entry_levels.get(id as usize).copied()
     }
 
     /// follow \let aliases to the effective meaning
     #[inline(always)]
-    pub fn resolve(&self, id: CsId) -> Option<&Equiv> {
-        self.resolve_entry(id).and_then(|e| e.equiv.as_ref())
-    }
-
-    #[inline(always)]
-    fn resolve_entry(&self, mut id: CsId) -> Option<&EqEntry> {
+    pub fn resolve(&self, mut id: CsId) -> Option<&Equiv> {
         for _ in 0..1024 {
             let entry = self.entries.get(id as usize)?;
-            match &entry.equiv {
+            match entry {
                 Some(Equiv::Alias(next)) => id = *next,
-                _ => return Some(entry),
+                other => return other.as_ref(),
             }
         }
         None
@@ -1386,7 +1359,7 @@ impl Eqtb {
         if f & CS_FLAG_ALIAS == 0 {
             (f & CS_FLAG_OUTER) != 0
         } else {
-            self.resolve_entry(id).is_some_and(|e| e.outer)
+            matches!(self.resolve(id), Some(Equiv::Macro(m)) if m.outer)
         }
     }
     #[inline]
@@ -1438,29 +1411,24 @@ impl Eqtb {
     fn define_eq(&mut self, id: CsId, equiv: Option<Equiv>, global: bool) {
         let idx = id as usize;
         let cur_level = self.cur_level;
-        if idx >= self.entries.len() {
-            self.entries.resize(idx + 1, EqEntry::UNDEFINED);
-            self.cs_flags.resize(idx + 1, 0);
-        }
+        self.ensure_entry(id);
         let tracing = self.int_params[IntParam::TracingAssigns as usize] > 0;
         let same = if !global || tracing {
-            Equiv::same(self.entries[idx].equiv.as_ref(), equiv.as_ref())
+            Equiv::same(self.entries[idx].as_ref(), equiv.as_ref())
         } else {
             false
         };
         if !self.begin_assign(global, same, TraceSlot::Eq(id)) {
             return;
         }
-        let entry = &mut self.entries[idx];
-        let flags_slot = &mut self.cs_flags[idx];
-        if !global && entry.level < cur_level {
-            let old = entry.set(equiv, flags_slot, &mut self.outer_entries);
-            let ol = entry.level;
-            entry.level = cur_level;
+        let ol = self.entry_levels[idx];
+        if !global && ol < cur_level {
+            let old = self.set_entry_slot(idx, equiv);
+            self.entry_levels[idx] = cur_level;
             self.push_save(SaveItem::Eq(id, old, ol));
         } else {
-            entry.set(equiv, flags_slot, &mut self.outer_entries);
-            entry.level = if global { LEVEL_ONE } else { cur_level };
+            self.set_entry_slot(idx, equiv);
+            self.entry_levels[idx] = if global { LEVEL_ONE } else { cur_level };
         }
         self.end_assign(TraceSlot::Eq(id));
     }
@@ -2848,11 +2816,10 @@ impl Eqtb {
     fn unsave_eq(&mut self, id: CsId, old: Option<Equiv>, ol: u16) {
         self.ensure_entry(id);
         let idx = id as usize;
-        let e = &mut self.entries[idx];
-        let restored = e.level > LEVEL_ONE;
+        let restored = self.entry_levels[idx] > LEVEL_ONE;
         if restored {
-            e.set(old, &mut self.cs_flags[idx], &mut self.outer_entries);
-            e.level = ol;
+            self.set_entry_slot(idx, old);
+            self.entry_levels[idx] = ol;
         }
         self.trace_restore(restored, TraceSlot::Eq(id));
     }
@@ -3168,9 +3135,10 @@ impl Eqtb {
     pub(crate) fn eqs(&self) -> Vec<(CsId, Option<&Equiv>, u16)> {
         self.entries
             .iter()
+            .zip(self.entry_levels.iter().copied())
             .enumerate()
-            .filter(|(_, e)| e.equiv.is_some() || e.level != LEVEL_ONE)
-            .map(|(id, e)| (id as CsId, e.equiv.as_ref(), e.level))
+            .filter(|(_, (equiv, level))| equiv.is_some() || *level != LEVEL_ONE)
+            .map(|(id, (equiv, level))| (id as CsId, equiv.as_ref(), level))
             .collect()
     }
 
@@ -3178,15 +3146,15 @@ impl Eqtb {
     pub(crate) fn restore_eq(&mut self, id: CsId, equiv: Option<Equiv>, level: u16) {
         self.ensure_entry(id);
         let idx = id as usize;
-        let e = &mut self.entries[idx];
-        e.set(equiv, &mut self.cs_flags[idx], &mut self.outer_entries);
-        e.level = level;
+        self.set_entry_slot(idx, equiv);
+        self.entry_levels[idx] = level;
     }
 
     /// Clear all control-sequence entries before restoring from a format dump.
     pub(crate) fn clear_entries(&mut self) {
         self.entries.clear();
         self.cs_flags.clear();
+        self.entry_levels.clear();
         self.outer_entries = 0;
     }
 

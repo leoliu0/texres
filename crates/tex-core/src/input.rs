@@ -854,19 +854,20 @@ impl From<&[Token]> for TokTokens {
     }
 }
 
+#[repr(C)]
 pub struct InputStack {
     pub stack: Vec<Source>,
+    /// Index of the topmost `Source::File`, a hint validated on every use:
+    /// `current_file_line` runs on hot paths (every skipped conditional)
+    /// below stacks of macro frames.
+    top_file: std::cell::Cell<usize>,
+    next_file_seq: u32,
     file_bytes: HashMap<String, Rc<[u8]>>,
     disk_stamps: HashMap<String, (std::time::SystemTime, u64)>,
     /// The scanner normally pops a file before an EOF error is diagnosed.
     /// Retain its final position so runaway definitions and arguments do not
     /// degrade to the unhelpful "line 0" location.
     last_finished_file: Option<SourceContext>,
-    /// Index of the topmost `Source::File`, a hint validated on every use:
-    /// `current_file_line` runs on hot paths (every skipped conditional)
-    /// below stacks of macro frames.
-    top_file: std::cell::Cell<usize>,
-    next_file_seq: u32,
 }
 
 /// The content end and next-line offset of a pseudo-file line that starts

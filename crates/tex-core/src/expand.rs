@@ -467,12 +467,64 @@ impl Engine {
     fn raw_token_non_idle(&mut self) -> Token {
         if !self.diagnostic_sources_live {
             let filter = self.align_raw_filter();
-            if let Some(t) = self.raw_token_fast(filter) {
-                return t;
+            if filter == AlignFilter::None {
+                // Leaf fast path inside an alignment when row delimiters are
+                // hidden (e.g. non-zero brace depth, u-template, or \edef).
+                let (token, delta) = if self.pushed.is_empty() {
+                    let Some(cursor) = self
+                        .input
+                        .stack
+                        .last_mut()
+                        .and_then(crate::input::Source::cursor_mut)
+                    else {
+                        return self.raw_token_slow();
+                    };
+                    if cursor.pos >= cursor.end {
+                        return self.raw_token_slow();
+                    }
+                    // SAFETY: `pos < end <=` backing buffer length.
+                    let t = unsafe { *cursor.seg.add(cursor.pos as usize) };
+                    let delta = RAW_TOP_DELTA[(t.0 >> 24) as usize];
+                    if delta == i8::MIN {
+                        return self.raw_token_slow();
+                    }
+                    cursor.pos += 1;
+                    let depth = cursor.trace_depth;
+                    self.unwind_macro_trace(depth);
+                    (t, delta)
+                } else {
+                    let Some(&t) = self.pushed.last() else {
+                        return self.raw_token_slow();
+                    };
+                    let delta = RAW_TOP_DELTA[(t.0 >> 24) as usize];
+                    if delta == i8::MIN
+                        || (self.scanner_status == ScannerStatus::Aligning
+                            && self.pushed.len() <= self.align_pushed_base)
+                        || self.lua_cb[crate::lua_callbacks::Cb::ShowErrorHook as usize] > 0
+                    {
+                        return self.raw_token_slow();
+                    }
+                    self.pushed.pop();
+                    self.pushed_read = t;
+                    (t, delta)
+                };
+                if delta != 0 {
+                    self.align_brace_depth =
+                        self.align_brace_depth.saturating_add(i32::from(delta));
+                }
+                return token;
             }
-            return self.raw_token_slow();
+            return self.raw_token_align_filter();
         }
         self.raw_token_general()
+    }
+
+    #[inline(never)]
+    fn raw_token_align_filter(&mut self) -> Token {
+        if let Some(t) = self.raw_token_fast(AlignFilter::Delimiters) {
+            return t;
+        }
+        self.raw_token_slow()
     }
 
     /// `raw_token` when the current segment is empty or blocked: advance past
@@ -1841,56 +1893,62 @@ impl Engine {
                 self.active_cs_id(t2.chr())
             };
             let invocation = id2;
-            for _ in 0..1024 {
-                match self.eqtb.get(id2) {
-                    Some(Equiv::Alias(next)) => id2 = *next,
-                    _ => break,
+            let mut equiv = self.eqtb.get(id2);
+            if let Some(Equiv::Alias(mut next)) = equiv {
+                for _ in 0..1024 {
+                    match self.eqtb.get(next) {
+                        Some(Equiv::Alias(n)) => next = *n,
+                        other => {
+                            equiv = other;
+                            break;
+                        }
+                    }
                 }
+                id2 = next;
             }
-            if let Some(eq) = self.eqtb.get(id2) {
-                match eq {
-                    // tex.web: \expandafter expands even \protected macros
-                    Equiv::Macro(m) => {
-                        if self.freeze_gts_in_edef(id2) {
-                            self.push_token(t2);
-                        } else if m.num_params == 0
-                            && m.prefix.is_empty()
-                            && !self.xetex_macro_trace()
-                        {
-                            let body = std::rc::Rc::clone(&m.body);
-                            let maybe_active_cs = m.has_active_cs(&self.cs);
-                            self.enter_macro_diagnostic(id2, invocation);
-                            self.try_push_tokens_rc(body, id2, maybe_active_cs);
-                        } else {
-                            let m = m.clone();
-                            self.expand_macro(id2, &m, invocation);
-                        }
+            if let Some(Equiv::Macro(m)) = equiv {
+                // tex.web: \expandafter expands even \protected macros
+                if self.freeze_gts_in_edef(id2) {
+                    self.push_token(t2);
+                } else if m.num_params == 0 && m.prefix.is_empty() && !self.xetex_macro_trace() {
+                    let is_empty = m.body.is_empty();
+                    let body = if is_empty {
+                        None
+                    } else {
+                        Some((std::rc::Rc::clone(&m.body), m.has_active_cs(&self.cs)))
+                    };
+                    self.enter_macro_diagnostic(id2, invocation);
+                    if let Some((body, maybe_active_cs)) = body {
+                        self.try_push_tokens_rc(body, id2, maybe_active_cs);
                     }
-                    Equiv::Prim(The) => {
-                        let expanded = self.in_expanded_scan;
-                        self.in_expanded_scan = false;
-                        self.the_scan();
-                        self.in_expanded_scan = expanded;
-                    }
-                    Equiv::Prim(p2) if self.is_expandable(*p2) => {
-                        let p2 = *p2;
-                        if let Some(tt) = self.expand_prim(p2, id2) {
-                            self.push_token(tt);
-                        }
-                    }
-                    &Equiv::LuaCall {
-                        slot,
-                        protected: false,
-                    } => {
-                        self.call_lua_function(slot as i32);
-                    }
-                    _ => {
-                        self.push_token(t2);
-                    }
+                } else {
+                    let m = m.clone();
+                    self.expand_macro(id2, &m, invocation);
                 }
-            } else {
+            } else if let Some(&Equiv::Prim(p2)) = equiv {
+                if p2 == The {
+                    let expanded = self.in_expanded_scan;
+                    self.in_expanded_scan = false;
+                    self.the_scan();
+                    self.in_expanded_scan = expanded;
+                } else if self.is_expandable(p2) {
+                    if let Some(tt) = self.expand_prim(p2, id2) {
+                        self.push_token(tt);
+                    }
+                } else {
+                    self.push_token(t2);
+                }
+            } else if let Some(&Equiv::LuaCall {
+                slot,
+                protected: false,
+            }) = equiv
+            {
+                self.call_lua_function(slot as i32);
+            } else if equiv.is_none() {
                 // tex.web §368: expand the undefined token (§370).
                 self.undefined_cs_error(Token::from_cs(id2));
+            } else {
+                self.push_token(t2);
             }
         } else {
             self.push_token(t2);
@@ -3601,7 +3659,7 @@ impl Engine {
             };
             let cs_flags = self.eqtb.cs_flags_slice();
             let flags_ptr = cs_flags.as_ptr();
-            let flags_len = cs_flags.len();
+            let flags_len = cs_flags.len().min((NOEXP_FLAG - 0x8000_0000) as usize);
             let mut braces = 0i32;
             let mut found = None;
             let start = segment.as_ptr();
@@ -3611,22 +3669,20 @@ impl Engine {
             while ptr != end {
                 // SAFETY: `ptr < end`.
                 let t = unsafe { *ptr };
-                let top = (t.0 >> 24) as usize;
-                let cs = (t.0 & 0x3FFF_FFFF) as usize;
-                // Select between `&cs_flags[cs]` and `&noncs[top]` via cmov.
-                // `wrapping_add` avoids out-of-bounds GEP when `!is_plain_cs`.
-                let is_plain_cs =
-                    t.0.wrapping_sub(0x8000_0000) < (NOEXP_FLAG - 0x8000_0000) && cs < flags_len;
-                let flag_ptr = if is_plain_cs {
-                    flags_ptr.wrapping_add(cs)
+                // Single unsigned range check: `cs_off < flags_len` holds iff
+                // `0x8000_0000 <= t.0 < NOEXP_FLAG` and `cs_id < flags_len`.
+                let cs_off = t.0.wrapping_sub(0x8000_0000) as usize;
+                let flag_ptr = if cs_off < flags_len {
+                    flags_ptr.wrapping_add(cs_off)
                 } else {
-                    // SAFETY: `top < 256`.
-                    unsafe { noncs_ptr.add(top) }
+                    // SAFETY: `(t.0 >> 24) < 256`.
+                    unsafe { noncs_ptr.add((t.0 >> 24) as usize) }
                 };
                 // SAFETY: `flag_ptr` points into either `cs_flags[..flags_len]` or `noncs[..256]`.
                 let byte = unsafe { *flag_ptr };
                 if byte & (FLAG_MASK | NONCS_ACTION) != 0 {
                     if byte & NONCS_ACTION != 0 {
+                        let top = t.0 >> 24;
                         if top.wrapping_sub(1) < 2 {
                             braces += 3 - 2 * (top as i32);
                         } else {
@@ -3637,7 +3693,7 @@ impl Engine {
                     } else if byte == crate::eqtb::CS_FLAG_OUTER {
                         break;
                     } else {
-                        match self.eqtb.resolve(cs as CsId) {
+                        match self.eqtb.resolve(cs_off as CsId) {
                             Some(Equiv::Prim(p)) if Self::is_if_test(*p) => *level += 1,
                             Some(Equiv::Prim(p)) if IF_DELIMITERS.contains(*p) => {
                                 if *level == 0 {
@@ -4922,68 +4978,120 @@ impl Engine {
             };
             let cs_flags = self.eqtb.cs_flags_slice();
             let flags_ptr = cs_flags.as_ptr();
-            let flags_len = cs_flags.len();
+            let flags_len = cs_flags.len().min((NOEXP_FLAG - 0x8000_0000) as usize);
             let room = crate::input::MAX_TOKEN_LIST_TOKENS.saturating_sub(out.len());
             let mut after = *depth;
             let mut length = 0;
             let seg_len = segment.len();
             let seg_ptr = segment.as_ptr();
-            while length < seg_len {
-                // SAFETY: `length < seg_len`.
-                let t = unsafe { *seg_ptr.add(length) };
-                let top = (t.0 >> 24) as usize;
-                let cs = (t.0 & 0x3FFF_FFFF) as usize;
-                let is_plain_cs =
-                    t.0.wrapping_sub(0x8000_0000) < (NOEXP_FLAG - 0x8000_0000) && cs < flags_len;
-                if maybe_active_cs && t.is_cs() && self.cs.is_active(t.cs_id()) {
-                    break;
-                }
-                let flag_ptr = if is_plain_cs {
-                    flags_ptr.wrapping_add(cs)
-                } else {
-                    // SAFETY: `top < 256`.
-                    unsafe { noncs_ptr.add(top) }
-                };
-                // SAFETY: `flag_ptr` points into `cs_flags[..flags_len]` or `DEF_BODY_NONCS`.
-                let byte = unsafe { *flag_ptr };
-                if byte & (flag_mask | NONCS_ACTION) != 0 {
-                    if byte & NONCS_ACTION != 0 {
-                        if top == 2 {
-                            if after == 1 {
-                                after = 0;
+            let action_mask = flag_mask | NONCS_ACTION;
+            if !maybe_active_cs {
+                while length < seg_len {
+                    // SAFETY: `length < seg_len`.
+                    let t = unsafe { *seg_ptr.add(length) };
+                    let cs_off = t.0.wrapping_sub(0x8000_0000) as usize;
+                    let flag_ptr = if cs_off < flags_len {
+                        flags_ptr.wrapping_add(cs_off)
+                    } else {
+                        // SAFETY: `(t.0 >> 24) < 256`.
+                        unsafe { noncs_ptr.add((t.0 >> 24) as usize) }
+                    };
+                    // SAFETY: `flag_ptr` points into `cs_flags[..flags_len]` or `DEF_BODY_NONCS`.
+                    let byte = unsafe { *flag_ptr };
+                    if byte & action_mask != 0 {
+                        if byte & NONCS_ACTION != 0 {
+                            let top = t.0 >> 24;
+                            if top == 2 {
+                                if after == 1 {
+                                    after = 0;
+                                    length += 1;
+                                    break;
+                                }
+                                if length == room {
+                                    break;
+                                }
+                                after -= 1;
                                 length += 1;
+                                continue;
+                            } else if top == 1 {
+                                if length == room {
+                                    break;
+                                }
+                                after += 1;
+                                length += 1;
+                                continue;
+                            } else if top == u32::from(CAT_ACTIVE) {
+                                if outer && self.is_outer_macro_token(t) {
+                                    break;
+                                }
+                            } else {
                                 break;
                             }
-                            if length == room {
-                                break;
-                            }
-                            after -= 1;
-                            length += 1;
-                            continue;
-                        } else if top == 1 {
-                            if length == room {
-                                break;
-                            }
-                            after += 1;
-                            length += 1;
-                            continue;
-                        } else if top == u32::from(CAT_ACTIVE) as usize {
-                            if outer && self.is_outer_macro_token(t) {
-                                break;
-                            }
-                        } else {
+                        } else if self.is_macro_param(t)
+                            || (outer && self.is_outer_macro_token(t))
+                        {
                             break;
                         }
-                    } else if self.is_macro_param(t)
-                        || (outer && self.is_outer_macro_token(t))
-                    {
+                    }
+                    if length == room {
                         break;
                     }
+                    length += 1;
                 }
-                if length == room {
-                    break;
+            } else {
+                while length < seg_len {
+                    // SAFETY: `length < seg_len`.
+                    let t = unsafe { *seg_ptr.add(length) };
+                    if t.is_cs() && self.cs.is_active(t.cs_id()) {
+                        break;
+                    }
+                    let cs_off = t.0.wrapping_sub(0x8000_0000) as usize;
+                    let flag_ptr = if cs_off < flags_len {
+                        flags_ptr.wrapping_add(cs_off)
+                    } else {
+                        unsafe { noncs_ptr.add((t.0 >> 24) as usize) }
+                    };
+                    let byte = unsafe { *flag_ptr };
+                    if byte & action_mask != 0 {
+                        if byte & NONCS_ACTION != 0 {
+                            let top = t.0 >> 24;
+                            if top == 2 {
+                                if after == 1 {
+                                    after = 0;
+                                    length += 1;
+                                    break;
+                                }
+                                if length == room {
+                                    break;
+                                }
+                                after -= 1;
+                                length += 1;
+                                continue;
+                            } else if top == 1 {
+                                if length == room {
+                                    break;
+                                }
+                                after += 1;
+                                length += 1;
+                                continue;
+                            } else if top == u32::from(CAT_ACTIVE) {
+                                if outer && self.is_outer_macro_token(t) {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        } else if self.is_macro_param(t)
+                            || (outer && self.is_outer_macro_token(t))
+                        {
+                            break;
+                        }
+                    }
+                    if length == room {
+                        break;
+                    }
+                    length += 1;
                 }
-                length += 1;
             }
             if length == 0 {
                 return took_any.then_some(false);

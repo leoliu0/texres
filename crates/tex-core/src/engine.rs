@@ -174,9 +174,84 @@ pub struct PdfFixedParams {
     pub inclusion_copy_font: bool,
 }
 
+#[repr(C)]
 pub struct Engine {
-    pub cs: CsTable,
+    // --- Hot token-fetch & expansion state (first two cache lines, disp8 offsets) ---
+    /// True while `diagnostic_physical_source` or `diagnostic_synthetic_source`
+    /// may be set. Both describe the token just fetched; the next fetch from a
+    /// token list clears them, and this flag keeps that check to one load.
+    pub(crate) diagnostic_sources_live: bool,
+    /// A macro parameter scanner is reading at alignment brace depth zero.
+    pub align_macro_arg: bool,
+    pub in_expanded_scan: bool,
+    pub scanner_status: ScannerStatus,
+    /// True when the last expanded token was a parameter character protected
+    /// by \unexpanded; the definition scanner must store it literally.
+    pub unexpanded_parameter: bool,
+    /// True when the active macro chain exceeded its storage cap. Rendering
+    /// inserts an ellipsis so retained frames never appear falsely adjacent.
+    pub(crate) diagnostic_macro_trace_truncated: bool,
+    /// Suppress normal trace unwinding while a construct emitted by a macro
+    /// scans physical input (for example a macro-generated definition).
+    pub(crate) diagnostic_trace_hold: u16,
+    pub align_state: i32, // & nesting balance for runaway detection
+    /// tex.web align_state (tex.web @6745): net brace depth relative to the
+    /// current alignment entry. A row delimiter ends the entry only at 0.
+    /// Maintained cumulatively at token fetch (tex.web @7335/@7492); reset
+    /// when a u-template finishes (tex.web @7007-7008) or an \omit cell
+    /// starts (tex.web @15562); parked at 1000000 while a template plays
+    /// (tex.web @15564).
+    pub(crate) align_brace_depth: i32,
+    /// The token most recently read back from `pushed` (tex.web's backed-up
+    /// input level), for `\tracingstacklevels`.
+    pub(crate) pushed_read: Token,
+    // current token being processed
+    pub cur_tok: Token,
+    pub pushed: Vec<Token>, // lookahead pushback
+    /// Macro ancestry for the token currently being processed. It survives
+    /// tail expansion after the corresponding token lists have been popped.
+    pub(crate) diagnostic_macro_trace: Vec<CsId>,
+    pub cur_cs: Option<CsId>,
+    pub(crate) diagnostic_source_cs: Option<CsId>,
+    /// noexpand'd token pending (returned once, unexpanded)
+    pub no_expand_tok: Option<Token>,
+    pub cur_prim: Option<Prim>,
+    /// e-TeX \\ifincsname: \\csname nesting depth
+    pub csname_depth: u32,
+    /// Input stack (`stack: Vec<Source>` at offset 0 of `InputStack`).
+    pub input: InputStack,
+    // --- Secondary hot expansion / macro-frame state ---
+    pub(crate) token_vec_pool: Vec<Vec<crate::token::Token>>,
+    pub if_stack: Vec<IfState>,
+    /// Expandable commands processed during this job. Unlike main_steps this
+    /// also advances while get_token is searching for one unexpandable token.
+    pub expansion_steps: u64,
+    pub expansion_limit: u64,
+    /// tex.web scanner_status/warning_index of an absorbing scan
+    /// (definition, general text, alignment preamble): an \outer macro read
+    /// while it is set is reported by `forbidden_outer` (§336-§339).
+    pub(crate) outer_scan: Option<(crate::expand::OuterScan, Option<CsId>)>,
+    /// The finished macro level that an expansion shortcut read without
+    /// putting it on the input stack, with the input position it ended at.
+    /// TeX keeps the level until a token is read from the input below it or
+    /// back_input or a macro call ends it; `show_context` shows it until then.
+    pub(crate) skipped_level: Option<(crate::show_context::SkippedLevel, (usize, usize))>,
+    pub(crate) pending_if_depth: Option<usize>,
+    pub unexp_protect: usize,
+    /// `pushed` length when the current align toklist was installed.
+    /// Expansions after that point outrank the toklist; older `pushed`
+    /// tokens (e.g. a \\futurelet peek) wait until the toklist finishes.
+    pub align_pushed_base: usize,
+    pub ids: Ids,
+    /// Semantic profile for this job. It is immutable after construction.
+    pub engine_kind: EngineKind,
+    /// LuaTeX `callback_set`: per callback `0` (none), `1` (a function is
+    /// registered) or `-1` (registered as `false`); see `lua_callbacks`.
+    pub(crate) lua_cb: [i8; crate::lua_callbacks::N_CALLBACKS],
+
+    // --- Core symbol & equivalent tables ---
     pub eqtb: Eqtb,
+    pub cs: CsTable,
     /// Original control-sequence name of each primitive. Unlike an eqtb
     /// reverse lookup, this survives formats redefining (for example) \input.
     pub(crate) primitive_names: crate::FxHashMap<u16, &'static [u8]>,
@@ -198,16 +273,10 @@ pub struct Engine {
     pub(crate) par_langs: Vec<crate::language::ParLang>,
     /// `\showlists` bookkeeping for math and alignment levels
     pub(crate) show: crate::show_state::ShowState,
-    pub input: InputStack,
-    pub ids: Ids,
 
     // current file line scanning
     pub pending_retokenize: bool,
 
-    // current token being processed
-    pub cur_tok: Token,
-    pub cur_cs: Option<CsId>,
-    pub cur_prim: Option<Prim>,
     /// char code for register-prefixed primitives etc.
     pub cur_chr: i32,
 
@@ -217,9 +286,6 @@ pub struct Engine {
     /// The LuaTeX node store behind `node.*` / `node.direct.*` (see
     /// `lua_node`).
     pub(crate) lua_nodes: crate::lua_node::NodeStore,
-    /// LuaTeX `callback_set`: per callback `0` (none), `1` (a function is
-    /// registered) or `-1` (registered as `false`); see `lua_callbacks`.
-    pub(crate) lua_cb: [i8; crate::lua_callbacks::N_CALLBACKS],
     /// `status.last*` strings and error-callback state
     pub(crate) lua_msgs: crate::lua_callbacks::LuaMessages,
     /// The luatex group code (index into `lua_callbacks::GROUP_NAMES`) the
@@ -241,8 +307,6 @@ pub struct Engine {
     /// was required. This recovery state belongs to one TeX engine/job.
     pub(crate) definable_cs_recovery_count: u8,
 
-    /// Semantic profile for this job. It is immutable after construction.
-    pub engine_kind: EngineKind,
     pub(crate) lua: Option<Box<crate::engine_lua::LuaEngine>>,
     /// LuaTeX bytecode registers (`lua.bytecode[n]`, dumped functions) and
     /// chunk names (`lua.name[n]`); both are part of the format.
@@ -291,20 +355,6 @@ pub struct Engine {
     /// reports missing packages through `\typeout` followed by `\read-1`, so
     /// the source has to survive until the read primitive reports the error.
     pub(crate) pending_terminal_error_source: Option<crate::input::SourceContext>,
-    /// Macro ancestry for the token currently being processed. It survives
-    /// tail expansion after the corresponding token lists have been popped.
-    pub(crate) diagnostic_macro_trace: Vec<CsId>,
-    /// True when the active macro chain exceeded its storage cap. Rendering
-    /// inserts an ellipsis so retained frames never appear falsely adjacent.
-    pub(crate) diagnostic_macro_trace_truncated: bool,
-    /// True while `diagnostic_physical_source` or `diagnostic_synthetic_source`
-    /// may be set. Both describe the token just fetched; the next fetch from a
-    /// token list clears them, and this flag keeps that check to one load.
-    pub(crate) diagnostic_sources_live: bool,
-    /// Suppress normal trace unwinding while a construct emitted by a macro
-    /// scans physical input (for example a macro-generated definition).
-    pub(crate) diagnostic_trace_hold: u16,
-    pub(crate) diagnostic_source_cs: Option<CsId>,
     pub(crate) diagnostic_physical_source: Option<PhysicalTokenSource>,
     /// The physical call site is read by every parameterized macro expansion.
     /// Share the immutable bookmark so the success path performs one cheap
@@ -376,28 +426,16 @@ pub struct Engine {
     pub(crate) diagnostics_finished: bool,
     /// tokens dispatched by main_loop; capacity guard
     pub main_steps: u64,
-    /// Expandable commands processed during this job. Unlike main_steps this
-    /// also advances while get_token is searching for one unexpandable token.
-    pub expansion_steps: u64,
-    pub expansion_limit: u64,
     // scanning state
-    pub if_stack: Vec<IfState>,
     /// Out-of-line diagnostic locations for `IfState` entries with
     /// `has_saved_mark == true`: `(if_stack_index, loc_file, loc)`.
     pub(crate) if_saved_marks:
         Vec<(usize, Option<std::rc::Rc<str>>, Option<crate::input::SourceMark>)>,
     /// Shared empty token slice for parameterless empty macro definitions.
     pub(crate) empty_tokens: std::rc::Rc<[Token]>,
-    pub(crate) pending_if_depth: Option<usize>,
-    pub pushed: Vec<Token>, // lookahead pushback
     /// The input stacks (with their pushback) that a private input hides, such as the one of a `\write` expansion, innermost last; `show_context` looks through them.
     /// The last backed-up token read, with the input position it was read at: TeX keeps its list as `<recently read>` until something else is read.
     pub(crate) recent_pushed: Option<(Token, (usize, usize))>,
-    /// The finished macro level that an expansion shortcut read without
-    /// putting it on the input stack, with the input position it ended at.
-    /// TeX keeps the level until a token is read from the input below it or
-    /// back_input or a macro call ends it; `show_context` shows it until then.
-    pub(crate) skipped_level: Option<(crate::show_context::SkippedLevel, (usize, usize))>,
     pub(crate) parked_inputs: Vec<(Vec<crate::input::Source>, Vec<Token>)>,
     /// fill order of the last scan_dimen unit (0=normal, 1=fil, 2=fill, 3=filll, 4=fi)
     pub cur_fill_order: u8,
@@ -410,26 +448,14 @@ pub struct Engine {
     /// >0 while scan_int/scan_dimen: e-TeX expands protected macros when
     /// looking for a number (`\romannumeral\protected...`).
     pub expand_protected: u32,
-    pub in_expanded_scan: bool,
     /// tex.web §1370 write_out sets `mode:=0` while it expands a `\write`
     /// text: \prevgraf reads 0, \spacefactor/\prevdepth are improper,
     /// \lastskip/\lastpenalty/\lastkern read 0, \lastnodetype reads -1 and
     /// \ifvmode/\ifhmode/\ifmmode/\ifinner are all false.
     pub write_mode_zero: bool,
-    /// True when the last expanded token was a parameter character protected
-    /// by \unexpanded; the definition scanner must store it literally.
-    pub unexpanded_parameter: bool,
-    /// e-TeX \\ifincsname: \\csname nesting depth
-    pub csname_depth: u32,
 
     pub last_macros: std::collections::VecDeque<String>,
-    pub unexp_protect: usize,
     pub tok_ring: std::collections::VecDeque<(u32, u32)>,
-    /// noexpand'd token pending (returned once, unexpanded)
-    pub no_expand_tok: Option<Token>,
-    pub align_state: i32, // & nesting balance for runaway detection
-    /// A macro parameter scanner is reading at alignment brace depth zero.
-    pub align_macro_arg: bool,
     pub format_done: bool,
     pub trace_ltx: u32,
     /// \pdfpageattr / \pdfpagesattr dict bodies (global in pdfTeX)
@@ -549,9 +575,6 @@ pub struct Engine {
     pub xetex_default_encoding: crate::xetex_input::EncSpec,
     /// A `\showstream` display is being built: `print_nl` always breaks.
     pub(crate) show_stream_nl: bool,
-    /// The token most recently read back from `pushed` (tex.web's backed-up
-    /// input level), for `\tracingstacklevels`.
-    pub(crate) pushed_read: Token,
     pub asset_fingerprint: u64,
     pub job_ended_by_end: bool,
     pub align_preamble: Vec<crate::align::ColSpec>,
@@ -564,17 +587,6 @@ pub struct Engine {
     pub align_cur_col: i32,
     pub align_scanning_cell: bool,
     pub(crate) align_close_reason: crate::align::AlignCloseReason,
-    /// `pushed` length when the current align toklist was installed.
-    /// Expansions after that point outrank the toklist; older `pushed`
-    /// tokens (e.g. a \\futurelet peek) wait until the toklist finishes.
-    pub align_pushed_base: usize,
-    /// tex.web align_state (tex.web @6745): net brace depth relative to the
-    /// current alignment entry. A row delimiter ends the entry only at 0.
-    /// Maintained cumulatively at token fetch (tex.web @7335/@7492); reset
-    /// when a u-template finishes (tex.web @7007-7008) or an \omit cell
-    /// starts (tex.web @15562); parked at 1000000 while a template plays
-    /// (tex.web @15564).
-    pub(crate) align_brace_depth: i32,
     /// Height/depth size target for e-TeX \middle delimiters inside the active
     /// \left...\right group.
     pub(crate) middle_delimiter_size: i32,
@@ -668,7 +680,6 @@ pub struct Engine {
     pub(crate) reported_missing_math_atoms: crate::FxHashSet<(u32, u16, u8)>,
     /// XeTeX OpenType math state (`cur_f`, font and glyph caches)
     pub(crate) xe_math: crate::math_xetex::XeMathState,
-    pub(crate) token_vec_pool: Vec<Vec<crate::token::Token>>,
     pub(crate) csname_pool: Vec<Vec<u8>>,
     /// The previous line buffer of a file source, reused for the next line.
     pub(crate) spare_line_buf: Vec<u8>,
@@ -710,11 +721,6 @@ pub struct Engine {
     /// Subformula boundaries: (math-list stack depth, opening position, saved mode).
     /// Nested scanners must not use or discard a surrounding list's marks.
     pub math_group_marks: Vec<(usize, usize, Mode)>,
-    pub scanner_status: ScannerStatus,
-    /// tex.web scanner_status/warning_index of an absorbing scan
-    /// (definition, general text, alignment preamble): an \outer macro read
-    /// while it is set is reported by `forbidden_outer` (§336-§339).
-    pub(crate) outer_scan: Option<(crate::expand::OuterScan, Option<CsId>)>,
     /// The end of the input was already reported as ending an absorbing
     /// scan; tex.web turns to the terminal afterwards and stops, so the
     /// end of the input is reported only once (§362).
