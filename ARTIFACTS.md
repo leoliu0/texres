@@ -67,10 +67,12 @@ Release archives (`tex-suite-v<version>-<platform>-<arch>.tar.gz`, or `.zip`
 on Windows) contain one executable, `bin/texres`, plus installer scripts, `README.txt`,
 license files, `manifest.json`, and `share/tex-suite/texmf/doc/fonts/` with
 font licenses, notices, and corresponding sources. The
-executable embeds the TeX engine, BibTeX, Biber, the LaTeX formats, packages, fonts,
+executable embeds the TeX engine, BibTeX, Biber, makeindex, the LaTeX formats, packages, fonts,
 and maps. No command aliases are shipped; the executable dispatches on the name
-it is invoked as (`pdflatex`, `xelatex`, `lualatex`, `bibtex`, `biber`, `latexmk`,
-`latexdiff`), so users may create such links themselves. The archive does not
+it is invoked as (`pdflatex`, `xelatex`, `lualatex`, `bibtex`, `biber`, `makeindex`,
+`latexmk`, `latexdiff`), so users may create such links themselves (and `texres`
+also accepts `pdflatex`, `xelatex`, `lualatex`, `latexdiff`, and `fmt` as
+subcommands). The archive does not
 carry a raw `pdflatex.fmt` unless a distributor explicitly supplies
 `scripts/package_dist.py --fmt FILE`.
 
@@ -145,10 +147,11 @@ The full workspace suite includes the archive-index checks. The release
 workflow also executes an extracted archive and the native installers on each
 supported operating system.
 Native Linux ARM64 CI and release jobs run the same workspace and packaging
-tests, full 127-case TeX Live 2026 reference/font/text/render gate, extracted
-archive smoke, and shell-installer smoke as x86_64 Linux; the release additionally
-installs and exercises the native Debian package. The independent ARM64 2 GiB
-memory-bounded build gate remains required.
+tests, full 129-case TeX Live 2026 reference/font/text/render gate, 100-document
+TeX Live 2026 parity, similarity, and performance gate (`scripts/bench100.py --gate`),
+extracted archive smoke, and shell-installer smoke as x86_64 Linux; the release
+additionally installs and exercises the native Debian package. The independent
+ARM64 2 GiB memory-bounded build gate remains required.
 Linux CI removes completed dev-profile test builds before the release build
 to reclaim disk for the reference TeX Live installation and archive staging.
 XeTeX fixture paths use forward slashes when inserted into TeX input,
@@ -182,8 +185,9 @@ Generated wrappers preserve the original document, jobname and bibliography
 workflow. Reference-free archive/installer smokes resolve those mappings from
 the binary's embedded tree and need no host TeX or archive reconstruction.
 
-The workflows upload `target/font-evidence-full/report.json` and failed-case
-artifacts even when the gate fails. The report includes engine/family counts,
+The workflows upload `target/font-evidence-full/report.json`, failed-case
+artifacts, and the 100-document parity report (`parity100.json` and `parity100.md`)
+even when a gate fails. The font report includes engine/family counts,
 failure reasons, executable identity, reference versions and bounded subprocess
 output; retained case directories contain the PDFs, renders and logs.
 Text mismatch reasons identify the first differing normalized character and

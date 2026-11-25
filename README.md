@@ -6,15 +6,15 @@
 
 TeXres is a TeX distribution in a single executable, written in Rust. It
 compiles LaTeX documents with pdfLaTeX, XeLaTeX or LuaLaTeX, and includes the
-LaTeX formats, a package archive, fonts, BibTeX and Biber. You don't need
-TeX Live, and nothing is downloaded during a build.
+LaTeX formats, a package archive, fonts, BibTeX, Biber and makeindex. You don't
+need TeX Live, and nothing is downloaded during a build.
 
 ```bash
 texres paper.tex
 ```
 
-This runs LaTeX, BibTeX or Biber as many times as needed and writes
-`paper.pdf`. Output is compared against TeX Live 2026 in CI.
+This runs LaTeX, BibTeX or Biber and makeindex as many times as needed and
+writes `paper.pdf`. Output is compared against TeX Live 2026 in CI.
 
 There is also a C library and a WebAssembly module that compile documents in
 memory; see [docs/libraries.md](docs/libraries.md).
@@ -82,10 +82,10 @@ cargo build --release --locked --bin texres   # needs stable Rust (1.88+)
 index tools as often as needed. A second run with no changes takes a few
 milliseconds.
 
-**Choose the engine.** Documents that load `fontspec`, `xeCJK`, `ctex`,
-`unicode-math` or `polyglossia` run as XeLaTeX, LuaTeX-ja and Lua-only
-packages such as `luacas` or `luacode` as LuaLaTeX, everything else as
-pdfLaTeX.
+**Choose the engine.** Documents that load Unicode-engine packages or classes
+such as `fontspec`, `xeCJK`, `ctex`, `unicode-math` or `polyglossia` run as
+XeLaTeX, LuaTeX-ja and Lua-only packages such as `luacas` or `luacode` as
+LuaLaTeX, and everything else as pdfLaTeX.
 To choose yourself, add `-pdf`, `-xelatex` or `-lualatex`:
 
 ```bash
@@ -106,7 +106,7 @@ document, replace `jsarticle` with `ltjsarticle` (`jsbook` with `ltjsbook`,
 \end{document}
 ```
 
-The first LuaTeX-ja build takes a few seconds while LuaTeX-ja caches its
+The first LuaTeX-ja build takes about two seconds while LuaTeX-ja caches its
 font data. XeLaTeX with `xeCJK` also typesets Japanese.
 
 **Write the output elsewhere.** `texres -outdir=build paper.tex` puts the PDF
@@ -169,10 +169,10 @@ texres fmt paper.tex chapters/
 ```
 
 **Single tools.** A link to `texres` named `pdflatex`, `xelatex`, `lualatex`,
-`bibtex` or `biber` runs one pass of that tool. Named `latexmk`, it behaves
-like `texres`. Without a link, `texres pdflatex ARGS` (or `xelatex`,
-`lualatex`) runs one engine pass, and so does `-progname=pdflatex` anywhere in
-the arguments, as with `pdftex`:
+`bibtex`, `biber`, `makeindex` or `latexdiff` runs that tool directly. Named
+`latexmk`, it behaves like `texres`. Without a link, `texres pdflatex ARGS` (or
+`xelatex`, `lualatex`) runs one engine pass, and so does `-progname=pdflatex`
+anywhere in the arguments, as with `pdftex`:
 `texres -progname=pdflatex -ini "&pdflatex" preamble.tex`. The packages
 install only `texres`, so an existing TeX Live is left alone. On Windows, run
 this in a PowerShell opened with *Run as administrator*; the hard link takes no extra disk space. Without admin
@@ -192,27 +192,50 @@ PowerShell, Command Prompt and macOS/Linux shells; on Windows, `texres` is
 
 ## Speed
 
-TeXres 0.7.3 was measured against TeX Live 2026 (`latexmk`) on 100 documents:
+TeXres 0.7.11 was measured against TeX Live 2026 (`latexmk`) on 100 documents:
 70 generated and 30 public papers, books and slide decks. pdfLaTeX, XeLaTeX
 and LuaLaTeX are all included. The binary is the profile-guided build that
 the Linux x86_64 and macOS arm64 releases ship. The machine is one Linux
-workstation (64-core Threadripper PRO). Each cell is the median of 5 runs.
-Both tools run every pass and the bibliography tool, and the PDFs were
-checked to have the same pages and text.
+workstation (16-core Ryzen 9 9950X3D2). Each cell is the median of 5 runs.
+Both tools run every pass and the bibliography tool, and all 100 PDFs were
+checked to have identical page counts and `pdftotext -layout` text.
 
 | Scenario | TeXres faster | Median TeXres / TeX Live | Closest document |
 | --- | ---: | ---: | --- |
-| Cold build | 100 of 100 | 0.60 | 0.98, siunitx tables (3.54 s / 3.63 s) |
-| No-change rebuild | 100 of 100 | 0.13 | 0.26, 193-page book (0.030 s / 0.114 s) |
-| One-line edit | 100 of 100 | 0.57 | 0.98, 193-page book (6.62 s / 6.77 s) |
+| Cold build | 100 of 100 | 0.51 (1.97× faster) | 0.90, siunitx tables (1.94 s / 2.15 s) |
+| No-change rebuild | 100 of 100 | 0.08 (12.5× faster) | 0.27, arXiv paper (0.013 s / 0.047 s) |
+| One-line edit | 100 of 100 | 0.49 (2.06× faster) | 0.86, siunitx tables (0.65 s / 0.76 s) |
 
-On most documents TeXres needs a little over half of TeX Live's time, but on
-the slowest two it is only 2-4% ahead. Both cold builds started with the
-machine's font database already built. On a new machine the first LuaLaTeX
-build scans the fonts for both tools, which takes about a minute either way.
-TeXres also writes SyncTeX by default, and that cost is included. Method,
-per-group numbers and a script to rerun it are in
-[PERFORMANCE.md](PERFORMANCE.md).
+Across the 100 documents TeXres uses about half of TeX Live's time on cold
+builds and edits (median ratio 0.50 on pdfLaTeX, 0.45 on XeLaTeX, 0.60 on
+LuaLaTeX), and stays about 10% ahead cold (14% on edits) even on the closest
+document (`pdf_siunitx_tables`, 0.89 cold and 0.86 edit in a 9-run
+one-at-a-time recheck). Both cold builds start with the font database already built; on a
+fresh cache a first LuaLaTeX build with a named font takes about 0.5 s in
+TeXres because it indexes only the bundled fonts rather than OS font
+directories. TeXres also writes SyncTeX by default, and that cost is included.
+Method, per-group numbers, reference setup details and a script to rerun it are
+in [PERFORMANCE.md](PERFORMANCE.md).
+
+## Coverage and verification
+
+Everything needed for ordinary LaTeX builds ships inside the single executable
+(no TeX Live installation or network downloads):
+
+| Area | Bundled / verified |
+| --- | --- |
+| Engines | pdfLaTeX, XeLaTeX, LuaLaTeX (in-tree Lua 5.3 VM, MetaPost `mplib`, EPS/PostScript converter) |
+| Companion tools | BibTeX (0.99e), Biber (2.22), makeindex (2.18), `latexdiff`, `texres fmt` |
+| Embedded TeX Live 2026 archive | 88,591 files across 4,130 `tex/` package directories (6,726 `.sty`, 765 `.cls`, 415 `.bst`), including 499 extra macro, LuaLaTeX, XeLaTeX and `babel-*` packages, LuaTeX-ja and `luacas` |
+| Fonts and languages | 343 OpenType/TrueType faces (Latin Modern, TeX Gyre, STIX Two, XITS, Libertinus, Harano Aji, IPAex, Fandol and others), 4,125 Type 1 `.pfb` programs, and 91 `language.dat` hyphenation entries (all TeX Live 2026 `collection-lang*` patterns) |
+| CI TeX Live 2026 parity gates | 129 isolated font, graphics and engine-subsystem fixtures (23 pdfLaTeX, 47 LuaLaTeX, 59 XeLaTeX; Poppler and pdf.js text and render parity), 100-document corpus parity and speed gate (`scripts/bench100.py --gate`), and 10 real-world arXiv papers built hermetically |
+| Workspace and library tests | Over 2,300 Rust unit and integration tests (including BibTeX, makeindex and 463 Biber oracle fixtures), native C library (`libtex`) and WebAssembly (Node.js and headless Chromium) parity checks, plus a 2 GiB ARM64 build-memory gate |
+
+Known limits: pLaTeX/upLaTeX (`platex` + `dvipdfmx`) and DVI/PostScript output
+modes (`-dvi`, `-ps`) are not provided; system OS fonts are not searched (put
+extra fonts next to your document and load them with `Path=./`); and `texres`
+does not read `latexmkrc` files. See [docs/internals.md](docs/internals.md) for
+engine details and [ARTIFACTS.md](ARTIFACTS.md) for packaging and CI gates.
 
 ## Editor setup
 
@@ -229,8 +252,9 @@ options. Three rules apply to every editor:
      (Homebrew: `"$(brew --prefix)/bin/texres"`, usually
      `/opt/homebrew/bin/texres` on Apple Silicon). Apps started from the Dock
      or a desktop menu do not see the `PATH` of your shell.
-2. Leave out `-pdf`. It forces pdfLaTeX and turns off the XeLaTeX detection.
-   Use `-xelatex` or `-lualatex` only to force those engines.
+2. Leave out `-pdf`. It forces pdfLaTeX and turns off automatic XeLaTeX and
+   LuaLaTeX detection. Use `-xelatex` or `-lualatex` only to force those
+   engines.
 3. Keep `-interaction=nonstopmode` (or `-file-line-error`, or
    `-synctex=1`). With one of them `texres` writes `paper.log` next to the PDF,
    where editors look for errors.
@@ -586,7 +610,7 @@ repos:
         name: texres fmt
         entry: texres fmt
         language: system
-        files: \.(tex|sty|cls|bib)$
+        files: \.(tex|sty|cls|ltx|bib)$
 ```
 
 The hook formats the staged files; pre-commit stops the commit when it changed

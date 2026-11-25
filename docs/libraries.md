@@ -113,8 +113,9 @@ The library chooses the engine from the entry file before the first pass: a
 comment lines selects pdfTeX, XeTeX, or LuaTeX; otherwise loading `luatexja`,
 `luacode`, or `luatextra`, or using `\directlua`, in the preamble selects the
 LuaTeX-compatible mode; loading `fontspec`, `xeCJK`, `ctex` (or a `ctex` class),
-`unicode-math`, or `polyglossia` selects XeTeX, as `texmk` does; anything else
-uses pdfTeX. If a
+`unicode-math`, or `polyglossia` selects XeTeX; anything else
+uses pdfTeX. Other LuaTeX- or XeTeX-only packages are handled by the fallback
+switch: if a
 pass fails with a log message stating that another engine is required (a
 package asking for XeTeX or LuaTeX moves a pdfTeX run to XeTeX; one that needs
 LuaTeX moves a pdfTeX or XeTeX run to LuaTeX), the
@@ -134,7 +135,8 @@ interactive terminal input, and operating-system file access are unavailable
 through the library API. Native `fontspec`/`xeCJK` selection runs on the XeTeX engine with the same
 bundled faces and shaping path as the CLI. Supply custom font files with
 `add_file` and select them by project-relative `Path`; a separate session
-cannot access those files. See the [font capabilities and engine limits](../README.md#fonts-and-unicode-in-the-source-build).
+cannot access those files. See [XeTeX and LuaTeX modes](internals.md#xetex-and-luatex-modes)
+and [native fonts and embedding](internals.md#native-fonts-and-embedding).
 
 ## Verification
 

@@ -123,15 +123,17 @@ only as links to `texres` (or `texmk`). Releases ship only `texres`.
 
 - `texres` (`src/bin/texres.rs`) is `texmk::main`. It decides what to run in this
   order:
-  1. `TEXMK_INTERNAL_MODE=engine|bibtex|latexdiff` (set by the driver for its
+  1. `TEXMK_INTERNAL_MODE=engine|bibtex|biber|latexdiff` (set by the driver for its
      child processes; the engine program name comes from
      `TEX_SUITE_PROGRAM_NAME`, default `pdflatex`);
-  2. a first argument `latexdiff`, or `fmt` (the source formatter,
-     `tex_format::cli::run`; see below);
-  3. the invoked file name: `pdflatex`, `xelatex`, `lualatex` run one engine
-     pass, `bibtex`/`tex-bibtex` run BibTeX, `makeindex` runs makeindex,
-     `latexdiff` runs the diff, and anything else (`texres`, `texmk`,
-     `latexmk`) runs the build driver.
+  2. the invoked file name: `pdflatex`, `xelatex`, `lualatex` run one engine
+     pass, `bibtex`/`tex-bibtex` run BibTeX, `biber` runs Biber, `makeindex`
+     runs makeindex, and `latexdiff` runs the diff;
+  3. for any other invoked name (`texres`, `texmk`, `latexmk`): a first
+     argument `latexdiff` runs the diff, `fmt` runs the source formatter
+     (`tex_format::cli::run`; see below), `pdflatex`/`xelatex`/`lualatex` or a
+     `-progname=...` flag runs one engine pass, and everything else runs the
+     build driver.
 
   Engine and BibTeX personalities started this way set `TEX_RS_HERMETIC=1`,
   so they resolve TeX files only from the embedded archive (see below).
@@ -160,8 +162,12 @@ to inject tools.
 
 1. Parse options, set `TEX_RS_HERMETIC=1`, convert EPS figures in the source
    directory, and select the engine (`-pdf`/`-xelatex`/`-lualatex`; otherwise
-   `xelatex` when the preamble loads `fontspec`, `xeCJK`, `ctex`, a `ctex`
-   class, `unicode-math`, or `polyglossia`, else pdfLaTeX). Locate the per-job cache directory and take its lock.
+   `lualatex` when the preamble loads a LuaTeX-only package or class such as
+   `luatexja`/`ltj*`, `luacode`, or `luacas` from `LUATEX_PACKAGES`/`LUATEX_CLASSES`,
+   else `xelatex` when it loads a Unicode-engine package or class such as
+   `fontspec`, `xeCJK`, `ctex`, `unicode-math`, or `polyglossia` from
+   `UNICODE_ENGINE_PACKAGES`/`UNICODE_ENGINE_CLASSES`, else pdfLaTeX). Locate
+   the per-job cache directory and take its lock.
 2. Each pass (at most `MAX_PASSES = 5`): snapshot every file in the auxiliary
    directory (size and hash), run the engine child with
    `-interaction=nonstopmode` unless the user chose a mode, and stream its
@@ -639,9 +645,12 @@ job's files in that directory), `-shell-escape` allows any
 command and `-no-shell-escape` none. pdfLaTeX has no native fonts: loading
 `fontspec` there fails with fontspec's own engine error, as in TeX Live.
 `-lualatex` runs the LuaTeX-compatible mode with the embedded LuaLaTeX format
-and an in-tree Lua VM, so `\directlua` works. `luatexja` and a few LuaTeX-only
-packages do not compile in any mode. Native fonts are loaded after the format
-is read, as in XeTeX; dumping native font state is rejected.
+and an in-tree Lua VM, so `\directlua`, LuaTeX-ja (`luatexja`, `ltj*` classes
+with the bundled Harano Aji fonts), `luacas`, `luacode`, and other bundled
+LuaTeX packages work. Native fonts are loaded after the format
+is read, as in XeTeX; dumping native font state is rejected. pLaTeX and upLaTeX
+classes (`platex` plus `dvipdfmx`) require the pTeX engine, which TeXres does
+not provide.
 
 ### Native fonts and embedding
 
@@ -692,11 +701,15 @@ selected.
 
 ### Verification
 
-The Linux CI and release workflows run the font, graphics and engine fixtures listed in
-[`scripts/fixtures/fonts/manifest.json`](scripts/fixtures/fonts/manifest.json)
-through the built binary (`scripts/test_fonts.py`) with filesystem isolation,
-pdf.js and Poppler rendering/text extraction, and TeX Live 2026 as the
-reference. The extracted archive is run on every release platform, and the
+The Linux CI and release workflows run the 129 font, graphics and engine fixtures listed in
+[`scripts/fixtures/fonts/manifest.json`](../scripts/fixtures/fonts/manifest.json)
+(23 pdfLaTeX, 47 LuaLaTeX, 59 XeLaTeX) through the built binary (`scripts/test_fonts.py`)
+with filesystem isolation, pdf.js and Poppler rendering/text extraction, and TeX Live 2026
+as the reference. They also run the 100-document TeX Live 2026 parity, similarity, and
+performance gate (`scripts/bench100.py --gate`, checking text similarity, 100 DPI visual
+ink IoU, and wall-time ratio across 70 generated and 30 public arXiv/GitHub documents),
+and CI compiles 10 real-world arXiv papers hermetically (`scripts/test_arxiv_ci.py`).
+The extracted archive is run on every release platform, and the
 shell installer, `.deb`, macOS `.pkg`, and Windows installers are installed
 and exercised. The workspace test suite,
 the C and WebAssembly libraries, and the browser module are tested as well.
@@ -711,7 +724,7 @@ TeX Live 2026 engine, alongside font-program checks and both renderers.
 Use `scripts/test_fonts.py --engine lualatex` or `--engine xelatex` with
 `--texres` and `--output` to select a suite; its report groups failures by engine
 and feature family and retains compilation and viewer evidence.
-See [PERFORMANCE.md](PERFORMANCE.md) for how speed is measured.
+See [PERFORMANCE.md](../PERFORMANCE.md) for how speed is measured.
 
 ### Issue assistant
 
@@ -735,6 +748,7 @@ texres/
 │   ├── tex-kpse/        # kpathsea-style resolver and the embedded zstd-compressed package archive
 │   ├── tex-bibtex/      # BibTeX implementation
 │   ├── tex-biber/       # Biber (biblatex backend) implementation
+│   ├── tex-makeindex/   # makeindex 2.18 implementation
 │   ├── tex-cli/         # `texres` executable: build driver, engine/BibTeX personalities, latexdiff
 │   ├── tex-format/      # `texres fmt`: LaTeX source and BibTeX database formatter
 │   ├── tex-lua/         # Lua VM used by the LuaTeX-compatible mode

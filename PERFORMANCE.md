@@ -4,8 +4,9 @@
 
 The distributed executable is `texres` (`target/release/texres`). Invoked as
 `texres`, it is the build driver: it re-executes itself for every TeX and BibTeX
-pass. To time or profile one engine pass, run the same executable through a
-link named `pdflatex` (or `xelatex`/`lualatex`):
+pass. To time or profile one engine pass, invoke `texres pdflatex ...` (or
+`xelatex`/`lualatex`) directly, or run the same executable through a link named
+`pdflatex` (or `xelatex`/`lualatex`):
 
 ```sh
 ln -s "$PWD/target/release/texres" /tmp/texres-bench/pdflatex
@@ -22,52 +23,47 @@ slowest first, and every run is in
 [`bench100.json`](scripts/bench/results/bench100.json).
 
 **Result, in short.** TeXres was faster than TeX Live on all 100 documents in
-all three scenarios. The ratio is TeXres wall time divided by TeX Live wall
-time, as the median of 5 runs per cell:
+all three scenarios, with 100/100 page-count parity and 100/100 exact
+`pdftotext -layout` text parity (`1.0000` similarity). The ratio is TeXres wall
+time divided by TeX Live wall time, as the median of 5 runs per cell:
 
 | Scenario | TeXres faster | Median ratio | Worst ratio |
 | --- | ---: | ---: | ---: |
-| (a) cold build | 100 / 100 | 0.60 | 0.98 (`pdf_siunitx_tables`, 3.54 / 3.63 s) |
-| (b) no-change rebuild | 100 / 100 | 0.13 | 0.26 (`gh_lkmpg_book`, 0.030 / 0.114 s) |
-| (c) one-line edit rebuild | 100 / 100 | 0.57 | 0.98 (`gh_lkmpg_book`, 6.62 / 6.77 s) |
+| (a) cold build | 100 / 100 | 0.51 | 0.90 (`pdf_siunitx_tables`, 1.94 / 2.15 s) |
+| (b) no-change rebuild | 100 / 100 | 0.08 | 0.27 (`arxiv_vae`, 0.013 / 0.047 s) |
+| (c) one-line edit rebuild | 100 / 100 | 0.49 | 0.86 (`pdf_siunitx_tables`, 0.652 / 0.757 s) |
 
 | Group | Documents | (a) median / worst | (b) median / worst | (c) median / worst |
 | --- | ---: | ---: | ---: | ---: |
-| generated (`corpus100`) | 70 | 0.60 / 0.98 | 0.11 / 0.19 | 0.56 / 0.94 |
-| public (arXiv, GitHub; never trained on) | 30 | 0.57 / 0.96 | 0.16 / 0.26 | 0.57 / 0.98 |
-| pdfLaTeX | 60 | 0.56 / 0.98 | 0.14 / 0.26 | 0.56 / 0.98 |
-| XeLaTeX | 25 | 0.59 / 0.81 | 0.11 / 0.16 | 0.51 / 0.74 |
-| LuaLaTeX | 15 | 0.74 / 0.88 | 0.13 / 0.17 | 0.72 / 0.87 |
+| generated (`corpus100`) | 70 | 0.51 / 0.90 | 0.07 / 0.14 | 0.48 / 0.86 |
+| public (arXiv, GitHub; never trained on) | 30 | 0.50 / 0.76 | 0.11 / 0.27 | 0.50 / 0.75 |
+| pdfLaTeX | 60 | 0.50 / 0.90 | 0.09 / 0.27 | 0.48 / 0.86 |
+| XeLaTeX | 25 | 0.45 / 0.64 | 0.07 / 0.11 | 0.39 / 0.60 |
+| LuaLaTeX | 15 | 0.60 / 0.73 | 0.08 / 0.12 | 0.57 / 0.73 |
 
-The margin is small on two documents. `pdf_siunitx_tables` (siunitx inside
-tables) is 0.98 cold and 0.94 after an edit; `gh_lkmpg_book` (193 pages) is
-0.96 cold and 0.98 after an edit. The next closest are `lua_beamer` (0.88)
-and `pdf_beamer_metropolis` (0.87). The four closest were measured again one
-at a time, unpinned, 9 runs per cell, load average 1.4-1.8
-([`bench100_recheck9.md`](scripts/bench/results/bench100_recheck9.md)):
-`pdf_siunitx_tables` 0.99 / 0.10 / 0.95, `gh_lkmpg_book` 0.96 / 0.24 / 0.96,
-`lua_beamer` 0.91 / 0.13 / 0.89 and `pdf_beamer_metropolis` 0.89 / 0.12 /
-0.88 for (a) / (b) / (c).
-
-On those two documents a single engine pass gains little or nothing; the
-builds win on fixed cost. Measured with `perf stat` over TeX Live's converged
-aux files: on `gh_lkmpg_book` TeXres takes 26.1G cycles against 28.0G for
-`pdflatex`; on `pdf_siunitx_tables` it takes 4.52G against 4.28G. A one-line
-document costs TeXres about 65 ms per pass and `pdflatex` about 155 ms. The
-gap on siunitx tables is branch mispredictions (48M against 28M). Inside an
-alignment entry TeXres looks up the meaning of every control sequence it
-fetches to test for a row delimiter; TeX gets that from `cur_cmd`.
+The closest document is `pdf_siunitx_tables` (siunitx inside tables) at 0.90
+cold and 0.86 after an edit. The next closest are `gh_lkmpg_book` (193 pages,
+0.76 cold and 0.75 edit), `lua_beamer` (0.73 / 0.73), and
+`pdf_beamer_metropolis` (0.73 / 0.72). Those four closest documents were
+measured again one at a time, unpinned, 9 runs per cell, load average 8.8
+dropping to 1.9 ([`bench100_recheck9.md`](scripts/bench/results/bench100_recheck9.md)):
+`pdf_siunitx_tables` 0.89 / 0.08 / 0.86 (1.88 / 2.12 s cold, 0.632 / 0.732 s edit),
+`gh_lkmpg_book` 0.77 / 0.18 / 0.76 (9.27 / 12.01 s cold, 3.35 / 4.42 s edit),
+`lua_beamer` 0.73 / 0.09 / 0.72 (1.41 / 1.92 s cold, 0.708 / 0.987 s edit), and
+`pdf_beamer_metropolis` 0.72 / 0.08 / 0.71 (1.33 / 1.85 s cold, 0.675 / 0.945 s edit)
+for (a) / (b) / (c). On this machine a one-line `pdflatex` single pass takes
+about 25 ms in TeXres against 89 ms in TeX Live's `/usr/bin/pdflatex`.
 
 ### Scenarios
 
 - **(a) cold build**: `texres -pdf|-xelatex|-lualatex main.tex` with an empty
   cache root, against `latexmk -pdf|-xelatex|-lualatex -interaction=nonstopmode
   main.tex` in a freshly copied directory. Both run every pass and the
-  bibliography tool (TeXres: built-in BibTeX and Biber; TeX Live: `bibtex`,
-  `biber 2.22`). The cache root keeps one directory, `texmf-var`, between cold
-  runs: the machine-wide luaotfload font database and font caches. TeX Live
-  keeps the same data in `$HOME/.texlive2026/texmf-var`, which `latexmk`
-  never clears.
+  bibliography tool (TeXres: built-in BibTeX and Biber; TeX Live: `bibtex` and
+  `biber`, see Method below). The cache root keeps one directory, `texmf-var`,
+  between cold runs: the machine-wide luaotfload font database and font caches.
+  TeX Live keeps the same data in `$HOME/.texlive2026/texmf-var`, which
+  `latexmk` never clears.
 - **(b) no-change rebuild**: the same command again, after a converged build.
 - **(c) one-line edit**: generated documents change `BENCH-A` to `BENCH-B`.
   Public documents get ` BENCH-B` appended to one plain-text line of a body
@@ -76,33 +72,43 @@ fetches to test for a row delimiter; TeX gets that from `cur_cmd`.
 
 ### Method
 
-- Binary: `scripts/build_pgo.sh` at commit `69c9ca4`, a profile-guided build
-  with fat LTO in one codegen unit. The release workflow ships this build for
-  Linux x86_64 and macOS arm64. Windows, linux-aarch64, macOS x86_64 and
-  `cargo install` get the plain release build, which is slower and is not
-  measured here (see "Profile-guided build").
+- Binary: `scripts/build_pgo.sh` at commit `eb6fdce` (`texres 0.7.11`), a
+  profile-guided build with fat LTO in one codegen unit. The release workflow
+  ships this build for Linux x86_64 and macOS arm64. Windows, linux-aarch64,
+  macOS x86_64 and `cargo install` get the plain release build, which is slower
+  and is not measured here (see "Profile-guided build").
 - Each document is built once with both tools first. The two PDFs must have
   the same page count and the same `pdftotext -layout` text after whitespace
-  is removed; otherwise the document is not timed. All 100 passed. The PDFs
-  of this binary are also byte-identical to those of `da0e76f` on all 100
-  documents.
+  is removed; otherwise the document is not timed. All 100 passed with `1.0000`
+  text similarity.
 - Every timed run starts from an identical restored state. The tools
   alternate, and the order flips every run. Wall time covers the whole
   command. `SOURCE_DATE_EPOCH` and `FORCE_SOURCE_DATE` are set. `PATH` is
-  `/usr/bin:/usr/bin/vendor_perl:/bin`, so only the system TeX Live is used.
-- 16 documents ran at once, each pinned with `taskset` to its own 4 logical
+  `/usr/bin:/usr/bin/vendor_perl:/bin`, so only the system TeX Live binaries
+  are used.
+- Because this Arch Linux host does not install every non-English hyphenation
+  collection, `bench100.py` aligned the reference TeX Live's `TEXMFLOCAL` tree
+  and freshly dumped host formats with the locked TeX Live 2026 payload
+  (`ensure_tl_reference_env`) while executing the genuine host `/usr/bin`
+  `pdftex`, `xetex`, `luahbtex`, `latexmk`, and `bibtex` binaries. Because Perl
+  `biber` was not installed on this host, `latexmk` fell back to `texres`'s
+  `biber` personality for the 6 `biblatex` documents (conservative for TeXres,
+  since Perl Biber 2.22 is slower).
+- 6 documents ran at once, each pinned with `taskset` to its own 4 logical
   CPUs (2 physical cores), which both tools of that document share. Load
-  average was 5.9 at the start and 5.6 at the end. `xe_natbib_bibtex` was
-  measured again on its own with the same binary and settings, because TeX
-  Live's `xelatex` exited with code 1 once during the parallel sweep.
+  average was 3.4 at the start and 5.7 at the end.
 
 ### Caveats
 
-- **The first LuaLaTeX build on a new machine** builds the font database
-  (a scan of the system fonts) for both tools. The cold builds above start
-  with that database already built on both sides. It was measured once at an
-  earlier commit: TeXres 65 s, TeX Live 61 s. It has not been re-measured
-  since the `getinfo` memo (c18e106), which should make it shorter.
+- **The first LuaLaTeX build on a new machine** builds `luaotfload`'s font
+  names database. Since commit `7f83aed` (v0.7.8), TeXres indexes only its
+  bundled fonts (ignoring OS font directories, matching its hermetic font
+  model); on this machine a fresh-cache LuaLaTeX build with
+  `\setmainfont{TeX Gyre Termes}` takes about 0.49 s (and a fresh-cache
+  LuaTeX-ja `ltjsarticle` build takes about 1.81 s). TeX Live scans OS fonts as
+  well, which takes much longer on a new machine. The cold builds in the table
+  above start with `texmf-var` already populated on both sides so neither side
+  pays the one-time database build on every run.
 - **SyncTeX**: TeXres writes it by default, and `latexmk` does not unless
   asked. That costs TeXres about 1% of a pass; it is included in all times
   above.
@@ -113,11 +119,11 @@ fetches to test for a row delimiter; TeX gets that from `cur_cmd`.
 
 | | |
 | --- | --- |
-| Date | 2026-10-08 |
-| CPU | AMD Ryzen Threadripper PRO 5995WX 64-Cores, 64 cores / 128 threads; governor `performance` |
-| RAM / OS | 504 GiB; Arch Linux, Linux 7.2.8-arch1-2 |
-| TeXres | texres 0.7.2, `scripts/build_pgo.sh` at `69c9ca4` |
-| TeX Live | pdfTeX 3.141592653-2.6-1.40.29, XeTeX 3.141592653-2.6-0.999998, LuaHBTeX 1.24.0 (TeX Live 2026, Arch Linux packages); Latexmk 4.87; biber 2.22 |
+| Date | 2026-11-25 |
+| CPU | AMD Ryzen 9 9950X3D2 16-Core Processor, 16 cores / 32 threads; governor `powersave` |
+| RAM / OS | 186.4 GiB; Arch Linux, Linux 7.3.5-arch1-1 |
+| TeXres | texres 0.7.11, `scripts/build_pgo.sh` at `eb6fdce` |
+| TeX Live | pdfTeX 3.141592653-2.6-1.40.29, XeTeX 3.141592653-2.6-0.999998, LuaHBTeX 1.24.0 (TeX Live 2026, Arch Linux packages with locked TeX Live 2026 `TEXMFLOCAL` overlay); Latexmk 4.87; BibTeX 0.99e (`texres` `biber` fallback on the 6 `biblatex` documents) |
 
 ### Corpus
 
@@ -145,17 +151,19 @@ never on the measured documents or the public ones.
 ### Reproduce
 
 ```sh
-scripts/build_pgo.sh /tmp/texres-pgo/texres          # about 15 minutes
-python3 scripts/bench100.py --texres /tmp/texres-pgo/texres --jobs 16 --cpus-per-job 4 --texres-note "$(git rev-parse --short HEAD) PGO"
-python3 scripts/bench100.py --texres BIN --docs pdf_siunitx_tables,gh_lkmpg_book --runs 9   # one at a time
+scripts/build_pgo.sh /tmp/texres-pgo/texres          # about 9 minutes
+python3 scripts/bench100.py --texres /tmp/texres-pgo/texres --jobs 6 --cpus-per-job 4 --texres-note "$(git rev-parse --short HEAD) PGO"
+python3 scripts/bench100.py --texres BIN --docs pdf_siunitx_tables,gh_lkmpg_book,lua_beamer,pdf_beamer_metropolis --runs 9   # one at a time
 python3 scripts/bench100.py --texres BIN --resume     # skip documents already measured with this binary
 ```
 
 It needs `/usr/bin/{pdflatex,xelatex,lualatex,latexmk,bibtex}` from TeX Live,
-`biber`, and poppler's `pdfinfo`/`pdftotext`. Before you trust parallel
-numbers on another machine, compare a few documents with `--jobs 1`. Here,
-16 jobs of 4 CPUs agreed with one-at-a-time runs to within about 3%. The
-full sweep takes about 6 minutes.
+`biber` (if absent, `bench100.py` falls back to `texres`'s `biber` personality),
+and poppler's `pdfinfo`/`pdftotext`. Size `--jobs` so that `jobs * cpus-per-job`
+fits within the host's physical cores. Before trusting parallel numbers on
+another machine, compare a few documents with `--jobs 1`. Here, 6 jobs of 4
+CPUs agreed with one-at-a-time runs to within about 1%. The full 5-run sweep
+takes about 7.5 minutes.
 
 ### Eight-document benchmark (historical)
 
@@ -239,8 +247,17 @@ them to 2.1G and 25M. Output is byte-identical.
   that up to four threads decode it at once: with a single frame, decoding
   took about half of the format load (roughly 40 of 80 ms for XeLaTeX).
 - Inside an alignment entry, tokens that cannot end the entry (anything but
-  `&`, a control sequence \let to it, `\cr` or `\crcr` at brace depth zero)
-  take the same fast token fetch and bulk argument scans as outside one.
+  `&`, a control sequence `\let` to it, `\cr` or `\crcr` at brace depth zero)
+  take the same fast token fetch and bulk argument scans as outside one,
+  checked through an L1 per-control-sequence flag table rather than full eqtb
+  lookups.
+- Hot interpreter state is packed for cache locality (16-byte `Eqtb` entries,
+  64-byte `Source` frames, SwissTable/flat-arena control-sequence table,
+  top-byte dispatch LUTs, and bulk token-list scans for balanced arguments,
+  `\def` bodies, `\csname`, and skipped conditional branches).
+- LuaTeX uses direct C-style callbacks for `node.direct` and font/table
+  operations, raw embedded-file readers, and pooled zstd decoders across
+  embedded archive reads.
 - TeX support files come from an embedded zstd-compressed package archive
   (`crates/tex-kpse`); no TeX installation is scanned.
 - The default font map (`pdftex.map`) is parsed only on first use.
@@ -295,8 +312,9 @@ and `finish`. It also reports `ls-R` loading whenever a TeX tree with an
 `scripts/bench_cold.py` is a fresh-process harness for a prepared set of
 documents (`prepare`, `run`, `profile`, and `pgo` subcommands); see its
 module docstring. It was written for private manuscripts that are not
-published, so it cannot be rerun from this repository; the harness for the
-public corpus is `scripts/bench_tl.py` (first section above).
+published, so it cannot be rerun from this repository; the harnesses for the
+public corpora are `scripts/bench100.py` (first section above) and
+`scripts/bench_tl.py`.
 
 ## Profiling
 
